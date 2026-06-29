@@ -289,7 +289,10 @@ Stage-1:
 Stage-2:
   train prompt bank
   train classifier
-  optionally fine-tune CLIP image encoder
+  fine-tune CLIP image encoder (default; matches CLIP-ReID Stage-2 and is the
+  only path for ReID gradients to reach f_v)
+  --freeze-image-encoder-stage2 opts back into prompt-only mode (caps mAP near
+  the frozen CLIP image-only floor)
 ```
 
 是否 fine-tune image encoder 应作为显式参数控制，不能 silently fallback。

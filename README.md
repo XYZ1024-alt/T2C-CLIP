@@ -77,10 +77,14 @@ which produces a `TwoStageTrainingJob` when `--stage1-epochs > 0` and a single
 Stage-2 `TrainingJob` otherwise.
 
 Stage-1 prompt alignment runs first (image encoder frozen by default), then
-Stage-2 ReID training runs (image encoder frozen by default; opt out with
-`--no-freeze-image-encoder-stage2`). Identity prompts present in Stage-1 and
-Stage-2 training are **never** used at inference; `encode_retrieval` only
-ever composes `global + camera` prompts.
+Stage-2 ReID training runs. CLIP-ReID's standard Stage-2 recipe fine-tunes
+the vision encoder so the ReID signal can actually reach the retrieval
+feature; this project therefore defaults to **unfrozen at Stage-2**. Pass
+`--freeze-image-encoder-stage2` to opt back into the prompt-tuning-only
+mode (which on person ReID tops out near the frozen CLIP image-only floor).
+Identity prompts present in Stage-1 and Stage-2 training are **never** used
+at inference; `encode_retrieval` only ever composes `global + camera`
+prompts.
 
 Market-1501 expects the standard directories under `--data-root`:
 
@@ -115,8 +119,22 @@ wsl --cd /mnt/d/Code/T2C-CLIP /home/xyz10/miniconda3/bin/conda run -n reid pytho
   --beta 0.1 \
   --clip-weight 0.1 \
   --tfc-weight 1.0 \
+  --image-encoder-lr 0.00005 \
+  --beta-warmup-epochs 5 \
+  --sanity-gate-epochs 10 \
   --freeze-image-encoder-stage1
 ```
+
+The MSMT17 command above fine-tunes the CLIP vision encoder during Stage-2
+(see `--image-encoder-lr`). The smaller backbone learning rate
+(`5e-5` by default) keeps the pretrained features from being catastrophically
+forgotten while still letting the ReID losses tune them. The blended
+text branch ramp goes from `0` at epoch 1 (pure image feature) to the
+configured `--beta` at `--beta-warmup-epochs + 1`, so the random
+camera-conditioned text feature does not pull the retrieval feature below
+the image-only floor at startup. `--sanity-gate-epochs` fails the run early
+if mAP stays pinned to the random floor (sign the ReID signal isn't acting
+on `f_eval`).
 
 Useful training arguments:
 
@@ -128,9 +146,15 @@ Useful training arguments:
 - `--validation-interval N` (Stage-2 mAP validation cadence)
 - `--batch-size 384`
 - `--num-workers 4`
-- `--lr 0.0001`
+- `--lr 0.0001` (learning rate for the prompt bank, classifier, and unfrozen
+  text encoder)
+- `--image-encoder-lr 0.00005` (learning rate for the CLIP vision backbone
+  and visual projection; smaller than `--lr` to avoid catastrophic
+  forgetting of the pretrained visual features)
 - `--device cuda`
 - `--beta 0.1`
+- `--beta-warmup-epochs 0` (linear ramp of the fused retrieval beta from
+  `0` at epoch 1 to `--beta` at `warmup-epochs + 1`)
 - `--context-length 4`
 - `--tfc-momentum 0.5`
 - `--triplet-margin 0.3`
@@ -138,8 +162,13 @@ Useful training arguments:
 - `--clip-weight 0.1`
 - `--retrieval-mode fused|image_only` (`fused` validates global + camera prompt fusion; `image_only` validates normalized CLIP image features)
 - `--freeze-image-encoder-stage1 / --no-freeze-image-encoder-stage1` (default frozen)
-- `--freeze-image-encoder-stage2 / --no-freeze-image-encoder-stage2` (default frozen)
+- `--freeze-image-encoder-stage2 / --no-freeze-image-encoder-stage2` (default **unfrozen**; CLIP-ReID Stage-2 fine-tunes the vision encoder. Pass `--freeze-image-encoder-stage2` to fall back to prompt-tuning-only mode, which on person ReID tops out near the frozen CLIP image-only mAP floor.)
 - `--freeze-text-encoder / --no-freeze-text-encoder` (default frozen — CoOp/CLIP-ReID-style prompt tuning)
+- `--sanity-gate-epochs 0` (when > 0, fails the training run early at the
+  first Stage-2 validation at-or-past epoch offset if best mAP is below
+  `sanity-gate-factor × first-validation mAP`. Catches regressions where
+  training never escapes the random-init floor.)
+- `--sanity-gate-factor 1.5`
 
 Training uses identity-balanced batches for batch-hard triplet loss. Each
 train batch samples two images per identity, so `--batch-size 64` means
