@@ -9,8 +9,18 @@ Stage-1 prompt alignment:
 
 Stage-2 ReID training:
 
-- Trains prompt bank, classifier, TFC centers; CLIP encoders are frozen by
-  default and can be unfrozen with ``--no-freeze-image-encoder-stage2``.
+- Trains prompt bank, classifier, TFC centers, and (by default) the CLIP
+  vision backbone + visual projection. CLIP-ReID's Stage-2 recipe fine-tunes
+  the image encoder so the ReID signal can actually act on ``f_v``; freezing
+  it caps the retrieval mAP near the frozen CLIP image-only floor
+  (~1% on MSMT17) and is opt-in via ``--freeze-image-encoder-stage2``.
+- The unfrozen backbone uses its own (smaller) learning rate
+  ``image_encoder_lr`` to avoid catastrophic forgetting of the pretrained
+  visual features.
+- ``--beta-warmup-epochs`` ramps the fused retrieval beta from ``0`` at
+  epoch 1 to ``config.beta`` at ``warmup_epochs + 1``, so the random
+  camera-conditioned text feature does not pull ``f_eval`` below the
+  image-only floor at startup.
 - Total loss is::
 
       L_id + L_triplet + clip_weight * L_clip_dual + tfc_weight * L_TFC
@@ -89,6 +99,9 @@ class JobDataConfig:
     root: Path
 
 
+DEFAULT_IMAGE_ENCODER_LR = 5e-5
+
+
 @dataclass(frozen=True)
 class CLIPReIDJobConfig:
     dataset: str
@@ -97,6 +110,7 @@ class CLIPReIDJobConfig:
     batch_size: int
     num_workers: int
     lr: float
+    image_encoder_lr: float
     device: torch.device
     beta: float
     context_length: int
@@ -111,6 +125,7 @@ class CLIPReIDJobConfig:
     freeze_image_encoder_stage2: bool
     freeze_text_encoder: bool
     retrieval_mode: str = "fused"
+    beta_warmup_epochs: int = 0
 
 
 @dataclass(frozen=True)
@@ -144,6 +159,7 @@ class StageTrainingRuntime:
     stage: str
     loss_config: Any
     device: torch.device
+    beta_schedule: "BetaSchedule | None" = None
 
 
 @dataclass(frozen=True)
@@ -152,6 +168,34 @@ class ValidationRuntime:
     loaders: LoaderBundle
     device: torch.device
     retrieval_mode: str
+    beta_schedule: "BetaSchedule | None" = None
+
+
+@dataclass(frozen=True)
+class BetaSchedule:
+    """Linear ramp of the fused retrieval beta from 0 to ``beta`` over ``warmup_epochs`` Stage-2 epochs.
+
+    The fused text feature ``f_t_eval`` carries only global+camera signal — no identity — so
+    blended into ``f_eval`` early on, before the image backbone has learned anything
+    discriminative, it actively pushes samples toward their camera cluster and *lowers*
+    mAP below the image-only floor. The warmup lets the image encoder learn discriminative
+    features first, then blends the camera-conditioned text in once the image stream is
+    stable. At ``epoch == 1`` the effective beta is ``0`` (pure image feature); at
+    ``epoch == warmup_epochs + 1`` (and every epoch after) the effective beta is ``beta``.
+    """
+
+    beta: float
+    warmup_epochs: int
+
+    def effective_beta(self, epoch: int) -> float:
+        if self.warmup_epochs <= 0:
+            return self.beta
+        if epoch <= 1:
+            return 0.0
+        return self.beta * min(1.0, (epoch - 1) / self.warmup_epochs)
+
+    def apply(self, model: "CLIPReIDTrainingModel", epoch: int) -> None:
+        model.retrieval_model.beta = self.effective_beta(epoch)
 
 
 class CLIPReIDTrainingModel(torch.nn.Module):
@@ -177,14 +221,20 @@ def build_training_job(
     data = load_dataset_bundle(JobDataConfig(config.dataset, config.data_root), transform)
     shared_model = _build_training_model(config, loaded_clip.model, data).to(config.device)
     loaders = _build_loaders(data, config)
-    stage1_runtime, stage2_runtime, optimizer_stage1, optimizer_stage2 = _build_runtimes(
+    stage1_runtime, stage2_runtime, optimizer_stage1, optimizer_stage2, stage2_beta_schedule = _build_runtimes(
         config, shared_model, loaders
     )
     stage2_job = TrainingJob(
         model=shared_model,
         optimizer=optimizer_stage2,
         train_one_epoch=_train_one_epoch(stage2_runtime),
-        validate=_validate(ValidationRuntime(shared_model, loaders, config.device, config.retrieval_mode)),
+        validate=_validate(ValidationRuntime(
+            shared_model,
+            loaders,
+            config.device,
+            config.retrieval_mode,
+            beta_schedule=stage2_beta_schedule,
+        )),
     )
     if config.stage1_epochs <= 0:
         return stage2_job
@@ -245,6 +295,7 @@ def _job_config_from_args(args: Any) -> CLIPReIDJobConfig:
         batch_size=int(getattr(args, "batch_size", 64)),
         num_workers=int(getattr(args, "num_workers", 4)),
         lr=float(getattr(args, "lr", 1e-4)),
+        image_encoder_lr=float(getattr(args, "image_encoder_lr", DEFAULT_IMAGE_ENCODER_LR)),
         device=torch.device(args.device),
         beta=float(args.beta),
         context_length=int(args.context_length),
@@ -256,9 +307,10 @@ def _job_config_from_args(args: Any) -> CLIPReIDJobConfig:
         stage2_epochs=int(getattr(args, "epochs", 120)),
         validation_interval=int(getattr(args, "validation_interval", 5)),
         freeze_image_encoder_stage1=bool(getattr(args, "freeze_image_encoder_stage1", True)),
-        freeze_image_encoder_stage2=bool(getattr(args, "freeze_image_encoder_stage2", True)),
+        freeze_image_encoder_stage2=bool(getattr(args, "freeze_image_encoder_stage2", False)),
         freeze_text_encoder=bool(getattr(args, "freeze_text_encoder", True)),
         retrieval_mode=require_retrieval_mode(str(getattr(args, "retrieval_mode", "fused"))),
+        beta_warmup_epochs=int(getattr(args, "beta_warmup_epochs", 0)),
     )
 
 
@@ -266,7 +318,13 @@ def _build_runtimes(
     config: CLIPReIDJobConfig,
     model: CLIPReIDTrainingModel,
     loaders: LoaderBundle,
-) -> tuple[StageTrainingRuntime, StageTrainingRuntime, torch.optim.Optimizer, torch.optim.Optimizer]:
+) -> tuple[
+    StageTrainingRuntime,
+    StageTrainingRuntime,
+    torch.optim.Optimizer,
+    torch.optim.Optimizer,
+    BetaSchedule | None,
+]:
     _apply_freezing(model, config, stage=STAGE1)
     optimizer_stage1 = _build_optimizer(model, config)
     stage1_runtime = StageTrainingRuntime(
@@ -280,11 +338,13 @@ def _build_runtimes(
         tfc_weight=config.tfc_weight,
         clip_weight=config.clip_weight,
     )
+    stage2_beta_schedule = BetaSchedule(beta=config.beta, warmup_epochs=config.beta_warmup_epochs)
     stage2_runtime = StageTrainingRuntime(
         model=model, loaders=loaders, optimizer=optimizer_stage2, stage=STAGE2,
         loss_config=stage2_loss_config, device=config.device,
+        beta_schedule=stage2_beta_schedule,
     )
-    return stage1_runtime, stage2_runtime, optimizer_stage1, optimizer_stage2
+    return stage1_runtime, stage2_runtime, optimizer_stage1, optimizer_stage2, stage2_beta_schedule
 
 
 def _apply_freezing(model: CLIPReIDTrainingModel, config: CLIPReIDJobConfig, stage: str) -> None:
@@ -319,14 +379,36 @@ def _set_module_requires_grad(module: torch.nn.Module, value: bool) -> None:
         parameter.requires_grad_(value)
 
 
+# Parameter-name prefixes whose owner is the CLIP vision backbone. These receive the
+# smaller image-encoder learning rate so the pretrained visual features are tuned, not
+# catastrophically forgotten, when Stage-2 unfreezes the image encoder.
+BACKBONE_PARAMETER_PREFIXES = (
+    "retrieval_model.image_encoder.clip_model.vision_model.",
+    "retrieval_model.image_encoder.clip_model.visual_projection.",
+)
+
+
 def _build_optimizer(model: torch.nn.Module, config: CLIPReIDJobConfig) -> torch.optim.Optimizer:
-    parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
-    if not parameters:
+    backbone_params: list[torch.nn.Parameter] = []
+    new_params: list[torch.nn.Parameter] = []
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if name.startswith(BACKBONE_PARAMETER_PREFIXES):
+            backbone_params.append(parameter)
+        else:
+            new_params.append(parameter)
+    if not backbone_params and not new_params:
         raise ValueError(
             "no trainable parameters were found for the requested stage; "
             "enable at least one of the prompt_bank/classifier/text_encoder"
         )
-    return torch.optim.AdamW(parameters, lr=config.lr)
+    param_groups: list[dict[str, Any]] = []
+    if backbone_params:
+        param_groups.append({"params": backbone_params, "lr": config.image_encoder_lr, "name": "backbone"})
+    if new_params:
+        param_groups.append({"params": new_params, "lr": config.lr, "name": "new"})
+    return torch.optim.AdamW(param_groups)
 
 
 def _stage_metadata(config: CLIPReIDJobConfig) -> StageMetadata:
@@ -347,7 +429,9 @@ def _stage_metadata(config: CLIPReIDJobConfig) -> StageMetadata:
             "batch_size": config.batch_size,
             "num_workers": config.num_workers,
             "lr": config.lr,
+            "image_encoder_lr": config.image_encoder_lr,
             "beta": config.beta,
+            "beta_warmup_epochs": config.beta_warmup_epochs,
             "clip_weight": config.clip_weight,
             "tfc_weight": config.tfc_weight,
             "triplet_margin": config.triplet_margin,
@@ -467,6 +551,8 @@ def _loader(dataset: ReIDImageDataset, config: CLIPReIDJobConfig, shuffle: bool)
 
 def _train_one_epoch(runtime: StageTrainingRuntime):
     def train(epoch: int, reporter) -> dict[str, float]:
+        if runtime.beta_schedule is not None:
+            runtime.beta_schedule.apply(runtime.model, epoch)
         runtime.model.train()
         metric_names = _train_metric_names(runtime.stage)
         totals = {name: 0.0 for name in metric_names}
@@ -491,6 +577,8 @@ def _noop_validate():
 
 def _validate(runtime: ValidationRuntime):
     def validate(epoch: int) -> ReIDMetrics:
+        if runtime.beta_schedule is not None:
+            runtime.beta_schedule.apply(runtime.model, epoch)
         runtime.model.eval()
         query = _extract_features(
             runtime.model.retrieval_model,

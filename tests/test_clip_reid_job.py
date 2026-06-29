@@ -11,6 +11,7 @@ from t2c_clip.jobs.clip_reid import (
     CLIPLoadResult,
     JobDataConfig,
     _extract_features,
+    BetaSchedule,
     build_training_job,
     load_dataset_bundle,
 )
@@ -109,6 +110,86 @@ class CLIPReIDJobTest(unittest.TestCase):
         clip_model = job.model.retrieval_model.image_encoder.clip_model
         self.assertGreater(_trainable_parameter_count(clip_model.visual_projection), 0)
 
+    def test_default_args_freeze_image_encoder_stage2_is_false_when_attr_absent(self):
+        # The job config must default Stage-2 image encoder to UNFROZEN (matching
+        # CLIP-ReID's standard Stage-2 recipe) when the caller passes no explicit flag.
+        args = Namespace(
+            dataset="market1501",
+            data_root=Path("."),
+            clip_model_name="fake-clip",
+            batch_size=4,
+            num_workers=0,
+            lr=0.001,
+            device="cpu",
+            beta=0.1,
+            context_length=2,
+            tfc_momentum=0.5,
+            triplet_margin=0.3,
+            tfc_weight=1.0,
+            clip_weight=0.1,
+            stage1_epochs=0,
+            epochs=1,
+            validation_interval=1,
+            freeze_image_encoder_stage1=True,
+            # freeze_image_encoder_stage2 deliberately absent
+            freeze_text_encoder=True,
+            retrieval_mode="fused",
+        )
+        from t2c_clip.jobs.clip_reid import _job_config_from_args
+
+        config = _job_config_from_args(args)
+        self.assertFalse(config.freeze_image_encoder_stage2)
+
+    def test_image_encoder_lr_creates_separate_param_group_for_unfrozen_stage2(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            args = _training_args(root)
+            args.stage1_epochs = 0
+            args.freeze_image_encoder_stage1 = True
+            args.freeze_image_encoder_stage2 = False  # default unfrozen
+            args.lr = 0.001
+            args.image_encoder_lr = 5e-5
+
+            job = build_training_job(args, clip_loader=_load_fake_clip)
+
+        optimizer = job.optimizer
+        backbone_group, new_group = _lookup_param_groups(optimizer)
+        self.assertAlmostEqual(backbone_group["lr"], 5e-5)
+        self.assertAlmostEqual(new_group["lr"], 0.001)
+        # Filtered by name: backbone group should hold only visual_projection params.
+        backbone_names = [_element_name(model=job.model, parameter=parameter) for parameter in backbone_group["params"]]
+        self.assertTrue(
+            all("visual_projection" in name or "vision_model" in name for name in backbone_names),
+            f"backbone group contains non-backbone params: {backbone_names}",
+        )
+
+    def test_beta_schedule_ramps_from_zero_to_beta_over_warmup(self):
+        schedule = BetaSchedule(beta=0.1, warmup_epochs=5)
+        self.assertAlmostEqual(schedule.effective_beta(1), 0.0)
+        self.assertAlmostEqual(schedule.effective_beta(2), 0.02)
+        self.assertAlmostEqual(schedule.effective_beta(5), 0.08)
+        self.assertAlmostEqual(schedule.effective_beta(6), 0.1)
+        self.assertAlmostEqual(schedule.effective_beta(120), 0.1)
+
+    def test_beta_schedule_zero_warmup_returns_constant_beta(self):
+        schedule = BetaSchedule(beta=0.1, warmup_epochs=0)
+        self.assertAlmostEqual(schedule.effective_beta(1), 0.1)
+        self.assertAlmostEqual(schedule.effective_beta(10), 0.1)
+
+    def test_beta_schedule_applies_to_model_retrieval_beta(self):
+        class CLIPReIDTrainingModelStub(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.retrieval_model = torch.nn.Module()
+                self.retrieval_model.beta = 999.0
+
+        stub = CLIPReIDTrainingModelStub()
+        warmup_schedule = BetaSchedule(beta=0.3, warmup_epochs=2)
+        warmup_schedule.apply(stub, epoch=1)
+        self.assertEqual(stub.retrieval_model.beta, 0.0)
+        warmup_schedule.apply(stub, epoch=3)
+        self.assertAlmostEqual(stub.retrieval_model.beta, 0.3)
+
 
 def _load_fake_clip(model_name: str) -> CLIPLoadResult:
     return CLIPLoadResult(FakeCLIP(hidden_size=8, projection_dim=4), ImageAwareFakeImageProcessor(), tokenizer=None)
@@ -116,6 +197,25 @@ def _load_fake_clip(model_name: str) -> CLIPLoadResult:
 
 def _trainable_parameter_count(module: torch.nn.Module) -> int:
     return sum(parameter.numel() for parameter in module.parameters() if parameter.requires_grad)
+
+
+def _lookup_param_groups(optimizer: torch.optim.Optimizer) -> tuple[dict, dict]:
+    """Return the (backbone, new) param groups used by the grouped-learning-rate optimizer."""
+    by_name = {group.get("name", ""): group for group in optimizer.param_groups}
+    for required in ("backbone", "new"):
+        if required not in by_name:
+            raise AssertionError(
+                f"optimizer is missing required param group {required!r}; "
+                f"found names: {sorted(by_name)}"
+            )
+    return by_name["backbone"], by_name["new"]
+
+
+def _element_name(model: torch.nn.Module, parameter: torch.nn.Parameter) -> str:
+    for name, candidate in model.named_parameters():
+        if candidate is parameter:
+            return name
+    raise AssertionError("parameter is not present on model.named_parameters()")
 
 
 class TrainBatchReporterRecorder:
@@ -152,6 +252,7 @@ def _training_args(root: Path) -> Namespace:
         batch_size=4,
         num_workers=0,
         lr=0.001,
+        image_encoder_lr=5e-5,
         device="cpu",
         beta=0.1,
         context_length=2,
@@ -163,9 +264,10 @@ def _training_args(root: Path) -> Namespace:
         epochs=1,
         validation_interval=1,
         freeze_image_encoder_stage1=True,
-        freeze_image_encoder_stage2=True,
+        freeze_image_encoder_stage2=False,
         freeze_text_encoder=True,
         retrieval_mode="fused",
+        beta_warmup_epochs=0,
     )
 
 
