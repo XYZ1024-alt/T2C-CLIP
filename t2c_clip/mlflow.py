@@ -151,6 +151,9 @@ def log_stage_params_to_mlflow(metadata: Mapping[str, Any]) -> None:
         "clip_weight",
         "tfc_weight",
         "beta",
+        "beta_warmup_epochs",
+        "lr",
+        "image_encoder_lr",
         "retrieval_mode",
     ):
         if key in metadata:
