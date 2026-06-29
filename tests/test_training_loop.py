@@ -254,6 +254,89 @@ class TrainingLoopTest(unittest.TestCase):
 
         self.assertEqual(logged, [(1, ReIDMetrics(map=0.25, cmc={1: 0.5}), 0.25, True)])
 
+    def test_sanity_gate_off_when_offset_is_zero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_training_loop(
+                model=torch.nn.Linear(2, 2),
+                optimizer=None,
+                config=TrainingLoopConfig(
+                    total_epochs=10, validation_interval=5, checkpoint_dir=Path(tmp),
+                    sanity_check_offset=0,
+                ),
+                train_one_epoch=lambda epoch, reporter: None,
+                validate=lambda epoch: ReIDMetrics(map=0.0123, cmc={1: 0.0123}),
+                progress_factory=lambda iterable, **kwargs: iterable,
+            )
+            # Tolerating a flat random-init floor for the whole run is the OFF-default behaviour.
+            self.assertEqual(result.best_map, 0.0123)
+
+    def test_sanity_gate_raises_when_best_map_stays_at_random_floor(self):
+        from t2c_clip.loops import SanityCheckFailed
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(SanityCheckFailed) as context:
+                run_training_loop(
+                    model=torch.nn.Linear(2, 2),
+                    optimizer=None,
+                    config=TrainingLoopConfig(
+                        total_epochs=20, validation_interval=5, checkpoint_dir=Path(tmp),
+                        sanity_check_offset=11,
+                        sanity_improvement_factor=1.5,
+                    ),
+                    train_one_epoch=lambda epoch, reporter: None,
+                    validate=lambda epoch: ReIDMetrics(map=0.0123, cmc={1: 0.0123}),
+                    progress_factory=lambda iterable, **kwargs: iterable,
+                )
+        # First validation batch happens at epoch 5 (best=0.0123, first=0.0123);
+        # at epoch 15 (second validation past the offset) the gate fires since
+        # best (0.0123) < first (0.0123) * 1.5.
+        self.assertEqual(context.exception.first_map, 0.0123)
+        self.assertEqual(context.exception.best_map, 0.0123)
+        self.assertEqual(context.exception.epoch, 15)
+
+    def test_sanity_gate_passes_when_best_map_clears_floor(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = run_training_loop(
+                model=torch.nn.Linear(2, 2),
+                optimizer=None,
+                config=TrainingLoopConfig(
+                    total_epochs=20, validation_interval=5, checkpoint_dir=Path(tmp),
+                    sanity_check_offset=10,
+                    sanity_improvement_factor=1.5,
+                ),
+                train_one_epoch=lambda epoch, reporter: None,
+                # epoch 5 (first): 0.01; epoch 10 (second, past offset): 0.03 -> above 1.5x floor.
+                validate=lambda epoch: ReIDMetrics(
+                    map={5: 0.01, 10: 0.03, 15: 0.05, 20: 0.07}[epoch],
+                    cmc={1: 0.0},
+                ),
+                progress_factory=lambda iterable, **kwargs: iterable,
+            )
+        self.assertEqual(result.best_map, 0.07)
+
+    def test_sanity_gate_does_not_fire_with_only_one_validation_observation(self):
+        # The first validation event alone cannot express improvement, so the gate must wait.
+        with tempfile.TemporaryDirectory() as tmp:
+            run_training_loop(
+                model=torch.nn.Linear(2, 2),
+                optimizer=None,
+                config=TrainingLoopConfig(
+                    total_epochs=1, validation_interval=1, checkpoint_dir=Path(tmp),
+                    sanity_check_offset=1,
+                    sanity_improvement_factor=1.5,
+                ),
+                train_one_epoch=lambda epoch, reporter: None,
+                validate=lambda epoch: ReIDMetrics(map=0.0123, cmc={1: 0.0123}),
+                progress_factory=lambda iterable, **kwargs: iterable,
+            )
+
+    def test_sanity_check_offset_must_be_non_negative(self):
+        with self.assertRaises(ValueError):
+            TrainingLoopConfig(total_epochs=1, checkpoint_dir=Path("/tmp"), sanity_check_offset=-1)
+
+    def test_sanity_improvement_factor_must_be_positive(self):
+        with self.assertRaises(ValueError):
+            TrainingLoopConfig(total_epochs=1, checkpoint_dir=Path("/tmp"), sanity_improvement_factor=0.0)
+
 
 def _metric(epoch: int, validated_epochs: list[int], values: dict[int, float]) -> ReIDMetrics:
     validated_epochs.append(epoch)

@@ -38,13 +38,44 @@ class TrainingLoopConfig:
     progress_description: str = DEFAULT_PROGRESS_DESCRIPTION
     checkpoint_prefix: str = ""
     stage: str = STAGE2
+    # Early-stopping sanity gate: when ``sanity_check_offset > 0`` the loop inspects
+    # the first validation event whose (epoch - first_epoch + 1) >= sanity_check_offset
+    # and raises :class:`SanityCheckFailed` if the best mAP so far is below
+    # ``first_validation_mAP * sanity_improvement_factor``. Catches regressions where
+    # training never escapes the random-init floor (e.g. a frozen image encoder that
+    # prevents the ReID signal from acting on the retrieval feature).
+    sanity_check_offset: int = 0
+    sanity_improvement_factor: float = 1.5
 
     def __post_init__(self) -> None:
         _require_positive(self.total_epochs, "total_epochs")
         _require_positive(self.validation_interval, "validation_interval")
         _require_positive(self.first_epoch, "first_epoch")
+        if self.sanity_check_offset < 0:
+            raise ValueError("sanity_check_offset must be non-negative")
+        if self.sanity_improvement_factor <= 0:
+            raise ValueError("sanity_improvement_factor must be positive")
         if self.checkpoint_prefix and not all(c.isalnum() or c == "_" for c in self.checkpoint_prefix):
             raise ValueError("checkpoint_prefix must be alphanumeric or underscore only")
+
+
+class SanityCheckFailed(RuntimeError):
+    """Raised by ``run_training_loop`` when the configured sanity gate fires and training
+    has failed to escape the random-init mAP floor."""
+
+    def __init__(self, *, first_map: float, best_map: float | None, factor: float, epoch: int):
+        first_display = f"{first_map:.6f}" if first_map == first_map else "nan"
+        best_display = "none" if best_map is None else f"{best_map:.6f}"
+        super().__init__(
+            f"sanity gate fired at epoch {epoch}: best mAP {best_display} failed to reach "
+            f"{factor}x the first validation mAP {first_display}; training is stuck at the "
+            "random-init floor — check whether the ReID signal can actually reach the "
+            "retrieval feature (frozen image encoder, missing gradients, mismatched losses)."
+        )
+        self.first_map = first_map
+        self.best_map = best_map
+        self.factor = factor
+        self.epoch = epoch
 
 
 @dataclass(frozen=True)
@@ -128,6 +159,9 @@ def run_training_loop(
 ) -> TrainingLoopResult:
     config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
     best_map: float | None = None
+    first_validated_map: float | None = None
+    validation_count = 0
+    sanity_gate_triggered = False
     history: list[EpochResult] = []
     train_step = 0
     for epoch in _epoch_numbers(config):
@@ -140,6 +174,15 @@ def run_training_loop(
         metrics = validate(epoch) if should_validate_epoch(epoch, config.validation_interval) else None
         is_best = _is_best_metric(metrics, best_map)
         best_map = metrics.map if is_best and metrics is not None else best_map
+        if metrics is not None:
+            validation_count += 1
+            if first_validated_map is None:
+                first_validated_map = metrics.map
+            # The sanity gate compares mAP between validation events, so it only fires on
+            # epochs where a validation actually ran.
+            sanity_gate_triggered |= _maybe_fire_sanity_gate(
+                config, epoch, validation_count, first_validated_map, best_map, sanity_gate_triggered
+            )
         _report_metrics(reporter.progress, epoch, train_metrics, metrics, best_map, is_best, metric_logger)
         _save_epoch_checkpoints(model, optimizer, config, epoch, metrics, best_map, is_best)
         history.append(EpochResult(epoch, metrics, best_map, is_best, train_metrics))
@@ -187,6 +230,40 @@ def _is_best_metric(metrics: ReIDMetrics | None, best_map: float | None) -> bool
     if best_map is None:
         return True
     return metrics.map > best_map
+
+
+def _maybe_fire_sanity_gate(
+    config: TrainingLoopConfig,
+    epoch: int,
+    validation_count: int,
+    first_validated_map: float | None,
+    best_map: float | None,
+    already_triggered: bool,
+) -> bool:
+    """Trigger the sanity gate once, at the first validation event at-or-past the offset.
+
+    Returns ``True`` if the gate has now fired (whether or not it raised). Raises
+    :class:`SanityCheckFailed` when the best mAP failed to clear the configured floor.
+
+    The gate requires at least two validations so we measure *improvement* rather than
+    comparing the first mAP to itself.
+    """
+    if already_triggered or config.sanity_check_offset <= 0 or validation_count < 2:
+        return already_triggered
+    if first_validated_map is None:
+        return already_triggered
+    epochs_completed = epoch - config.first_epoch + 1
+    if epochs_completed < config.sanity_check_offset:
+        return False
+    floor = first_validated_map * config.sanity_improvement_factor
+    if best_map is None or best_map < floor:
+        raise SanityCheckFailed(
+            first_map=first_validated_map,
+            best_map=best_map,
+            factor=config.sanity_improvement_factor,
+            epoch=epoch,
+        )
+    return True
 
 
 def _report_metrics(
