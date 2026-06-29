@@ -50,6 +50,10 @@ DEFAULT_CLIP_MODEL_NAME = "openai/clip-vit-base-patch16"
 DEFAULT_BATCH_SIZE = 64
 DEFAULT_NUM_WORKERS = 4
 DEFAULT_LEARNING_RATE = 1e-4
+DEFAULT_IMAGE_ENCODER_LR = 5e-5
+DEFAULT_BETA_WARMUP_EPOCHS = 0
+DEFAULT_SANITY_GATE_EPOCHS = 0
+DEFAULT_SANITY_GATE_FACTOR = 1.5
 DEFAULT_DEVICE = "cuda"
 DEFAULT_BETA = 0.1
 DEFAULT_CONTEXT_LENGTH = 4
@@ -156,8 +160,10 @@ def _add_project_training_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--num-workers", type=int, default=DEFAULT_NUM_WORKERS)
     parser.add_argument("--lr", type=float, default=DEFAULT_LEARNING_RATE)
+    parser.add_argument("--image-encoder-lr", type=float, default=DEFAULT_IMAGE_ENCODER_LR)
     parser.add_argument("--device", default=DEFAULT_DEVICE)
     parser.add_argument("--beta", type=float, default=DEFAULT_BETA)
+    parser.add_argument("--beta-warmup-epochs", type=int, default=DEFAULT_BETA_WARMUP_EPOCHS)
     parser.add_argument("--context-length", type=int, default=DEFAULT_CONTEXT_LENGTH)
     parser.add_argument("--tfc-momentum", type=float, default=DEFAULT_TFC_MOMENTUM)
     parser.add_argument("--triplet-margin", type=float, default=DEFAULT_TRIPLET_MARGIN)
@@ -173,13 +179,15 @@ def _add_project_training_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--freeze-image-encoder-stage2",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
     )
     parser.add_argument(
         "--freeze-text-encoder",
         action=argparse.BooleanOptionalAction,
         default=True,
     )
+    parser.add_argument("--sanity-gate-epochs", type=int, default=DEFAULT_SANITY_GATE_EPOCHS)
+    parser.add_argument("--sanity-gate-factor", type=float, default=DEFAULT_SANITY_GATE_FACTOR)
 
 
 def _mlflow_context_if_requested(args: argparse.Namespace):
@@ -224,6 +232,8 @@ def _run_two_stage_loop(job: TwoStageTrainingJob, args: argparse.Namespace, prog
         progress_description="stage2",
         checkpoint_prefix="",
         stage="stage2",
+        sanity_check_offset=int(getattr(args, "sanity_gate_epochs", 0)),
+        sanity_improvement_factor=float(getattr(args, "sanity_gate_factor", 1.5)),
     )
     run_training_loop(
         model=job.stage2.model,
@@ -246,6 +256,8 @@ def _run_single_loop(job: TrainingJob, args: argparse.Namespace, progress_factor
         checkpoint_dir=args.checkpoint_dir,
         progress_description="stage2",
         stage="stage2",
+        sanity_check_offset=int(getattr(args, "sanity_gate_epochs", 0)),
+        sanity_improvement_factor=float(getattr(args, "sanity_gate_factor", 1.5)),
     )
     run_training_loop(
         model=job.model,
