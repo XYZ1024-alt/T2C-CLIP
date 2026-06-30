@@ -97,6 +97,21 @@ class CLIPReIDJobTest(unittest.TestCase):
         clip_model = job.stage2.model.retrieval_model.image_encoder.clip_model
         self.assertGreater(_trainable_parameter_count(clip_model.visual_projection), 0)
 
+    def test_stage1_training_reapplies_stage1_freezing_before_epoch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            args = _training_args(root)
+            args.stage1_epochs = 1
+            args.freeze_image_encoder_stage1 = True
+            args.freeze_image_encoder_stage2 = False
+            job = build_training_job(args, clip_loader=_load_fake_clip)
+            reporter = TrainBatchReporterRecorder()
+
+            job.stage1.train_one_epoch(1, reporter)
+
+        clip_model = job.stage1.model.retrieval_model.image_encoder.clip_model
+        self.assertEqual(_trainable_parameter_count(clip_model.visual_projection), 0)
+
     def test_no_freeze_image_encoder_stage2_works_without_stage1_epochs(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
@@ -171,6 +186,14 @@ class CLIPReIDJobTest(unittest.TestCase):
         self.assertAlmostEqual(schedule.effective_beta(6), 0.1)
         self.assertAlmostEqual(schedule.effective_beta(120), 0.1)
 
+    def test_beta_schedule_uses_stage_local_epoch_offset(self):
+        schedule = BetaSchedule(beta=0.1, warmup_epochs=5)
+
+        self.assertAlmostEqual(schedule.effective_beta(stage_epoch=1), 0.0)
+        self.assertAlmostEqual(schedule.effective_beta(stage_epoch=2), 0.02)
+        self.assertAlmostEqual(schedule.effective_beta(stage_epoch=5), 0.08)
+        self.assertAlmostEqual(schedule.effective_beta(stage_epoch=6), 0.1)
+
     def test_beta_schedule_zero_warmup_returns_constant_beta(self):
         schedule = BetaSchedule(beta=0.1, warmup_epochs=0)
         self.assertAlmostEqual(schedule.effective_beta(1), 0.1)
@@ -189,6 +212,25 @@ class CLIPReIDJobTest(unittest.TestCase):
         self.assertEqual(stub.retrieval_model.beta, 0.0)
         warmup_schedule.apply(stub, epoch=3)
         self.assertAlmostEqual(stub.retrieval_model.beta, 0.3)
+
+    def test_beta_schedule_apply_uses_stage_first_epoch(self):
+        class CLIPReIDTrainingModelStub(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.retrieval_model = torch.nn.Module()
+                self.retrieval_model.beta = 999.0
+
+        stub = CLIPReIDTrainingModelStub()
+        schedule = BetaSchedule(beta=0.1, warmup_epochs=5, first_epoch=11)
+
+        schedule.apply(stub, epoch=11)
+        self.assertAlmostEqual(stub.retrieval_model.beta, 0.0)
+
+        schedule.apply(stub, epoch=15)
+        self.assertAlmostEqual(stub.retrieval_model.beta, 0.08)
+
+        schedule.apply(stub, epoch=16)
+        self.assertAlmostEqual(stub.retrieval_model.beta, 0.1)
 
 
 def _load_fake_clip(model_name: str) -> CLIPLoadResult:

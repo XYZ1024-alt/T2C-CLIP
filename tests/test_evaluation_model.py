@@ -33,6 +33,13 @@ class EvaluationModelTest(unittest.TestCase):
         self.assertEqual(metrics.map, 0.5)
         self.assertEqual(metrics.cmc[1], 0.0)
 
+    def test_evaluate_reid_rejects_empty_query_or_gallery(self):
+        with self.assertRaisesRegex(ValueError, "query_features must contain at least one row"):
+            evaluate_reid(torch.empty(0, 2), torch.empty(1, 2), [], [1], [], [1])
+
+        with self.assertRaisesRegex(ValueError, "gallery_features must contain at least one row"):
+            evaluate_reid(torch.empty(1, 2), torch.empty(0, 2), [1], [], [1], [])
+
     def test_model_inference_uses_global_and_camera_prompts(self):
         prompt_bank = PromptBank(PromptConfig(num_cameras=1, num_train_ids=1, context_length=1, embedding_dim=2))
         with torch.no_grad():

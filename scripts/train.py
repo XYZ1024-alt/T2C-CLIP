@@ -98,6 +98,7 @@ class TwoStageTrainingJob:
 
 def main(argv: Sequence[str] | None = None, progress_factory: ProgressFactory | None = None) -> int:
     args = _build_parser().parse_args(argv)
+    args.stage2_first_epoch = args.stage1_epochs + 1
     with _mlflow_context_if_requested(args):
         job = _load_job_builder(args.job_builder)(args)
         # Use a structural check rather than ``isinstance(job, TwoStageTrainingJob)``.
