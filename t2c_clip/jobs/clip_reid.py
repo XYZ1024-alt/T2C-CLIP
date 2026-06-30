@@ -58,7 +58,7 @@ from t2c_clip.datasets import (
     build_person_id_map,
     collate_reid_batches,
 )
-from t2c_clip.evaluation import ReIDMetrics, evaluate_reid
+from t2c_clip.evaluation import ReIDMetrics, evaluate_reid, evaluate_reid_with_rerank
 from t2c_clip.model import T2CClipModel
 from t2c_clip.prompts import PromptBank, PromptConfig
 from t2c_clip.retrieval import require_retrieval_mode
@@ -107,6 +107,7 @@ class CLIPReIDJobConfig:
     dataset: str
     data_root: Path
     clip_model_name: str
+    clip_checkpoint: Path | None
     batch_size: int
     num_workers: int
     lr: float
@@ -118,6 +119,7 @@ class CLIPReIDJobConfig:
     triplet_margin: float
     tfc_weight: float
     clip_weight: float
+    label_smoothing: float
     stage1_epochs: int
     stage2_epochs: int
     validation_interval: int
@@ -125,8 +127,11 @@ class CLIPReIDJobConfig:
     freeze_image_encoder_stage2: bool
     freeze_text_encoder: bool
     stage2_first_epoch: int = 1
+    freeze_prompt_bank_stage2: bool = False
+    reid_head: str = "linear"
     retrieval_mode: str = "fused"
     beta_warmup_epochs: int = 0
+    report_rerank: bool = False
 
 
 @dataclass(frozen=True)
@@ -172,6 +177,7 @@ class ValidationRuntime:
     retrieval_mode: str
     model_config: "CLIPReIDJobConfig"
     beta_schedule: "BetaSchedule | None" = None
+    report_rerank: bool = False
 
 
 @dataclass(frozen=True)
@@ -211,11 +217,27 @@ class CLIPReIDTrainingModel(torch.nn.Module):
         retrieval_model: T2CClipModel,
         classifier: torch.nn.Module,
         tfc_bank: TFCCenterBank,
+        *,
+        feature_head: torch.nn.Module | None = None,
     ):
         super().__init__()
         self.retrieval_model = retrieval_model
         self.classifier = classifier
         self.tfc_bank = tfc_bank
+        self.feature_head = torch.nn.Identity() if feature_head is None else feature_head
+
+
+class BNNeck(torch.nn.Module):
+    def __init__(self, feature_dim: int):
+        super().__init__()
+        self.bn = torch.nn.BatchNorm1d(feature_dim)
+        self.freeze_bias()
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        return self.bn(features)
+
+    def freeze_bias(self) -> None:
+        self.bn.bias.requires_grad_(False)
 
 
 def build_training_job(
@@ -224,6 +246,7 @@ def build_training_job(
 ) -> TwoStageTrainingJob | TrainingJob:
     config = _job_config_from_args(args)
     loaded_clip = clip_loader(config.clip_model_name)
+    _load_clip_checkpoint_if_requested(loaded_clip.model, config.clip_checkpoint, config.device)
     transform = CLIPImageTransform(loaded_clip.image_processor)
     data = load_dataset_bundle(JobDataConfig(config.dataset, config.data_root), transform)
     shared_model = _build_training_model(config, loaded_clip.model, data).to(config.device)
@@ -242,6 +265,7 @@ def build_training_job(
             config.retrieval_mode,
             config,
             beta_schedule=stage2_beta_schedule,
+            report_rerank=config.report_rerank,
         )),
     )
     if config.stage1_epochs <= 0:
@@ -300,6 +324,7 @@ def _job_config_from_args(args: Any) -> CLIPReIDJobConfig:
         dataset=args.dataset,
         data_root=args.data_root,
         clip_model_name=args.clip_model_name,
+        clip_checkpoint=getattr(args, "clip_checkpoint", None),
         batch_size=int(getattr(args, "batch_size", 64)),
         num_workers=int(getattr(args, "num_workers", 4)),
         lr=float(getattr(args, "lr", 1e-4)),
@@ -311,6 +336,7 @@ def _job_config_from_args(args: Any) -> CLIPReIDJobConfig:
         triplet_margin=float(args.triplet_margin),
         tfc_weight=float(args.tfc_weight),
         clip_weight=float(getattr(args, "clip_weight", 0.1)),
+        label_smoothing=float(getattr(args, "label_smoothing", 0.0)),
         stage1_epochs=int(getattr(args, "stage1_epochs", 0)),
         stage2_epochs=int(getattr(args, "epochs", 120)),
         validation_interval=int(getattr(args, "validation_interval", 5)),
@@ -318,8 +344,11 @@ def _job_config_from_args(args: Any) -> CLIPReIDJobConfig:
         freeze_image_encoder_stage2=bool(getattr(args, "freeze_image_encoder_stage2", False)),
         freeze_text_encoder=bool(getattr(args, "freeze_text_encoder", True)),
         stage2_first_epoch=int(getattr(args, "stage2_first_epoch", int(getattr(args, "stage1_epochs", 0)) + 1)),
+        freeze_prompt_bank_stage2=bool(getattr(args, "freeze_prompt_bank_stage2", False)),
+        reid_head=str(getattr(args, "reid_head", "linear")),
         retrieval_mode=require_retrieval_mode(str(getattr(args, "retrieval_mode", "fused"))),
         beta_warmup_epochs=int(getattr(args, "beta_warmup_epochs", 0)),
+        report_rerank=bool(getattr(args, "report_rerank", False)),
     )
 
 
@@ -347,6 +376,7 @@ def _build_runtimes(
         triplet_margin=config.triplet_margin,
         tfc_weight=config.tfc_weight,
         clip_weight=config.clip_weight,
+        label_smoothing=config.label_smoothing,
     )
     stage2_beta_schedule = BetaSchedule(
         beta=config.beta,
@@ -371,8 +401,12 @@ def _apply_freezing(model: CLIPReIDTrainingModel, config: CLIPReIDJobConfig, sta
     _set_module_requires_grad(clip_model.visual_projection, image_trainable)
     _set_module_requires_grad(clip_model.text_model, text_trainable)
     _set_module_requires_grad(clip_model.text_projection, text_trainable)
-    retrieval.prompt_bank.requires_grad_(True)
+    prompt_trainable = stage == STAGE1 or not config.freeze_prompt_bank_stage2
+    retrieval.prompt_bank.requires_grad_(prompt_trainable)
     model.classifier.requires_grad_(stage == STAGE2)
+    model.feature_head.requires_grad_(stage == STAGE2)
+    if isinstance(model.feature_head, BNNeck):
+        model.feature_head.freeze_bias()
 
 
 def _image_encoder_trainable(config: CLIPReIDJobConfig, stage: str) -> bool:
@@ -438,6 +472,7 @@ def _stage_metadata(config: CLIPReIDJobConfig) -> StageMetadata:
         values={
             "dataset": config.dataset,
             "clip_model_name": config.clip_model_name,
+            "clip_checkpoint": str(config.clip_checkpoint) if config.clip_checkpoint is not None else None,
             "stage1_epochs": config.stage1_epochs,
             "stage2_epochs": config.stage2_epochs,
             "stage2_first_epoch": config.stage2_first_epoch,
@@ -449,6 +484,7 @@ def _stage_metadata(config: CLIPReIDJobConfig) -> StageMetadata:
             "beta": config.beta,
             "beta_warmup_epochs": config.beta_warmup_epochs,
             "clip_weight": config.clip_weight,
+            "label_smoothing": config.label_smoothing,
             "tfc_weight": config.tfc_weight,
             "triplet_margin": config.triplet_margin,
             "tfc_momentum": config.tfc_momentum,
@@ -456,7 +492,10 @@ def _stage_metadata(config: CLIPReIDJobConfig) -> StageMetadata:
             "freeze_image_encoder_stage1": config.freeze_image_encoder_stage1,
             "freeze_image_encoder_stage2": config.freeze_image_encoder_stage2,
             "freeze_text_encoder": config.freeze_text_encoder,
+            "freeze_prompt_bank_stage2": config.freeze_prompt_bank_stage2,
+            "reid_head": config.reid_head,
             "retrieval_mode": config.retrieval_mode,
+            "report_rerank": config.report_rerank,
         }
     )
 
@@ -520,7 +559,36 @@ def _build_training_model(
     )
     classifier = torch.nn.Linear(projection_dim, data.num_train_ids)
     tfc_bank = TFCCenterBank(data.num_train_ids, projection_dim, config.tfc_momentum)
-    return CLIPReIDTrainingModel(retrieval, classifier, tfc_bank)
+    feature_head = _build_feature_head(config.reid_head, projection_dim)
+    return CLIPReIDTrainingModel(retrieval, classifier, tfc_bank, feature_head=feature_head)
+
+
+def _load_clip_checkpoint_if_requested(
+    model: torch.nn.Module,
+    checkpoint: Path | None,
+    device: torch.device,
+) -> None:
+    if checkpoint is None:
+        return
+    if not checkpoint.exists():
+        raise FileNotFoundError(f"CLIP checkpoint does not exist: {checkpoint}")
+    payload = torch.load(checkpoint, map_location=device)
+    state_dict = payload.get("state_dict", payload) if isinstance(payload, dict) else payload
+    if not isinstance(state_dict, dict):
+        raise TypeError("CLIP checkpoint must be a state_dict or contain a state_dict key")
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if unexpected:
+        raise ValueError(f"unexpected CLIP checkpoint keys: {unexpected}")
+    if missing:
+        raise ValueError(f"missing CLIP checkpoint keys: {missing}")
+
+
+def _build_feature_head(reid_head: str, projection_dim: int) -> torch.nn.Module:
+    if reid_head == "linear":
+        return torch.nn.Identity()
+    if reid_head == "bnneck":
+        return BNNeck(projection_dim)
+    raise ValueError(f"unsupported reid_head: {reid_head!r}")
 
 
 def _resolve_clip_token_ids(clip_model: torch.nn.Module, config: CLIPReIDJobConfig) -> tuple[int, int, int]:
@@ -611,14 +679,33 @@ def _validate(runtime: ValidationRuntime):
             runtime.device,
             runtime.retrieval_mode,
         )
-        return evaluate_reid(
+        metrics = evaluate_reid(
             query.features,
             gallery.features,
-            query.person_ids,
-            gallery.person_ids,
-            query.camera_ids,
-            gallery.camera_ids,
+            query_ids=query.person_ids,
+            gallery_ids=gallery.person_ids,
+            query_cams=query.camera_ids,
+            gallery_cams=gallery.camera_ids,
             ranks=DEFAULT_RANKS,
+        )
+        if not runtime.report_rerank:
+            return metrics
+        rerank = evaluate_reid_with_rerank(
+            query.features,
+            gallery.features,
+            query_ids=query.person_ids,
+            gallery_ids=gallery.person_ids,
+            query_cams=query.camera_ids,
+            gallery_cams=gallery.camera_ids,
+            ranks=DEFAULT_RANKS,
+        )
+        return ReIDMetrics(
+            map=metrics.map,
+            cmc=metrics.cmc,
+            extras={
+                "rerank_mAP": rerank.map,
+                "rerank_rank_1": rerank.cmc[1],
+            },
         )
 
     return validate
@@ -685,6 +772,7 @@ def _stage2_step(runtime: StageTrainingRuntime, batch: TrainingBatch) -> Stage2L
     inputs = Stage2LossInputs(
         classifier=runtime.model.classifier,
         tfc_bank=runtime.model.tfc_bank,
+        feature_head=runtime.model.feature_head,
         config=runtime.loss_config,
     )
     return stage2_loss_breakdown(runtime.model.retrieval_model, batch, inputs)

@@ -47,10 +47,10 @@ def _evaluate_npz(path: Path, ranks: tuple[int, ...]) -> ReIDMetrics:
         return evaluate_reid(
             torch.as_tensor(data["query_features"], dtype=torch.float32),
             torch.as_tensor(data["gallery_features"], dtype=torch.float32),
-            data["query_ids"].astype(int).tolist(),
-            data["gallery_ids"].astype(int).tolist(),
-            data["query_cams"].astype(int).tolist(),
-            data["gallery_cams"].astype(int).tolist(),
+            query_ids=data["query_ids"].astype(int).tolist(),
+            gallery_ids=data["gallery_ids"].astype(int).tolist(),
+            query_cams=data["query_cams"].astype(int).tolist(),
+            gallery_cams=data["gallery_cams"].astype(int).tolist(),
             ranks=ranks,
         )
 
@@ -62,10 +62,13 @@ def _validate_keys(keys: Sequence[str], path: Path) -> None:
 
 
 def _metrics_payload(metrics: ReIDMetrics) -> dict[str, object]:
-    return {
+    payload: dict[str, object] = {
         "cmc": {str(rank): value for rank, value in metrics.cmc.items()},
         "mAP": metrics.map,
     }
+    if metrics.extras:
+        payload["extras"] = dict(metrics.extras)
+    return payload
 
 
 if __name__ == "__main__":

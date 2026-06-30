@@ -104,6 +104,8 @@ def log_reid_metrics_to_mlflow(
     mlflow.log_metric("is_best", float(is_best), step=epoch)
     for rank, value in metrics.cmc.items():
         mlflow.log_metric(f"rank_{rank}", value, step=epoch)
+    for name, value in metrics.extras.items():
+        mlflow.log_metric(name, value, step=epoch)
 
 
 def log_training_metrics_to_mlflow(epoch: int, metrics: Mapping[str, float]) -> None:
@@ -144,17 +146,22 @@ def log_stage_params_to_mlflow(metadata: Mapping[str, Any]) -> None:
     for key in (
         "stage1_epochs",
         "stage2_epochs",
+        "clip_checkpoint",
         "validation_interval",
         "freeze_image_encoder_stage1",
         "freeze_image_encoder_stage2",
         "freeze_text_encoder",
+        "freeze_prompt_bank_stage2",
         "clip_weight",
+        "label_smoothing",
         "tfc_weight",
         "beta",
         "beta_warmup_epochs",
         "lr",
         "image_encoder_lr",
+        "reid_head",
         "retrieval_mode",
+        "report_rerank",
     ):
         if key in metadata:
             mlflow.log_param(key, metadata[key])
