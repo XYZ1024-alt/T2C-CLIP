@@ -102,6 +102,10 @@ def _validate_inputs(
 ) -> None:
     if query_features.ndim != 2 or gallery_features.ndim != 2:
         raise ValueError("query_features and gallery_features must be rank-2 tensors")
+    if query_features.shape[0] < 1:
+        raise ValueError("query_features must contain at least one row")
+    if gallery_features.shape[0] < 1:
+        raise ValueError("gallery_features must contain at least one row")
     if query_features.shape[1] != gallery_features.shape[1]:
         raise ValueError("query and gallery feature dimensions must match")
     if len(query_ids) != query_features.shape[0] or len(query_cams) != query_features.shape[0]:

@@ -124,6 +124,7 @@ class CLIPReIDJobConfig:
     freeze_image_encoder_stage1: bool
     freeze_image_encoder_stage2: bool
     freeze_text_encoder: bool
+    stage2_first_epoch: int = 1
     retrieval_mode: str = "fused"
     beta_warmup_epochs: int = 0
 
@@ -160,6 +161,7 @@ class StageTrainingRuntime:
     loss_config: Any
     device: torch.device
     beta_schedule: "BetaSchedule | None" = None
+    freeze_config: "CLIPReIDJobConfig | None" = None
 
 
 @dataclass(frozen=True)
@@ -168,6 +170,7 @@ class ValidationRuntime:
     loaders: LoaderBundle
     device: torch.device
     retrieval_mode: str
+    model_config: "CLIPReIDJobConfig"
     beta_schedule: "BetaSchedule | None" = None
 
 
@@ -186,16 +189,20 @@ class BetaSchedule:
 
     beta: float
     warmup_epochs: int
+    first_epoch: int = 1
 
-    def effective_beta(self, epoch: int) -> float:
+    def effective_beta(self, stage_epoch: int) -> float:
+        if stage_epoch < 1:
+            raise ValueError("stage_epoch must be positive")
         if self.warmup_epochs <= 0:
             return self.beta
-        if epoch <= 1:
+        if stage_epoch <= 1:
             return 0.0
-        return self.beta * min(1.0, (epoch - 1) / self.warmup_epochs)
+        return self.beta * min(1.0, (stage_epoch - 1) / self.warmup_epochs)
 
     def apply(self, model: "CLIPReIDTrainingModel", epoch: int) -> None:
-        model.retrieval_model.beta = self.effective_beta(epoch)
+        stage_epoch = epoch - self.first_epoch + 1
+        model.retrieval_model.beta = self.effective_beta(stage_epoch)
 
 
 class CLIPReIDTrainingModel(torch.nn.Module):
@@ -233,6 +240,7 @@ def build_training_job(
             loaders,
             config.device,
             config.retrieval_mode,
+            config,
             beta_schedule=stage2_beta_schedule,
         )),
     )
@@ -309,6 +317,7 @@ def _job_config_from_args(args: Any) -> CLIPReIDJobConfig:
         freeze_image_encoder_stage1=bool(getattr(args, "freeze_image_encoder_stage1", True)),
         freeze_image_encoder_stage2=bool(getattr(args, "freeze_image_encoder_stage2", False)),
         freeze_text_encoder=bool(getattr(args, "freeze_text_encoder", True)),
+        stage2_first_epoch=int(getattr(args, "stage2_first_epoch", int(getattr(args, "stage1_epochs", 0)) + 1)),
         retrieval_mode=require_retrieval_mode(str(getattr(args, "retrieval_mode", "fused"))),
         beta_warmup_epochs=int(getattr(args, "beta_warmup_epochs", 0)),
     )
@@ -330,6 +339,7 @@ def _build_runtimes(
     stage1_runtime = StageTrainingRuntime(
         model=model, loaders=loaders, optimizer=optimizer_stage1, stage=STAGE1,
         loss_config=Stage1LossConfig(), device=config.device,
+        freeze_config=config,
     )
     _apply_freezing(model, config, stage=STAGE2)
     optimizer_stage2 = _build_optimizer(model, config)
@@ -338,11 +348,16 @@ def _build_runtimes(
         tfc_weight=config.tfc_weight,
         clip_weight=config.clip_weight,
     )
-    stage2_beta_schedule = BetaSchedule(beta=config.beta, warmup_epochs=config.beta_warmup_epochs)
+    stage2_beta_schedule = BetaSchedule(
+        beta=config.beta,
+        warmup_epochs=config.beta_warmup_epochs,
+        first_epoch=config.stage2_first_epoch,
+    )
     stage2_runtime = StageTrainingRuntime(
         model=model, loaders=loaders, optimizer=optimizer_stage2, stage=STAGE2,
         loss_config=stage2_loss_config, device=config.device,
         beta_schedule=stage2_beta_schedule,
+        freeze_config=config,
     )
     return stage1_runtime, stage2_runtime, optimizer_stage1, optimizer_stage2, stage2_beta_schedule
 
@@ -425,6 +440,7 @@ def _stage_metadata(config: CLIPReIDJobConfig) -> StageMetadata:
             "clip_model_name": config.clip_model_name,
             "stage1_epochs": config.stage1_epochs,
             "stage2_epochs": config.stage2_epochs,
+            "stage2_first_epoch": config.stage2_first_epoch,
             "validation_interval": config.validation_interval,
             "batch_size": config.batch_size,
             "num_workers": config.num_workers,
@@ -551,6 +567,8 @@ def _loader(dataset: ReIDImageDataset, config: CLIPReIDJobConfig, shuffle: bool)
 
 def _train_one_epoch(runtime: StageTrainingRuntime):
     def train(epoch: int, reporter) -> dict[str, float]:
+        if runtime.freeze_config is not None:
+            _apply_freezing(runtime.model, runtime.freeze_config, runtime.stage)
         if runtime.beta_schedule is not None:
             runtime.beta_schedule.apply(runtime.model, epoch)
         runtime.model.train()
@@ -577,6 +595,7 @@ def _noop_validate():
 
 def _validate(runtime: ValidationRuntime):
     def validate(epoch: int) -> ReIDMetrics:
+        _apply_freezing(runtime.model, runtime.model_config, STAGE2)
         if runtime.beta_schedule is not None:
             runtime.beta_schedule.apply(runtime.model, epoch)
         runtime.model.eval()
