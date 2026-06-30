@@ -84,6 +84,56 @@ class CLIPReIDJobTest(unittest.TestCase):
         self.assertEqual(features.camera_ids, (1, 2))
         self.assertEqual(tuple(features.features.shape), (2, 4))
 
+    def test_validation_reports_rerank_metrics_when_requested(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            args = _training_args(root)
+            args.report_rerank = True
+
+            job = build_training_job(args, clip_loader=_load_fake_clip)
+            metrics = job.validate(1)
+
+        self.assertIn(1, metrics.cmc)
+        self.assertIn("rerank_mAP", metrics.extras)
+        self.assertIn("rerank_rank_1", metrics.extras)
+
+    def test_local_clip_checkpoint_is_loaded_explicitly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            checkpoint = Path(tmp) / "clip_state.pth"
+            model = FakeCLIP(hidden_size=8, projection_dim=4)
+            state = model.state_dict()
+            key = "visual_projection.weight"
+            state[key] = torch.full_like(state[key], 0.25)
+            torch.save(state, checkpoint)
+            args = _training_args(root)
+            args.clip_checkpoint = checkpoint
+
+            job = build_training_job(args, clip_loader=_load_fake_clip)
+
+        loaded = job.model.retrieval_model.image_encoder.clip_model.visual_projection.weight
+        self.assertTrue(torch.allclose(loaded, torch.full_like(loaded, 0.25)))
+
+    def test_missing_clip_checkpoint_fails_at_startup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            args = _training_args(root)
+            args.clip_checkpoint = Path(tmp) / "missing.pth"
+
+            with self.assertRaises(FileNotFoundError):
+                build_training_job(args, clip_loader=_load_fake_clip)
+
+    def test_clip_checkpoint_with_unexpected_keys_fails_at_startup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            checkpoint = Path(tmp) / "bad_clip_state.pth"
+            torch.save({"not_a_clip_weight": torch.ones(1)}, checkpoint)
+            args = _training_args(root)
+            args.clip_checkpoint = checkpoint
+
+            with self.assertRaisesRegex(ValueError, "unexpected CLIP checkpoint keys"):
+                build_training_job(args, clip_loader=_load_fake_clip)
+
     def test_no_freeze_image_encoder_stage2_reenables_encoder_after_stage1_freeze(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
@@ -125,6 +175,50 @@ class CLIPReIDJobTest(unittest.TestCase):
         clip_model = job.model.retrieval_model.image_encoder.clip_model
         self.assertGreater(_trainable_parameter_count(clip_model.visual_projection), 0)
 
+    def test_stage2_can_freeze_prompt_bank_after_stage1(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            args = _training_args(root)
+            args.stage1_epochs = 1
+            args.freeze_prompt_bank_stage2 = True
+
+            job = build_training_job(args, clip_loader=_load_fake_clip)
+            job.stage2.train_one_epoch(2, TrainBatchReporterRecorder())
+
+        prompt_bank = job.stage2.model.retrieval_model.prompt_bank
+        self.assertEqual(_trainable_parameter_count(prompt_bank), 0)
+
+    def test_stage2_prompt_bank_remains_trainable_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            args = _training_args(root)
+
+            job = build_training_job(args, clip_loader=_load_fake_clip)
+
+        prompt_bank = job.model.retrieval_model.prompt_bank
+        self.assertGreater(_trainable_parameter_count(prompt_bank), 0)
+
+    def test_bnneck_adds_trainable_batch_norm_head(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            args = _training_args(root)
+            args.reid_head = "bnneck"
+
+            job = build_training_job(args, clip_loader=_load_fake_clip)
+
+        self.assertTrue(hasattr(job.model, "feature_head"))
+        self.assertGreater(_trainable_parameter_count(job.model.feature_head), 0)
+
+    def test_bnneck_keeps_batch_norm_bias_frozen_in_stage2(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            args = _training_args(root)
+            args.reid_head = "bnneck"
+
+            job = build_training_job(args, clip_loader=_load_fake_clip)
+
+        self.assertFalse(job.model.feature_head.bn.bias.requires_grad)
+
     def test_default_args_freeze_image_encoder_stage2_is_false_when_attr_absent(self):
         # The job config must default Stage-2 image encoder to UNFROZEN (matching
         # CLIP-ReID's standard Stage-2 recipe) when the caller passes no explicit flag.
@@ -142,12 +236,15 @@ class CLIPReIDJobTest(unittest.TestCase):
             triplet_margin=0.3,
             tfc_weight=1.0,
             clip_weight=0.1,
+            label_smoothing=0.0,
             stage1_epochs=0,
             epochs=1,
             validation_interval=1,
             freeze_image_encoder_stage1=True,
             # freeze_image_encoder_stage2 deliberately absent
             freeze_text_encoder=True,
+            freeze_prompt_bank_stage2=False,
+            reid_head="linear",
             retrieval_mode="fused",
         )
         from t2c_clip.jobs.clip_reid import _job_config_from_args
@@ -302,14 +399,19 @@ def _training_args(root: Path) -> Namespace:
         triplet_margin=0.3,
         tfc_weight=1.0,
         clip_weight=0.1,
+        label_smoothing=0.0,
         stage1_epochs=0,
         epochs=1,
         validation_interval=1,
         freeze_image_encoder_stage1=True,
         freeze_image_encoder_stage2=False,
         freeze_text_encoder=True,
+        freeze_prompt_bank_stage2=False,
+        reid_head="linear",
+        clip_checkpoint=None,
         retrieval_mode="fused",
         beta_warmup_epochs=0,
+        report_rerank=False,
     )
 
 

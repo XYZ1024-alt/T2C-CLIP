@@ -90,7 +90,12 @@ class MLflowSQLiteTest(unittest.TestCase):
                 experiment_name="T2C-CLIP-Training-Test",
             )
             with start_mlflow_sqlite_run(config, run_name="train-test") as run:
-                log_reid_metrics_to_mlflow(5, ReIDMetrics(map=0.4, cmc={1: 0.6}), 0.4, True)
+                log_reid_metrics_to_mlflow(
+                    5,
+                    ReIDMetrics(map=0.4, cmc={1: 0.6}, extras={"rerank_mAP": 0.5}),
+                    0.4,
+                    True,
+                )
                 run_id = run.run_id
             client = MlflowClient(tracking_uri=run.tracking_uri)
             logged = client.get_run(run_id)
@@ -98,6 +103,7 @@ class MLflowSQLiteTest(unittest.TestCase):
         self.assertEqual(logged.data.metrics["mAP"], 0.4)
         self.assertEqual(logged.data.metrics["best_mAP"], 0.4)
         self.assertEqual(logged.data.metrics["rank_1"], 0.6)
+        self.assertEqual(logged.data.metrics["rerank_mAP"], 0.5)
         self.assertEqual(logged.data.metrics["is_best"], 1.0)
         self.assertEqual(logged.data.tags["t2c_clip.role"], "training")
 

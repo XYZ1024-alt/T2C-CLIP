@@ -27,6 +27,7 @@ DEFAULT_LOGIT_SCALE = 1.0
 DEFAULT_TRIPLET_MARGIN = 0.3
 DEFAULT_TFC_WEIGHT = 1.0
 DEFAULT_CLIP_WEIGHT = 0.1
+DEFAULT_LABEL_SMOOTHING = 0.0
 
 
 @dataclass(frozen=True)
@@ -47,12 +48,14 @@ class Stage2LossConfig:
     triplet_margin: float = DEFAULT_TRIPLET_MARGIN
     tfc_weight: float = DEFAULT_TFC_WEIGHT
     clip_weight: float = DEFAULT_CLIP_WEIGHT
+    label_smoothing: float = DEFAULT_LABEL_SMOOTHING
 
 
 @dataclass(frozen=True)
 class Stage2LossInputs:
     classifier: torch.nn.Module
     tfc_bank: TFCCenterBank
+    feature_head: torch.nn.Module = field(default_factory=torch.nn.Identity)
     config: Stage2LossConfig = field(default_factory=Stage2LossConfig)
 
 
@@ -103,12 +106,16 @@ def stage2_loss_breakdown(
 ) -> Stage2LossBreakdown:
     outputs = model.forward_stage2(batch.images, batch.camera_ids, batch.person_ids)
     retrieval = outputs["retrieval"]
-    logits = inputs.classifier(retrieval)
+    logits = inputs.classifier(inputs.feature_head(retrieval))
     return Stage2LossBreakdown(
         clip_dual=bidirectional_contrastive_loss(
             outputs["visual"], outputs["text"], inputs.config.logit_scale
         ),
-        identity=F.cross_entropy(logits, batch.person_ids),
+        identity=F.cross_entropy(
+            logits,
+            batch.person_ids,
+            label_smoothing=inputs.config.label_smoothing,
+        ),
         triplet=batch_hard_triplet_loss(retrieval, batch.person_ids, inputs.config.triplet_margin),
         tfc=inputs.tfc_bank.loss(retrieval, batch.person_ids),
         tfc_weight=inputs.config.tfc_weight,

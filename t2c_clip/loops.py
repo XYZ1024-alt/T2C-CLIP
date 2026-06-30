@@ -360,6 +360,8 @@ def _metric_strings(metrics: ReIDMetrics, best_map: float | None) -> dict[str, s
     values = {"mAP": _format_metric(metrics.map), "best_mAP": _format_optional_metric(best_map)}
     for rank, value in sorted(metrics.cmc.items()):
         values[f"rank{rank}"] = _format_metric(value)
+    for name, value in sorted(metrics.extras.items()):
+        values[name] = _format_metric(value)
     return values
 
 
@@ -379,13 +381,14 @@ def _message_metric_keys(values: Mapping[str, str]) -> tuple[str, ...]:
 
 def _validation_message_keys(values: Mapping[str, str]) -> tuple[str, ...]:
     rank_keys = tuple(sorted((key for key in values if key.startswith("rank")), key=_rank_number))
+    extra_keys = tuple(sorted(key for key in values if key.startswith("rerank_")))
     prefix_keys = tuple(key for key in ("mAP",) if key in values)
     suffix_keys = tuple(key for key in ("best_mAP",) if key in values)
-    return prefix_keys + rank_keys + suffix_keys
+    return prefix_keys + rank_keys + suffix_keys + extra_keys
 
 
 def _is_validation_metric_key(key: str) -> bool:
-    return key in VALIDATION_METRIC_KEYS or key.startswith("rank")
+    return key in VALIDATION_METRIC_KEYS or key.startswith("rank") or key.startswith("rerank_")
 
 
 def _rank_number(key: str) -> int:
@@ -448,7 +451,7 @@ def _checkpoint_payload(
 def _metrics_payload(metrics: ReIDMetrics | None) -> dict[str, Any] | None:
     if metrics is None:
         return None
-    return {"mAP": metrics.map, "cmc": dict(metrics.cmc)}
+    return {"mAP": metrics.map, "cmc": dict(metrics.cmc), "extras": dict(metrics.extras)}
 
 
 def _require_positive(value: int, name: str) -> None:

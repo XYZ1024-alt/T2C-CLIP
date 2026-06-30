@@ -158,6 +158,7 @@ def _add_project_training_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dataset", choices=SUPPORTED_DATASETS)
     parser.add_argument("--data-root", type=Path)
     parser.add_argument("--clip-model-name", default=DEFAULT_CLIP_MODEL_NAME)
+    parser.add_argument("--clip-checkpoint", type=Path)
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--num-workers", type=int, default=DEFAULT_NUM_WORKERS)
     parser.add_argument("--lr", type=float, default=DEFAULT_LEARNING_RATE)
@@ -171,7 +172,15 @@ def _add_project_training_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--tfc-weight", type=float, default=DEFAULT_TFC_WEIGHT)
     parser.add_argument("--stage1-epochs", type=int, default=DEFAULT_STAGE1_EPOCHS)
     parser.add_argument("--clip-weight", type=float, default=DEFAULT_CLIP_WEIGHT)
+    parser.add_argument("--label-smoothing", type=float, default=0.0)
+    parser.add_argument("--reid-head", choices=("linear", "bnneck"), default="linear")
     parser.add_argument("--retrieval-mode", choices=SUPPORTED_RETRIEVAL_MODES, default=DEFAULT_RETRIEVAL_MODE)
+    parser.add_argument("--report-rerank", action="store_true")
+    parser.add_argument(
+        "--freeze-prompt-bank-stage2",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument(
         "--freeze-image-encoder-stage1",
         action=argparse.BooleanOptionalAction,

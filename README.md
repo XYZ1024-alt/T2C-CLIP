@@ -55,6 +55,9 @@ wsl --cd /mnt/d/Code/T2C-CLIP /home/xyz10/miniconda3/bin/conda run -n reid pytho
 ```
 
 The evaluator performs standard Image-to-Image ReID scoring without rerank. Same-identity same-camera gallery samples are excluded for each query.
+Training keeps this no-rerank mAP as the primary metric. Pass `--report-rerank`
+to log additional `rerank_mAP` and `rerank_rank_1` values for comparison only;
+do not mix those values into the main no-rerank result table.
 
 ## Training Loop Checkpoints
 
@@ -141,6 +144,8 @@ Useful training arguments:
 - `--dataset market1501|msmt17`
 - `--data-root PATH`
 - `--clip-model-name openai/clip-vit-base-patch16`
+- `--clip-checkpoint /path/to/clip_state.pth` (optional local CLIP/ReID
+  checkpoint; missing, unexpected, or incomplete keys fail at startup)
 - `--stage1-epochs N` (Stage-1 prompt alignment epochs; `0` skips Stage-1)
 - `--epochs N` (Stage-2 ReID training epochs)
 - `--validation-interval N` (Stage-2 mAP validation cadence)
@@ -160,10 +165,19 @@ Useful training arguments:
 - `--triplet-margin 0.3`
 - `--tfc-weight 1.0`
 - `--clip-weight 0.1`
+- `--label-smoothing 0.0` (Stage-2 identity classification label smoothing;
+  strong ReID recipes commonly use `0.1`)
+- `--reid-head linear|bnneck` (`bnneck` classifies BN-normalized retrieval
+  features while triplet/TFC/eval keep the T2C retrieval feature)
 - `--retrieval-mode fused|image_only` (`fused` validates global + camera prompt fusion; `image_only` validates normalized CLIP image features)
+- `--report-rerank` (logs extra rerank metrics while keeping primary `mAP`
+  no-rerank)
 - `--freeze-image-encoder-stage1 / --no-freeze-image-encoder-stage1` (default frozen)
 - `--freeze-image-encoder-stage2 / --no-freeze-image-encoder-stage2` (default **unfrozen**; CLIP-ReID Stage-2 fine-tunes the vision encoder. Pass `--freeze-image-encoder-stage2` to fall back to prompt-tuning-only mode, which on person ReID tops out near the frozen CLIP image-only mAP floor.)
 - `--freeze-text-encoder / --no-freeze-text-encoder` (default frozen — CoOp/CLIP-ReID-style prompt tuning)
+- `--freeze-prompt-bank-stage2 / --no-freeze-prompt-bank-stage2` (default
+  trainable; pass `--freeze-prompt-bank-stage2` for a CLIP-ReID-faithful
+  Stage-2 run that treats Stage-1 prompts as fixed text descriptors)
 - `--sanity-gate-epochs 0` (when > 0, fails the training run early at the
   first Stage-2 validation at-or-past epoch offset if best mAP is below
   `sanity-gate-factor × first-validation mAP`. Catches regressions where

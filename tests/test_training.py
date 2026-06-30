@@ -43,7 +43,7 @@ class TrainingLossTest(unittest.TestCase):
         model = _training_model(beta=0.0)
         classifier = torch.nn.Linear(2, 2, bias=False)
         with torch.no_grad():
-            classifier.weight.copy_(torch.eye(2))
+            classifier.weight.copy_(10.0 * torch.eye(2))
         batch = TrainingBatch(
             images=torch.tensor([[1.0, 0.0], [0.9, 0.1], [0.0, 1.0]]),
             camera_ids=torch.tensor([0, 0, 1]),
@@ -67,6 +67,52 @@ class TrainingLossTest(unittest.TestCase):
         self.assertTrue(torch.allclose(breakdown.total, expected))
         self.assertEqual(breakdown.clip_weight, 1.0)
         self.assertEqual(breakdown.tfc_weight, 0.5)
+
+    def test_stage2_loss_uses_configured_label_smoothing(self):
+        model = _training_model(beta=0.0)
+        classifier = torch.nn.Linear(2, 2, bias=False)
+        with torch.no_grad():
+            classifier.weight.copy_(torch.eye(2))
+        batch = TrainingBatch(
+            images=torch.tensor([[1.0, 0.0], [0.9, 0.1], [0.0, 1.0], [0.1, 0.9]]),
+            camera_ids=torch.tensor([0, 0, 1, 1]),
+            person_ids=torch.tensor([0, 0, 1, 1]),
+        )
+        tfc_bank = TFCCenterBank(num_train_ids=2, feature_dim=2, momentum=0.5)
+        tfc_bank.update(model.forward_stage2(batch.images, batch.camera_ids, batch.person_ids)["retrieval"], batch.person_ids)
+        config = Stage2LossConfig(label_smoothing=0.1)
+
+        breakdown = stage2_loss_breakdown(
+            model,
+            batch,
+            Stage2LossInputs(classifier=classifier, tfc_bank=tfc_bank, config=config),
+        )
+
+        self.assertGreater(float(breakdown.identity.detach()), 0.0)
+
+    def test_stage2_loss_classifies_feature_head_output(self):
+        model = _training_model(beta=0.0)
+        classifier = torch.nn.Linear(2, 2, bias=False)
+        with torch.no_grad():
+            classifier.weight.copy_(10.0 * torch.eye(2))
+        head = torch.nn.Linear(2, 2, bias=False)
+        with torch.no_grad():
+            head.weight.copy_(torch.tensor([[0.0, 1.0], [1.0, 0.0]]))
+        batch = TrainingBatch(
+            images=torch.tensor([[1.0, 0.0], [0.9, 0.1], [0.0, 1.0], [0.1, 0.9]]),
+            camera_ids=torch.tensor([0, 0, 1, 1]),
+            person_ids=torch.tensor([1, 1, 0, 0]),
+        )
+        tfc_bank = TFCCenterBank(num_train_ids=2, feature_dim=2, momentum=0.5)
+        tfc_bank.update(model.forward_stage2(batch.images, batch.camera_ids, batch.person_ids)["retrieval"], batch.person_ids)
+
+        breakdown = stage2_loss_breakdown(
+            model,
+            batch,
+            Stage2LossInputs(classifier=classifier, tfc_bank=tfc_bank, feature_head=head),
+        )
+
+        self.assertLess(float(breakdown.identity.detach()), 0.01)
 
 
 def _training_model(beta: float) -> T2CClipModel:
