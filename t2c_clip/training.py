@@ -108,7 +108,8 @@ def stage2_loss_breakdown(
 ) -> Stage2LossBreakdown:
     outputs = model.forward_stage2(batch.images, batch.camera_ids, batch.person_ids)
     retrieval = outputs["retrieval"]
-    logits = inputs.classifier(inputs.feature_head(retrieval)) * inputs.config.id_logit_scale
+    reid_features = inputs.feature_head(retrieval)
+    logits = inputs.classifier(reid_features) * inputs.config.id_logit_scale
     return Stage2LossBreakdown(
         clip_dual=bidirectional_contrastive_loss(
             outputs["visual"], outputs["text"], inputs.config.logit_scale
@@ -118,8 +119,8 @@ def stage2_loss_breakdown(
             batch.person_ids,
             label_smoothing=inputs.config.label_smoothing,
         ),
-        triplet=batch_hard_triplet_loss(retrieval, batch.person_ids, inputs.config.triplet_margin),
-        tfc=inputs.tfc_bank.loss(retrieval, batch.person_ids),
+        triplet=batch_hard_triplet_loss(reid_features, batch.person_ids, inputs.config.triplet_margin),
+        tfc=inputs.tfc_bank.loss(reid_features, batch.person_ids),
         tfc_weight=inputs.config.tfc_weight,
         clip_weight=inputs.config.clip_weight,
     )

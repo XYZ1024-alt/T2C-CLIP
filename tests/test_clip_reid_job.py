@@ -273,6 +273,35 @@ class CLIPReIDJobTest(unittest.TestCase):
 
         self.assertFalse(torch.allclose(with_head.features, without_head.features))
 
+    def test_tfc_center_update_uses_feature_head_output(self):
+        from t2c_clip.jobs.clip_reid import _update_tfc_centers
+        from t2c_clip.tfc import TFCCenterBank
+        from t2c_clip.training import TrainingBatch
+
+        class StubRetrieval(torch.nn.Module):
+            def forward_stage2(self, images, camera_ids, person_ids):
+                return {"retrieval": images}
+
+        head = torch.nn.Linear(2, 2, bias=False)
+        with torch.no_grad():
+            head.weight.copy_(torch.tensor([[1.0, 0.0], [0.0, 0.0]]))
+        model = CLIPReIDTrainingModel(
+            retrieval_model=StubRetrieval(),
+            classifier=torch.nn.Linear(2, 2),
+            tfc_bank=TFCCenterBank(num_train_ids=2, feature_dim=2, momentum=0.5),
+            feature_head=head,
+        )
+        batch = TrainingBatch(
+            images=torch.tensor([[1.0, 0.0], [0.8, 0.2], [0.0, 1.0], [0.0, 0.8]]),
+            camera_ids=torch.tensor([0, 0, 1, 1]),
+            person_ids=torch.tensor([0, 0, 1, 1]),
+        )
+
+        _update_tfc_centers(model, batch)
+
+        self.assertTrue(torch.allclose(model.tfc_bank.centers[0], torch.tensor([1.0, 0.0])))
+        self.assertTrue(torch.allclose(model.tfc_bank.centers[1], torch.tensor([0.0, 0.0])))
+
     def test_default_args_freeze_image_encoder_stage2_is_false_when_attr_absent(self):
         # The job config must default Stage-2 image encoder to UNFROZEN (matching
         # CLIP-ReID's standard Stage-2 recipe) when the caller passes no explicit flag.

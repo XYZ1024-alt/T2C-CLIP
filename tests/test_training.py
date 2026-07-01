@@ -144,6 +144,32 @@ class TrainingLossTest(unittest.TestCase):
 
         self.assertLess(float(breakdown.identity.detach()), 0.01)
 
+    def test_stage2_triplet_and_tfc_use_feature_head_output(self):
+        model = _training_model(beta=0.0)
+        classifier = torch.nn.Linear(2, 2, bias=False)
+        head = torch.nn.Linear(2, 2, bias=False)
+        with torch.no_grad():
+            classifier.weight.copy_(torch.eye(2))
+            head.weight.copy_(torch.tensor([[1.0, 0.0], [0.0, 0.0]]))
+        batch = TrainingBatch(
+            images=torch.tensor([[1.0, 0.5], [1.0, -0.5], [-1.0, 0.5], [-1.0, -0.5]]),
+            camera_ids=torch.tensor([0, 0, 1, 1]),
+            person_ids=torch.tensor([0, 0, 1, 1]),
+        )
+        raw_features = model.forward_stage2(batch.images, batch.camera_ids, batch.person_ids)["retrieval"]
+        headed_features = head(raw_features)
+        tfc_bank = TFCCenterBank(num_train_ids=2, feature_dim=2, momentum=0.5)
+        tfc_bank.update(headed_features, batch.person_ids)
+
+        breakdown = stage2_loss_breakdown(
+            model,
+            batch,
+            Stage2LossInputs(classifier=classifier, tfc_bank=tfc_bank, feature_head=head),
+        )
+
+        self.assertLess(float(breakdown.triplet.detach()), 0.01)
+        self.assertLess(float(breakdown.tfc.detach()), 0.01)
+
 
 def _training_model(beta: float) -> T2CClipModel:
     bank = PromptBank(PromptConfig(num_cameras=2, num_train_ids=2, context_length=1, embedding_dim=2))

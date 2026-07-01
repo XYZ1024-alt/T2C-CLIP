@@ -920,4 +920,4 @@ def _optimizer_lr(optimizer: torch.optim.Optimizer) -> float:
 def _update_tfc_centers(model: CLIPReIDTrainingModel, batch: TrainingBatch) -> None:
     with torch.no_grad():
         outputs = model.retrieval_model.forward_stage2(batch.images, batch.camera_ids, batch.person_ids)
-        model.tfc_bank.update(outputs["retrieval"], batch.person_ids)
+        model.tfc_bank.update(model.feature_head(outputs["retrieval"]), batch.person_ids)
