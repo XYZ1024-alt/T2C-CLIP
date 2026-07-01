@@ -76,7 +76,7 @@ from t2c_clip.training import (
     stage1_alignment_loss,
     stage2_loss_breakdown,
 )
-from t2c_clip.transforms import CLIPImageTransform
+from t2c_clip.transforms import CLIPImageTransform, CLIPTrainImageTransform
 
 DEFAULT_RANKS = (1, 5, 10)
 SUPPORTED_DATASETS = ("market1501", "msmt17")
@@ -162,6 +162,12 @@ class LoaderBundle:
     train: DataLoader
     query: DataLoader
     gallery: DataLoader
+
+
+@dataclass(frozen=True)
+class TransformBundle:
+    train: Any
+    eval: Any
 
 
 @dataclass(frozen=True)
@@ -307,8 +313,11 @@ def build_training_job(
     config = _job_config_from_args(args)
     loaded_clip = clip_loader(config.clip_model_name)
     _load_clip_checkpoint_if_requested(loaded_clip.model, config.clip_checkpoint, config.device)
-    transform = CLIPImageTransform(loaded_clip.image_processor)
-    data = load_dataset_bundle(JobDataConfig(config.dataset, config.data_root), transform)
+    transforms = TransformBundle(
+        train=CLIPTrainImageTransform(loaded_clip.image_processor),
+        eval=CLIPImageTransform(loaded_clip.image_processor),
+    )
+    data = load_dataset_bundle(JobDataConfig(config.dataset, config.data_root), transforms)
     shared_model = _build_training_model(config, loaded_clip.model, data).to(config.device)
     loaders = _build_loaders(data, config)
     stage1_runtime, stage2_runtime, optimizer_stage1, optimizer_stage2, stage2_beta_schedule = _build_runtimes(
@@ -360,19 +369,26 @@ def load_transformers_clip(model_name: str) -> CLIPLoadResult:
     return CLIPLoadResult(model, image_processor, tokenizer)
 
 
-def load_dataset_bundle(config: JobDataConfig, transform) -> DatasetBundle:
+def load_dataset_bundle(config: JobDataConfig, transforms) -> DatasetBundle:
     splits = _load_split_samples(config)
     _require_non_empty_splits(splits)
     camera_map = build_camera_id_map([*splits.train, *splits.query, *splits.gallery])
     train_person_map = build_person_id_map(splits.train)
     eval_person_map = build_person_id_map([*splits.query, *splits.gallery])
+    bundle = _transform_bundle(transforms)
     return DatasetBundle(
-        train=ReIDImageDataset(ReIDImageDatasetConfig(splits.train, train_person_map, camera_map, transform)),
-        query=ReIDImageDataset(ReIDImageDatasetConfig(splits.query, eval_person_map, camera_map, transform)),
-        gallery=ReIDImageDataset(ReIDImageDatasetConfig(splits.gallery, eval_person_map, camera_map, transform)),
+        train=ReIDImageDataset(ReIDImageDatasetConfig(splits.train, train_person_map, camera_map, bundle.train)),
+        query=ReIDImageDataset(ReIDImageDatasetConfig(splits.query, eval_person_map, camera_map, bundle.eval)),
+        gallery=ReIDImageDataset(ReIDImageDatasetConfig(splits.gallery, eval_person_map, camera_map, bundle.eval)),
         num_train_ids=len(train_person_map),
         num_cameras=len(camera_map),
     )
+
+
+def _transform_bundle(transforms) -> TransformBundle:
+    if isinstance(transforms, TransformBundle):
+        return transforms
+    return TransformBundle(train=transforms, eval=transforms)
 
 
 def _job_config_from_args(args: Any) -> CLIPReIDJobConfig:
