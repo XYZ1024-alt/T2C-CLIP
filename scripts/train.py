@@ -48,10 +48,13 @@ DEFAULT_EXPERIMENT_NAME = "T2C-CLIP"
 DEFAULT_RUN_NAME = "train"
 DEFAULT_CLIP_MODEL_NAME = "openai/clip-vit-base-patch16"
 DEFAULT_BATCH_SIZE = 64
+DEFAULT_NUM_INSTANCES = 2
 DEFAULT_NUM_WORKERS = 4
 DEFAULT_LEARNING_RATE = 1e-4
 DEFAULT_IMAGE_ENCODER_LR = 5e-5
 DEFAULT_BETA_WARMUP_EPOCHS = 0
+DEFAULT_STAGE2_LR_SCHEDULER = "none"
+DEFAULT_STAGE2_WARMUP_EPOCHS = 0
 DEFAULT_SANITY_GATE_EPOCHS = 0
 DEFAULT_SANITY_GATE_FACTOR = 1.5
 DEFAULT_DEVICE = "cuda"
@@ -160,12 +163,15 @@ def _add_project_training_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--clip-model-name", default=DEFAULT_CLIP_MODEL_NAME)
     parser.add_argument("--clip-checkpoint", type=Path)
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
+    parser.add_argument("--num-instances", type=int, default=DEFAULT_NUM_INSTANCES)
     parser.add_argument("--num-workers", type=int, default=DEFAULT_NUM_WORKERS)
     parser.add_argument("--lr", type=float, default=DEFAULT_LEARNING_RATE)
     parser.add_argument("--image-encoder-lr", type=float, default=DEFAULT_IMAGE_ENCODER_LR)
     parser.add_argument("--device", default=DEFAULT_DEVICE)
     parser.add_argument("--beta", type=float, default=DEFAULT_BETA)
     parser.add_argument("--beta-warmup-epochs", type=int, default=DEFAULT_BETA_WARMUP_EPOCHS)
+    parser.add_argument("--stage2-lr-scheduler", choices=("none", "cosine"), default=DEFAULT_STAGE2_LR_SCHEDULER)
+    parser.add_argument("--stage2-warmup-epochs", type=int, default=DEFAULT_STAGE2_WARMUP_EPOCHS)
     parser.add_argument("--context-length", type=int, default=DEFAULT_CONTEXT_LENGTH)
     parser.add_argument("--tfc-momentum", type=float, default=DEFAULT_TFC_MOMENTUM)
     parser.add_argument("--triplet-margin", type=float, default=DEFAULT_TRIPLET_MARGIN)
