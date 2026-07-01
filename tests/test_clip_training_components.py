@@ -10,7 +10,7 @@ from t2c_clip.clip_backbone import (
     clip_projection_dim,
     clip_text_hidden_dim,
 )
-from t2c_clip.transforms import CLIPImageTransform
+from t2c_clip.transforms import CLIPImageTransform, CLIPTrainImageTransform
 from tests._clip_fakes import FakeCLIP, FakeImageProcessor
 
 
@@ -22,6 +22,20 @@ class CLIPTrainingComponentsTest(unittest.TestCase):
         output = transform(Image.new("RGB", (2, 2)))
 
         self.assertTrue(torch.equal(output, torch.ones(3, 2, 2)))
+        self.assertEqual(processor.call_count, 1)
+
+    def test_clip_train_image_transform_erases_after_processor(self):
+        processor = FakeImageProcessor()
+        transform = CLIPTrainImageTransform(
+            processor,
+            erase_prob=1.0,
+            erase_scale=(0.25, 0.25),
+            erase_ratio=(1.0, 1.0),
+        )
+
+        output = transform(Image.new("RGB", (2, 2)))
+
+        self.assertTrue(bool(torch.any(output == 0.0)))
         self.assertEqual(processor.call_count, 1)
 
     def test_transformers_clip_image_encoder_calls_get_image_features(self):

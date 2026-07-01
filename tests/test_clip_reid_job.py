@@ -11,6 +11,7 @@ from t2c_clip.jobs.clip_reid import (
     CLIPLoadResult,
     CLIPReIDTrainingModel,
     JobDataConfig,
+    TransformBundle,
     _extract_features,
     BetaSchedule,
     StageLRScheduler,
@@ -27,6 +28,27 @@ class CLIPReIDJobTest(unittest.TestCase):
 
         with self.assertRaises(FileNotFoundError):
             load_dataset_bundle(config, ImageAwareFakeImageProcessor())
+
+    def test_load_dataset_bundle_uses_train_transform_only_for_train_split(self):
+        class ConstantTransform:
+            def __init__(self, value: float):
+                self.value = value
+
+            def __call__(self, image):
+                return torch.full((3, image.height, image.width), self.value)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            transforms = TransformBundle(
+                train=ConstantTransform(2.0),
+                eval=ConstantTransform(1.0),
+            )
+
+            data = load_dataset_bundle(JobDataConfig("market1501", root), transforms)
+
+            self.assertTrue(torch.equal(data.train[0].image, torch.full((3, 2, 2), 2.0)))
+            self.assertTrue(torch.equal(data.query[0].image, torch.ones(3, 2, 2)))
+            self.assertTrue(torch.equal(data.gallery[0].image, torch.ones(3, 2, 2)))
 
     def test_build_training_job_returns_real_callbacks_with_fake_clip(self):
         with tempfile.TemporaryDirectory() as tmp:
