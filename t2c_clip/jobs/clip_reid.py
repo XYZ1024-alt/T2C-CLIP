@@ -33,6 +33,8 @@ Validation:
 
 from __future__ import annotations
 
+import math
+
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -50,6 +52,7 @@ from t2c_clip.clip_backbone import (
 )
 from t2c_clip.data import ReIDSample, load_market_split, load_msmt17_manifest
 from t2c_clip.datasets import (
+    DEFAULT_INSTANCES_PER_IDENTITY,
     IdentityBalancedBatchSampler,
     ReIDImageBatch,
     ReIDImageDataset,
@@ -61,7 +64,7 @@ from t2c_clip.datasets import (
 from t2c_clip.evaluation import ReIDMetrics, evaluate_reid, evaluate_reid_with_rerank
 from t2c_clip.model import T2CClipModel
 from t2c_clip.prompts import PromptBank, PromptConfig
-from t2c_clip.retrieval import require_retrieval_mode
+from t2c_clip.retrieval import FUSED_RETRIEVAL, require_retrieval_mode
 from t2c_clip.tfc import TFCCenterBank
 from t2c_clip.training import (
     Stage1LossBreakdown,
@@ -132,6 +135,9 @@ class CLIPReIDJobConfig:
     retrieval_mode: str = "fused"
     beta_warmup_epochs: int = 0
     report_rerank: bool = False
+    stage2_lr_scheduler: str = "none"
+    stage2_warmup_epochs: int = 0
+    num_instances: int = DEFAULT_INSTANCES_PER_IDENTITY
 
 
 @dataclass(frozen=True)
@@ -167,6 +173,7 @@ class StageTrainingRuntime:
     device: torch.device
     beta_schedule: "BetaSchedule | None" = None
     freeze_config: "CLIPReIDJobConfig | None" = None
+    lr_scheduler: "StageLRScheduler | None" = None
 
 
 @dataclass(frozen=True)
@@ -211,6 +218,39 @@ class BetaSchedule:
         model.retrieval_model.beta = self.effective_beta(stage_epoch)
 
 
+@dataclass(frozen=True)
+class StageLRScheduler:
+    """Warmup + cosine-decay of Stage-2 learning rates over Stage-2-local epochs.
+
+    Linear warmup from ``base_lr / warmup_epochs`` at stage epoch 1 up to the full
+    ``base_lr`` at ``warmup_epochs``, then a cosine decay toward ~0 by ``total_epochs``.
+    Every param group is scaled by the same factor so the grouped backbone/new
+    learning rates keep their ratio. ``warmup_epochs == 0`` disables warmup and
+    applies pure cosine decay from stage epoch 1.
+    """
+
+    base_lrs: tuple[float, ...]
+    total_epochs: int
+    warmup_epochs: int
+    first_epoch: int = 1
+
+    def scale(self, stage_epoch: int) -> float:
+        if stage_epoch < 1:
+            raise ValueError("stage_epoch must be positive")
+        if self.warmup_epochs > 0 and stage_epoch <= self.warmup_epochs:
+            return stage_epoch / self.warmup_epochs
+        decay_start = self.warmup_epochs + 1
+        decay_epochs = max(1, self.total_epochs - self.warmup_epochs)
+        progress = min(1.0, max(0.0, (stage_epoch - decay_start) / decay_epochs))
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    def apply(self, optimizer: torch.optim.Optimizer, epoch: int) -> None:
+        stage_epoch = epoch - self.first_epoch + 1
+        factor = self.scale(stage_epoch)
+        for group, base_lr in zip(optimizer.param_groups, self.base_lrs):
+            group["lr"] = base_lr * factor
+
+
 class CLIPReIDTrainingModel(torch.nn.Module):
     def __init__(
         self,
@@ -225,6 +265,25 @@ class CLIPReIDTrainingModel(torch.nn.Module):
         self.classifier = classifier
         self.tfc_bank = tfc_bank
         self.feature_head = torch.nn.Identity() if feature_head is None else feature_head
+
+    def encode_retrieval(
+        self,
+        images: torch.Tensor,
+        camera_ids: torch.Tensor,
+        retrieval_mode: str = FUSED_RETRIEVAL,
+    ) -> torch.Tensor:
+        """Validation / inference retrieval feature.
+
+        Route the base retrieval feature through the same ``feature_head`` the
+        Stage-2 ID classifier is trained on, so retrieval uses the BNNeck-normalized
+        feature rather than the raw pre-head feature. For the default ``linear``
+        head (``Identity``) this is unchanged; ``evaluate_reid`` L2-normalizes the
+        result before scoring either way.
+        """
+        features = self.retrieval_model.encode_retrieval(
+            images, camera_ids, retrieval_mode=retrieval_mode
+        )
+        return self.feature_head(features)
 
 
 class BNNeck(torch.nn.Module):
@@ -349,6 +408,9 @@ def _job_config_from_args(args: Any) -> CLIPReIDJobConfig:
         retrieval_mode=require_retrieval_mode(str(getattr(args, "retrieval_mode", "fused"))),
         beta_warmup_epochs=int(getattr(args, "beta_warmup_epochs", 0)),
         report_rerank=bool(getattr(args, "report_rerank", False)),
+        stage2_lr_scheduler=str(getattr(args, "stage2_lr_scheduler", "none")),
+        stage2_warmup_epochs=int(getattr(args, "stage2_warmup_epochs", 0)),
+        num_instances=int(getattr(args, "num_instances", DEFAULT_INSTANCES_PER_IDENTITY)),
     )
 
 
@@ -383,11 +445,13 @@ def _build_runtimes(
         warmup_epochs=config.beta_warmup_epochs,
         first_epoch=config.stage2_first_epoch,
     )
+    stage2_lr_scheduler = _build_stage2_lr_scheduler(optimizer_stage2, config)
     stage2_runtime = StageTrainingRuntime(
         model=model, loaders=loaders, optimizer=optimizer_stage2, stage=STAGE2,
         loss_config=stage2_loss_config, device=config.device,
         beta_schedule=stage2_beta_schedule,
         freeze_config=config,
+        lr_scheduler=stage2_lr_scheduler,
     )
     return stage1_runtime, stage2_runtime, optimizer_stage1, optimizer_stage2, stage2_beta_schedule
 
@@ -460,6 +524,22 @@ def _build_optimizer(model: torch.nn.Module, config: CLIPReIDJobConfig) -> torch
     return torch.optim.AdamW(param_groups)
 
 
+def _build_stage2_lr_scheduler(
+    optimizer: torch.optim.Optimizer,
+    config: CLIPReIDJobConfig,
+) -> "StageLRScheduler | None":
+    if config.stage2_lr_scheduler == "none":
+        return None
+    if config.stage2_lr_scheduler != "cosine":
+        raise ValueError(f"unsupported stage2_lr_scheduler: {config.stage2_lr_scheduler!r}")
+    return StageLRScheduler(
+        base_lrs=tuple(float(group["lr"]) for group in optimizer.param_groups),
+        total_epochs=config.stage2_epochs,
+        warmup_epochs=config.stage2_warmup_epochs,
+        first_epoch=config.stage2_first_epoch,
+    )
+
+
 def _stage_metadata(config: CLIPReIDJobConfig) -> StageMetadata:
     """Bundle two-stage config into the canonical ``StageMetadata`` container.
 
@@ -496,6 +576,9 @@ def _stage_metadata(config: CLIPReIDJobConfig) -> StageMetadata:
             "reid_head": config.reid_head,
             "retrieval_mode": config.retrieval_mode,
             "report_rerank": config.report_rerank,
+            "stage2_lr_scheduler": config.stage2_lr_scheduler,
+            "stage2_warmup_epochs": config.stage2_warmup_epochs,
+            "num_instances": config.num_instances,
         }
     )
 
@@ -614,7 +697,11 @@ def _build_loaders(data: DatasetBundle, config: CLIPReIDJobConfig) -> LoaderBund
 
 
 def _train_loader(dataset: ReIDImageDataset, config: CLIPReIDJobConfig) -> DataLoader:
-    sampler = IdentityBalancedBatchSampler(dataset.person_ids, batch_size=config.batch_size)
+    sampler = IdentityBalancedBatchSampler(
+        dataset.person_ids,
+        batch_size=config.batch_size,
+        instances_per_identity=config.num_instances,
+    )
     return DataLoader(
         dataset,
         batch_sampler=sampler,
@@ -639,6 +726,8 @@ def _train_one_epoch(runtime: StageTrainingRuntime):
             _apply_freezing(runtime.model, runtime.freeze_config, runtime.stage)
         if runtime.beta_schedule is not None:
             runtime.beta_schedule.apply(runtime.model, epoch)
+        if runtime.lr_scheduler is not None:
+            runtime.lr_scheduler.apply(runtime.optimizer, epoch)
         runtime.model.train()
         metric_names = _train_metric_names(runtime.stage)
         totals = {name: 0.0 for name in metric_names}
@@ -668,13 +757,13 @@ def _validate(runtime: ValidationRuntime):
             runtime.beta_schedule.apply(runtime.model, epoch)
         runtime.model.eval()
         query = _extract_features(
-            runtime.model.retrieval_model,
+            runtime.model,
             runtime.loaders.query,
             runtime.device,
             runtime.retrieval_mode,
         )
         gallery = _extract_features(
-            runtime.model.retrieval_model,
+            runtime.model,
             runtime.loaders.gallery,
             runtime.device,
             runtime.retrieval_mode,
@@ -719,7 +808,7 @@ class FeatureSet:
 
 
 def _extract_features(
-    model: T2CClipModel,
+    model: CLIPReIDTrainingModel,
     loader: DataLoader,
     device: torch.device,
     retrieval_mode: str,

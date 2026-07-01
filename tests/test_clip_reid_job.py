@@ -9,9 +9,11 @@ import torch
 from t2c_clip.datasets import ReIDImageBatch
 from t2c_clip.jobs.clip_reid import (
     CLIPLoadResult,
+    CLIPReIDTrainingModel,
     JobDataConfig,
     _extract_features,
     BetaSchedule,
+    StageLRScheduler,
     build_training_job,
     load_dataset_bundle,
 )
@@ -219,6 +221,58 @@ class CLIPReIDJobTest(unittest.TestCase):
 
         self.assertFalse(job.model.feature_head.bn.bias.requires_grad)
 
+    def test_clipreid_model_encode_retrieval_applies_feature_head(self):
+        # Retrieval/validation must pass the base feature through the same
+        # feature_head (e.g. BNNeck) the Stage-2 ID classifier is trained on.
+        # Otherwise the ID signal shapes BN(f) while retrieval uses raw f.
+        class StubRetrieval(torch.nn.Module):
+            def encode_retrieval(self, images, camera_ids, retrieval_mode="fused"):
+                return torch.ones(images.shape[0], 4)
+
+        head = torch.nn.Linear(4, 4, bias=False)
+        with torch.no_grad():
+            head.weight.copy_(torch.eye(4) * 2.0)
+        model = CLIPReIDTrainingModel(
+            retrieval_model=StubRetrieval(),
+            classifier=torch.nn.Linear(4, 2),
+            tfc_bank=torch.nn.Module(),
+            feature_head=head,
+        )
+
+        output = model.encode_retrieval(torch.zeros(3, 3, 2, 2), torch.zeros(3, dtype=torch.long))
+
+        self.assertTrue(torch.allclose(output, torch.full((3, 4), 2.0)))
+
+    def test_validation_extracts_features_through_bnneck_head(self):
+        # The built validation path must route retrieval through the BNNeck head,
+        # so extracted features differ from the raw pre-head retrieval feature.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            args = _training_args(root)
+            args.reid_head = "bnneck"
+
+            job = build_training_job(args, clip_loader=_load_fake_clip)
+
+        head = job.model.feature_head
+        with torch.no_grad():
+            head.bn.weight.copy_(torch.full_like(head.bn.weight, 3.0))
+            head.bn.running_var.copy_(torch.full_like(head.bn.running_var, 4.0))
+        job.model.eval()
+
+        batch = ReIDImageBatch(
+            images=torch.ones(2, 3, 2, 2),
+            person_ids=torch.tensor([0, 1]),
+            camera_ids=torch.tensor([0, 0]),
+            original_person_ids=(10, 20),
+            original_camera_ids=(1, 1),
+        )
+        device = torch.device("cpu")
+
+        with_head = _extract_features(job.model, [batch], device, "fused")
+        without_head = _extract_features(job.model.retrieval_model, [batch], device, "fused")
+
+        self.assertFalse(torch.allclose(with_head.features, without_head.features))
+
     def test_default_args_freeze_image_encoder_stage2_is_false_when_attr_absent(self):
         # The job config must default Stage-2 image encoder to UNFROZEN (matching
         # CLIP-ReID's standard Stage-2 recipe) when the caller passes no explicit flag.
@@ -328,6 +382,98 @@ class CLIPReIDJobTest(unittest.TestCase):
 
         schedule.apply(stub, epoch=16)
         self.assertAlmostEqual(stub.retrieval_model.beta, 0.1)
+
+    def test_stage_lr_scheduler_warmup_then_cosine(self):
+        scheduler = StageLRScheduler(base_lrs=(1.0,), total_epochs=10, warmup_epochs=2)
+
+        self.assertAlmostEqual(scheduler.scale(1), 0.5)
+        self.assertAlmostEqual(scheduler.scale(2), 1.0)
+        self.assertAlmostEqual(scheduler.scale(3), 1.0)
+        self.assertLess(scheduler.scale(10), 0.05)
+        self.assertGreaterEqual(scheduler.scale(10), 0.0)
+
+    def test_stage_lr_scheduler_apply_scales_groups_by_stage_epoch(self):
+        parameter = torch.nn.Parameter(torch.zeros(1))
+        optimizer = torch.optim.AdamW([{"params": [parameter], "lr": 1e-4, "name": "new"}])
+        scheduler = StageLRScheduler(base_lrs=(1e-4,), total_epochs=10, warmup_epochs=2, first_epoch=11)
+
+        scheduler.apply(optimizer, epoch=11)  # stage epoch 1 -> 0.5x warmup
+
+        self.assertAlmostEqual(optimizer.param_groups[0]["lr"], 0.5e-4)
+
+    def test_stage2_cosine_scheduler_changes_lr_across_epochs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            args = _training_args(root)
+            args.stage2_lr_scheduler = "cosine"
+            args.stage2_warmup_epochs = 2
+            args.epochs = 10
+
+            job = build_training_job(args, clip_loader=_load_fake_clip)
+            first = job.train_one_epoch(1, TrainBatchReporterRecorder())["lr"]
+            second = job.train_one_epoch(2, TrainBatchReporterRecorder())["lr"]
+
+        self.assertNotEqual(first, second)
+
+    def test_stage2_scheduler_none_keeps_lr_constant(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            args = _training_args(root)
+            args.stage2_lr_scheduler = "none"
+            args.epochs = 10
+
+            job = build_training_job(args, clip_loader=_load_fake_clip)
+            first = job.train_one_epoch(1, TrainBatchReporterRecorder())["lr"]
+            second = job.train_one_epoch(2, TrainBatchReporterRecorder())["lr"]
+
+        self.assertEqual(first, second)
+
+    def test_job_config_reads_num_instances(self):
+        from t2c_clip.jobs.clip_reid import _job_config_from_args
+
+        args = _training_args(Path("."))
+        args.num_instances = 4
+
+        config = _job_config_from_args(args)
+
+        self.assertEqual(config.num_instances, 4)
+
+    def test_job_config_num_instances_defaults_to_two_when_absent(self):
+        from t2c_clip.jobs.clip_reid import _job_config_from_args
+
+        args = _training_args(Path("."))
+
+        config = _job_config_from_args(args)
+
+        self.assertEqual(config.num_instances, 2)
+
+    def test_train_loader_uses_configured_num_instances(self):
+        from t2c_clip.jobs.clip_reid import _job_config_from_args, _train_loader
+
+        class _StubDataset(torch.utils.data.Dataset):
+            def __init__(self, person_ids):
+                self._person_ids = tuple(person_ids)
+
+            @property
+            def person_ids(self):
+                return self._person_ids
+
+            def __len__(self):
+                return len(self._person_ids)
+
+            def __getitem__(self, index):
+                return index
+
+        args = _training_args(Path("."))
+        args.num_instances = 4
+        args.batch_size = 8
+        config = _job_config_from_args(args)
+        dataset = _StubDataset([0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3])
+
+        loader = _train_loader(dataset, config)
+
+        self.assertEqual(loader.batch_sampler._instances_per_identity, 4)
+        self.assertEqual(loader.batch_sampler._identities_per_batch, 2)
 
 
 def _load_fake_clip(model_name: str) -> CLIPLoadResult:
