@@ -121,6 +121,7 @@ wsl --cd /mnt/d/Code/T2C-CLIP /home/xyz10/miniconda3/bin/conda run -n reid pytho
   --device cuda \
   --beta 0.1 \
   --clip-weight 0.1 \
+  --id-logit-scale 10.0 \
   --tfc-weight 1.0 \
   --image-encoder-lr 0.00005 \
   --beta-warmup-epochs 5 \
@@ -165,6 +166,8 @@ Useful training arguments:
 - `--triplet-margin 0.3`
 - `--tfc-weight 1.0`
 - `--clip-weight 0.1`
+- `--id-logit-scale 1.0` (multiplies Stage-2 ID-classification logits;
+  try `10.0` when normalized retrieval features make CE logits too small)
 - `--label-smoothing 0.0` (Stage-2 identity classification label smoothing;
   strong ReID recipes commonly use `0.1`)
 - `--reid-head linear|bnneck` (`bnneck` classifies BN-normalized retrieval
@@ -222,8 +225,8 @@ Run params recorded with `--enable-mlflow`:
 
 - `dataset`, `clip_model_name`, `stage1_epochs`, `stage2_epochs`,
   `validation_interval`, `batch_size`, `lr`, `beta`, `clip_weight`,
-  `tfc_weight`, `freeze_image_encoder_stage1`, `freeze_image_encoder_stage2`,
-  `freeze_text_encoder`, `retrieval_mode`.
+  `id_logit_scale`, `tfc_weight`, `freeze_image_encoder_stage1`,
+  `freeze_image_encoder_stage2`, `freeze_text_encoder`, `retrieval_mode`.
 
 ## MLflow SQLite Tracking
 
@@ -295,3 +298,7 @@ Sanity gate:
    (`test_features_prompts`, `test_evaluation_model`,
    `test_two_stage_training`) and by the `encode_retrieval` implementation
    in `t2c_clip/model.py`.
+
+If Stage-2 `reid_loss` stays near `ln(num_train_ids)` while backbone gradients
+are non-zero, normalized retrieval logits are likely too small for the ID
+classifier. Run a tiny-overfit check and try `--id-logit-scale 10.0`.

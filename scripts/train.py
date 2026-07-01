@@ -64,6 +64,7 @@ DEFAULT_TFC_MOMENTUM = 0.5
 DEFAULT_TRIPLET_MARGIN = 0.3
 DEFAULT_TFC_WEIGHT = 1.0
 DEFAULT_CLIP_WEIGHT = 0.1
+DEFAULT_ID_LOGIT_SCALE = 1.0
 DEFAULT_RETRIEVAL_MODE = "fused"
 SUPPORTED_DATASETS = ("market1501", "msmt17")
 
@@ -178,6 +179,7 @@ def _add_project_training_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--tfc-weight", type=float, default=DEFAULT_TFC_WEIGHT)
     parser.add_argument("--stage1-epochs", type=int, default=DEFAULT_STAGE1_EPOCHS)
     parser.add_argument("--clip-weight", type=float, default=DEFAULT_CLIP_WEIGHT)
+    parser.add_argument("--id-logit-scale", type=float, default=DEFAULT_ID_LOGIT_SCALE)
     parser.add_argument("--label-smoothing", type=float, default=0.0)
     parser.add_argument("--reid-head", choices=("linear", "bnneck"), default="linear")
     parser.add_argument("--retrieval-mode", choices=SUPPORTED_RETRIEVAL_MODES, default=DEFAULT_RETRIEVAL_MODE)

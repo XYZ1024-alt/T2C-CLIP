@@ -153,6 +153,7 @@ def log_stage_params_to_mlflow(metadata: Mapping[str, Any]) -> None:
         "freeze_text_encoder",
         "freeze_prompt_bank_stage2",
         "clip_weight",
+        "id_logit_scale",
         "label_smoothing",
         "tfc_weight",
         "beta",

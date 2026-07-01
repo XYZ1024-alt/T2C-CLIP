@@ -122,6 +122,7 @@ class CLIPReIDJobConfig:
     triplet_margin: float
     tfc_weight: float
     clip_weight: float
+    id_logit_scale: float
     label_smoothing: float
     stage1_epochs: int
     stage2_epochs: int
@@ -395,6 +396,7 @@ def _job_config_from_args(args: Any) -> CLIPReIDJobConfig:
         triplet_margin=float(args.triplet_margin),
         tfc_weight=float(args.tfc_weight),
         clip_weight=float(getattr(args, "clip_weight", 0.1)),
+        id_logit_scale=float(getattr(args, "id_logit_scale", 1.0)),
         label_smoothing=float(getattr(args, "label_smoothing", 0.0)),
         stage1_epochs=int(getattr(args, "stage1_epochs", 0)),
         stage2_epochs=int(getattr(args, "epochs", 120)),
@@ -438,6 +440,7 @@ def _build_runtimes(
         triplet_margin=config.triplet_margin,
         tfc_weight=config.tfc_weight,
         clip_weight=config.clip_weight,
+        id_logit_scale=config.id_logit_scale,
         label_smoothing=config.label_smoothing,
     )
     stage2_beta_schedule = BetaSchedule(
@@ -564,6 +567,7 @@ def _stage_metadata(config: CLIPReIDJobConfig) -> StageMetadata:
             "beta": config.beta,
             "beta_warmup_epochs": config.beta_warmup_epochs,
             "clip_weight": config.clip_weight,
+            "id_logit_scale": config.id_logit_scale,
             "label_smoothing": config.label_smoothing,
             "tfc_weight": config.tfc_weight,
             "triplet_margin": config.triplet_margin,

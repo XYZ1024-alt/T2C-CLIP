@@ -11,6 +11,7 @@ from t2c_clip.mlflow import (
     DEFAULT_MLFLOW_UI_PORT,
     MLflowSQLiteConfig,
     initialize_mlflow_sqlite,
+    log_stage_params_to_mlflow,
     log_reid_metrics_to_mlflow,
     log_training_step_metrics_to_mlflow,
     log_training_metrics_to_mlflow,
@@ -136,6 +137,27 @@ class MLflowSQLiteTest(unittest.TestCase):
         self.assertEqual(logged.data.metrics["train_triplet_loss"], 0.1)
         self.assertEqual(logged.data.metrics["train_tfc_loss"], 0.1)
         self.assertEqual(logged.data.metrics["lr"], 0.001)
+
+    def test_training_run_logs_stage_identity_logit_scale(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = MLflowSQLiteConfig(
+                tracking_db=Path(tmp) / "tracking.db",
+                artifact_root=Path(tmp) / "artifacts",
+                experiment_name="T2C-CLIP-StageParam-Test",
+            )
+            with start_mlflow_sqlite_run(config, run_name="stage-param-test") as run:
+                log_stage_params_to_mlflow(
+                    {
+                        "retrieval_mode": "image",
+                        "id_logit_scale": 10.0,
+                    }
+                )
+                run_id = run.run_id
+            client = MlflowClient(tracking_uri=run.tracking_uri)
+            logged = client.get_run(run_id)
+
+        self.assertEqual(logged.data.params["id_logit_scale"], "10.0")
+        self.assertEqual(logged.data.tags["t2c_clip.retrieval_mode"], "image")
 
     def test_training_run_logs_step_train_metrics_to_sqlite_store(self):
         with tempfile.TemporaryDirectory() as tmp:

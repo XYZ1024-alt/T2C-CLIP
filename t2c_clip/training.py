@@ -28,6 +28,7 @@ DEFAULT_TRIPLET_MARGIN = 0.3
 DEFAULT_TFC_WEIGHT = 1.0
 DEFAULT_CLIP_WEIGHT = 0.1
 DEFAULT_LABEL_SMOOTHING = 0.0
+DEFAULT_ID_LOGIT_SCALE = 1.0
 
 
 @dataclass(frozen=True)
@@ -49,6 +50,7 @@ class Stage2LossConfig:
     tfc_weight: float = DEFAULT_TFC_WEIGHT
     clip_weight: float = DEFAULT_CLIP_WEIGHT
     label_smoothing: float = DEFAULT_LABEL_SMOOTHING
+    id_logit_scale: float = DEFAULT_ID_LOGIT_SCALE
 
 
 @dataclass(frozen=True)
@@ -106,7 +108,7 @@ def stage2_loss_breakdown(
 ) -> Stage2LossBreakdown:
     outputs = model.forward_stage2(batch.images, batch.camera_ids, batch.person_ids)
     retrieval = outputs["retrieval"]
-    logits = inputs.classifier(inputs.feature_head(retrieval))
+    logits = inputs.classifier(inputs.feature_head(retrieval)) * inputs.config.id_logit_scale
     return Stage2LossBreakdown(
         clip_dual=bidirectional_contrastive_loss(
             outputs["visual"], outputs["text"], inputs.config.logit_scale

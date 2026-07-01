@@ -438,6 +438,16 @@ class CLIPReIDJobTest(unittest.TestCase):
 
         self.assertEqual(config.num_instances, 4)
 
+    def test_job_config_reads_id_logit_scale(self):
+        from t2c_clip.jobs.clip_reid import _job_config_from_args
+
+        args = _training_args(Path("."))
+        args.id_logit_scale = 10.0
+
+        config = _job_config_from_args(args)
+
+        self.assertEqual(config.id_logit_scale, 10.0)
+
     def test_job_config_num_instances_defaults_to_two_when_absent(self):
         from t2c_clip.jobs.clip_reid import _job_config_from_args
 
