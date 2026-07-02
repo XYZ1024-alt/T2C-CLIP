@@ -19,7 +19,11 @@ class TransformersCLIPImageEncoder(torch.nn.Module):
         self.clip_model = clip_model
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
-        output = self.clip_model.get_image_features(pixel_values=images)
+        # ReID inputs are non-square (e.g. 256x128); the pretrained CLIP ViT
+        # only accepts them with position-embedding interpolation enabled.
+        output = self.clip_model.get_image_features(
+            pixel_values=images, interpolate_pos_encoding=True
+        )
         return _image_features_tensor(output)
 
 
