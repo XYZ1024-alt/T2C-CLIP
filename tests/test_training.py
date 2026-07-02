@@ -2,6 +2,7 @@ import unittest
 
 import torch
 
+from t2c_clip.losses import supervised_bidirectional_contrastive_loss
 from t2c_clip.model import T2CClipModel
 from t2c_clip.prompts import PromptBank, PromptConfig
 from t2c_clip.tfc import TFCCenterBank
@@ -38,6 +39,50 @@ class TrainingLossTest(unittest.TestCase):
 
         self.assertLess(float(breakdown.total.detach()), 0.01)
         self.assertTrue(torch.allclose(breakdown.total, breakdown.clip_dual))
+
+    def test_stage1_alignment_treats_same_identity_as_positive(self):
+        # PK-sampled batches repeat identities; the stage-1 alignment loss must
+        # score same-person rows as positives, not arange negatives.
+        model = _training_model(beta=0.0)
+        batch = TrainingBatch(
+            images=torch.tensor([[1.0, 0.0], [0.0, 1.0], [0.7, 0.7]]),
+            camera_ids=torch.tensor([0, 1, 0]),
+            person_ids=torch.tensor([0, 0, 1]),
+        )
+        config = Stage1LossConfig(logit_scale=5.0)
+        outputs = model.forward_stage1(batch.images, batch.camera_ids, batch.person_ids)
+        expected = supervised_bidirectional_contrastive_loss(
+            outputs["visual"], outputs["text"], batch.person_ids, logit_scale=5.0
+        )
+
+        breakdown = stage1_alignment_loss(model, batch, config)
+
+        self.assertTrue(torch.allclose(breakdown.clip_dual, expected))
+
+    def test_stage2_clip_alignment_treats_same_identity_as_positive(self):
+        model = _training_model(beta=0.0)
+        classifier = torch.nn.Linear(2, 2, bias=False)
+        with torch.no_grad():
+            classifier.weight.copy_(torch.eye(2))
+        batch = TrainingBatch(
+            images=torch.tensor([[1.0, 0.0], [0.9, 0.1], [0.0, 1.0]]),
+            camera_ids=torch.tensor([0, 1, 0]),
+            person_ids=torch.tensor([0, 0, 1]),
+        )
+        tfc_bank = TFCCenterBank(num_train_ids=2, feature_dim=2, momentum=0.5)
+        tfc_bank.update(model.forward_stage2(batch.images, batch.camera_ids, batch.person_ids)["retrieval"], batch.person_ids)
+        outputs = model.forward_stage2(batch.images, batch.camera_ids, batch.person_ids)
+        expected = supervised_bidirectional_contrastive_loss(
+            outputs["visual"], outputs["text"], batch.person_ids, logit_scale=Stage2LossConfig().logit_scale
+        )
+
+        breakdown = stage2_loss_breakdown(
+            model,
+            batch,
+            Stage2LossInputs(classifier=classifier, tfc_bank=tfc_bank),
+        )
+
+        self.assertTrue(torch.allclose(breakdown.clip_dual, expected))
 
     def test_stage2_loss_breakdown_combines_clip_reid_and_tfc(self):
         model = _training_model(beta=0.0)

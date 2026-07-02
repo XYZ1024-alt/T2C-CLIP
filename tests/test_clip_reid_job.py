@@ -564,6 +564,36 @@ class CLIPReIDJobTest(unittest.TestCase):
         self.assertEqual(loader.batch_sampler._instances_per_identity, 4)
         self.assertEqual(loader.batch_sampler._identities_per_batch, 2)
 
+    def test_stage_loss_configs_read_logit_scale_from_clip_model(self):
+        import math
+
+        from t2c_clip.jobs.clip_reid import (
+            _job_config_from_args,
+            _stage1_loss_config,
+            _stage2_loss_config,
+        )
+
+        clip = FakeCLIP(hidden_size=8, projection_dim=4)  # logit_scale parameter = 1.0
+
+        stage1 = _stage1_loss_config(clip)
+        self.assertAlmostEqual(stage1.logit_scale, math.e, places=5)
+
+        config = _job_config_from_args(_training_args(Path(".")))
+        stage2 = _stage2_loss_config(config, clip)
+        self.assertAlmostEqual(stage2.logit_scale, math.e, places=5)
+        self.assertEqual(stage2.triplet_margin, config.triplet_margin)
+        self.assertEqual(stage2.id_logit_scale, config.id_logit_scale)
+        self.assertEqual(stage2.clip_weight, config.clip_weight)
+
+    def test_clip_logit_scale_is_frozen_in_built_job(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+
+            job = build_training_job(_training_args(root), clip_loader=_load_fake_clip)
+
+        clip = job.model.retrieval_model.image_encoder.clip_model
+        self.assertFalse(clip.logit_scale.requires_grad)
+
 
 def _load_fake_clip(model_name: str) -> CLIPLoadResult:
     return CLIPLoadResult(FakeCLIP(hidden_size=8, projection_dim=4), ImageAwareFakeImageProcessor(), tokenizer=None)
