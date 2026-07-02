@@ -106,9 +106,16 @@ def stage2_loss_breakdown(
     batch: TrainingBatch,
     inputs: Stage2LossInputs,
 ) -> Stage2LossBreakdown:
+    """Compute the Stage-2 losses from a single forward pass.
+
+    The TFC centers are updated (detached, no-grad) from this forward's
+    feature-head output before scoring, so no separate center-update forward
+    is needed and the BNNeck running stats see each batch exactly once.
+    """
     outputs = model.forward_stage2(batch.images, batch.camera_ids, batch.person_ids)
     retrieval = outputs["retrieval"]
     reid_features = inputs.feature_head(retrieval)
+    inputs.tfc_bank.update(reid_features, batch.person_ids)
     logits = inputs.classifier(reid_features) * inputs.config.id_logit_scale
     return Stage2LossBreakdown(
         clip_dual=supervised_bidirectional_contrastive_loss(

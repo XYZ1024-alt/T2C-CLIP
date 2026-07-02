@@ -100,9 +100,11 @@ class FakeCLIP(nn.Module):
         self.logit_scale = nn.Parameter(torch.tensor(1.0))
         self.scale = nn.Parameter(torch.tensor(1.0))
         self.last_interpolate_pos_encoding: bool | None = None
+        self.image_feature_calls = 0
 
     def get_image_features(self, pixel_values: torch.Tensor, interpolate_pos_encoding: bool = False) -> torch.Tensor:
         self.last_interpolate_pos_encoding = interpolate_pos_encoding
+        self.image_feature_calls += 1
         pooled = pixel_values.mean(dim=(2, 3))  # [B, channels]
         target_dim = self.config.vision_config.hidden_size
         if pooled.shape[1] < target_dim:

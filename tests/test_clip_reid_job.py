@@ -323,34 +323,18 @@ class CLIPReIDJobTest(unittest.TestCase):
 
         self.assertFalse(torch.allclose(with_head.features, without_head.features))
 
-    def test_tfc_center_update_uses_feature_head_output(self):
-        from t2c_clip.jobs.clip_reid import _update_tfc_centers
-        from t2c_clip.tfc import TFCCenterBank
-        from t2c_clip.training import TrainingBatch
+    def test_stage2_training_step_runs_single_image_forward_per_batch(self):
+        # TFC center updates must reuse the loss forward's features instead of
+        # running a second full no-grad forward per batch.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            job = build_training_job(_training_args(root), clip_loader=_load_fake_clip)
+            clip = job.model.retrieval_model.image_encoder.clip_model
+            clip.image_feature_calls = 0
 
-        class StubRetrieval(torch.nn.Module):
-            def forward_stage2(self, images, camera_ids, person_ids):
-                return {"retrieval": images}
+            job.train_one_epoch(1, TrainBatchReporterRecorder())
 
-        head = torch.nn.Linear(2, 2, bias=False)
-        with torch.no_grad():
-            head.weight.copy_(torch.tensor([[1.0, 0.0], [0.0, 0.0]]))
-        model = CLIPReIDTrainingModel(
-            retrieval_model=StubRetrieval(),
-            classifier=torch.nn.Linear(2, 2),
-            tfc_bank=TFCCenterBank(num_train_ids=2, feature_dim=2, momentum=0.5),
-            feature_head=head,
-        )
-        batch = TrainingBatch(
-            images=torch.tensor([[1.0, 0.0], [0.8, 0.2], [0.0, 1.0], [0.0, 0.8]]),
-            camera_ids=torch.tensor([0, 0, 1, 1]),
-            person_ids=torch.tensor([0, 0, 1, 1]),
-        )
-
-        _update_tfc_centers(model, batch)
-
-        self.assertTrue(torch.allclose(model.tfc_bank.centers[0], torch.tensor([1.0, 0.0])))
-        self.assertTrue(torch.allclose(model.tfc_bank.centers[1], torch.tensor([0.0, 0.0])))
+        self.assertEqual(clip.image_feature_calls, 1)
 
     def test_default_args_freeze_image_encoder_stage2_is_false_when_attr_absent(self):
         # The job config must default Stage-2 image encoder to UNFROZEN (matching
