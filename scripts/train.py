@@ -227,6 +227,7 @@ def _run_two_stage_loop(job: TwoStageTrainingJob, args: argparse.Namespace, prog
         progress_description="stage1",
         checkpoint_prefix="stage1",
         stage="stage1",
+        validate_final_epoch=False,
     )
     if args.stage1_epochs > 0:
         run_training_loop(
