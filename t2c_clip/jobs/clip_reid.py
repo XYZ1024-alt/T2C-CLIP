@@ -445,20 +445,15 @@ def _build_runtimes(
 ]:
     _apply_freezing(model, config, stage=STAGE1)
     optimizer_stage1 = _build_optimizer(model, config)
+    clip_model = _clip_model_for(model.retrieval_model)
     stage1_runtime = StageTrainingRuntime(
         model=model, loaders=loaders, optimizer=optimizer_stage1, stage=STAGE1,
-        loss_config=Stage1LossConfig(), device=config.device,
+        loss_config=_stage1_loss_config(clip_model), device=config.device,
         freeze_config=config,
     )
     _apply_freezing(model, config, stage=STAGE2)
     optimizer_stage2 = _build_optimizer(model, config)
-    stage2_loss_config = Stage2LossConfig(
-        triplet_margin=config.triplet_margin,
-        tfc_weight=config.tfc_weight,
-        clip_weight=config.clip_weight,
-        id_logit_scale=config.id_logit_scale,
-        label_smoothing=config.label_smoothing,
-    )
+    stage2_loss_config = _stage2_loss_config(config, clip_model)
     stage2_beta_schedule = BetaSchedule(
         beta=config.beta,
         warmup_epochs=config.beta_warmup_epochs,
@@ -484,6 +479,9 @@ def _apply_freezing(model: CLIPReIDTrainingModel, config: CLIPReIDJobConfig, sta
     _set_module_requires_grad(clip_model.visual_projection, image_trainable)
     _set_module_requires_grad(clip_model.text_model, text_trainable)
     _set_module_requires_grad(clip_model.text_projection, text_trainable)
+    # The contrastive losses read logit_scale as a frozen constant; keep the
+    # parameter out of every stage optimizer.
+    clip_model.logit_scale.requires_grad_(False)
     prompt_trainable = stage == STAGE1 or not config.freeze_prompt_bank_stage2
     retrieval.prompt_bank.requires_grad_(prompt_trainable)
     model.classifier.requires_grad_(stage == STAGE2)
@@ -541,6 +539,33 @@ def _build_optimizer(model: torch.nn.Module, config: CLIPReIDJobConfig) -> torch
     if new_params:
         param_groups.append({"params": new_params, "lr": config.lr, "name": "new"})
     return torch.optim.AdamW(param_groups)
+
+
+def _contrastive_logit_scale(clip_model: torch.nn.Module) -> float:
+    """Pretrained CLIP contrastive temperature (``exp(logit_scale)``, ~100).
+
+    Read once as a frozen constant — the parameter itself never enters the
+    optimizer, matching CLIP-ReID's use of the pretrained scale.
+    """
+    logit_scale = getattr(clip_model, "logit_scale", None)
+    if not isinstance(logit_scale, torch.Tensor):
+        raise ValueError("CLIP model must expose a logit_scale tensor for the contrastive losses")
+    return float(logit_scale.detach().exp())
+
+
+def _stage1_loss_config(clip_model: torch.nn.Module) -> Stage1LossConfig:
+    return Stage1LossConfig(logit_scale=_contrastive_logit_scale(clip_model))
+
+
+def _stage2_loss_config(config: CLIPReIDJobConfig, clip_model: torch.nn.Module) -> Stage2LossConfig:
+    return Stage2LossConfig(
+        logit_scale=_contrastive_logit_scale(clip_model),
+        triplet_margin=config.triplet_margin,
+        tfc_weight=config.tfc_weight,
+        clip_weight=config.clip_weight,
+        id_logit_scale=config.id_logit_scale,
+        label_smoothing=config.label_smoothing,
+    )
 
 
 def _build_stage2_lr_scheduler(
