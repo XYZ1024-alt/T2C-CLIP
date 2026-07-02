@@ -67,6 +67,54 @@ class MultiProgressRecorder:
 
 
 class TrainingLoopTest(unittest.TestCase):
+    def test_validation_cadence_is_stage_local_and_final_epoch_always_validates(self):
+        # A stage-2 loop resumed at first_epoch=3 (stage1_epochs=2) with
+        # interval=5 must validate at stage-local epochs 5 and 7 (the final
+        # epoch), i.e. global epochs 7 and 9 — not at global epoch 5.
+        validated: list[int] = []
+
+        def validate(epoch: int) -> ReIDMetrics:
+            validated.append(epoch)
+            return ReIDMetrics(map=0.1, cmc={1: 0.1})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_training_loop(
+                model=torch.nn.Linear(2, 2),
+                optimizer=None,
+                config=TrainingLoopConfig(
+                    total_epochs=7, validation_interval=5, checkpoint_dir=Path(tmp), first_epoch=3
+                ),
+                train_one_epoch=lambda epoch, reporter: None,
+                validate=validate,
+                progress_factory=lambda iterable, **kwargs: iterable,
+            )
+
+        self.assertEqual(validated, [7, 9])
+
+    def test_final_epoch_validation_can_be_disabled_for_stage1(self):
+        validated: list[int] = []
+
+        def validate(epoch: int) -> ReIDMetrics:
+            validated.append(epoch)
+            return ReIDMetrics(map=0.1, cmc={1: 0.1})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_training_loop(
+                model=torch.nn.Linear(2, 2),
+                optimizer=None,
+                config=TrainingLoopConfig(
+                    total_epochs=3,
+                    validation_interval=10**9,
+                    checkpoint_dir=Path(tmp),
+                    validate_final_epoch=False,
+                ),
+                train_one_epoch=lambda epoch, reporter: None,
+                validate=validate,
+                progress_factory=lambda iterable, **kwargs: iterable,
+            )
+
+        self.assertEqual(validated, [])
+
     def test_default_interval_validates_every_five_epochs_and_saves_checkpoints(self):
         with tempfile.TemporaryDirectory() as tmp:
             model = torch.nn.Linear(2, 2)
@@ -150,12 +198,13 @@ class TrainingLoopTest(unittest.TestCase):
                 progress_factory=progress,
             )
 
+        # epoch 1: no val; epoch 2: val (interval=2); epoch 3: val (final epoch)
         self.assertEqual(
             progress.messages,
             [
                 "epoch=1 done",
                 "epoch=2 mAP=0.2500 rank1=0.5000 best_mAP=0.2500 best=True",
-                "epoch=3 done",
+                "epoch=3 mAP=0.2500 rank1=0.5000 best_mAP=0.2500 best=False",
             ],
         )
 
@@ -219,12 +268,14 @@ class TrainingLoopTest(unittest.TestCase):
                 {"loss": "1.1500", "lr": "0.0100"},
             ],
         )
+        # epoch 2 is the final epoch → always validates; postfixes get mAP appended
         self.assertEqual(
             progress.bars[1].postfixes,
             [
                 {"loss": "2.1000", "lr": "0.0100"},
                 {"loss": "2.2000", "lr": "0.0100"},
                 {"loss": "2.1500", "lr": "0.0100"},
+                {"loss": "2.1500", "lr": "0.0100", "mAP": "0.2500", "best_mAP": "0.2500", "rank1": "0.5000"},
             ],
         )
         self.assertEqual(

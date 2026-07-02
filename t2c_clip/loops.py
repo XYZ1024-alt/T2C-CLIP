@@ -46,6 +46,10 @@ class TrainingLoopConfig:
     # prevents the ReID signal from acting on the retrieval feature).
     sanity_check_offset: int = 0
     sanity_improvement_factor: float = 1.5
+    # When True (default) the final epoch always validates, regardless of
+    # whether it falls on a validation_interval boundary. Set False for
+    # Stage-1 loops that disable validation entirely via a huge interval.
+    validate_final_epoch: bool = True
 
     def __post_init__(self) -> None:
         _require_positive(self.total_epochs, "total_epochs")
@@ -171,7 +175,13 @@ def run_training_loop(
         train_step = reporter.last_train_step
         _report_training_progress(reporter.progress, train_metrics)
         _log_train_metrics(epoch, train_metrics, train_metric_logger)
-        metrics = validate(epoch) if should_validate_epoch(epoch, config.validation_interval) else None
+        epoch_position = epoch - config.first_epoch + 1
+        is_last_epoch = epoch_position == config.total_epochs
+        should_validate = (
+            epoch_position % config.validation_interval == 0
+            or (config.validate_final_epoch and is_last_epoch)
+        )
+        metrics = validate(epoch) if should_validate else None
         is_best = _is_best_metric(metrics, best_map)
         best_map = metrics.map if is_best and metrics is not None else best_map
         if metrics is not None:
