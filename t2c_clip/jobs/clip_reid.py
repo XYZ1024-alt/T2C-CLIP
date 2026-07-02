@@ -906,7 +906,6 @@ def _stage1_step(runtime: StageTrainingRuntime, batch: TrainingBatch) -> Stage1L
 
 
 def _stage2_step(runtime: StageTrainingRuntime, batch: TrainingBatch) -> Stage2LossBreakdown:
-    _update_tfc_centers(runtime.model, batch)
     inputs = Stage2LossInputs(
         classifier=runtime.model.classifier,
         tfc_bank=runtime.model.tfc_bank,
@@ -960,9 +959,3 @@ def _optimizer_lr(optimizer: torch.optim.Optimizer) -> float:
     if not optimizer.param_groups:
         raise ValueError("optimizer has no parameter groups")
     return float(optimizer.param_groups[0]["lr"])
-
-
-def _update_tfc_centers(model: CLIPReIDTrainingModel, batch: TrainingBatch) -> None:
-    with torch.no_grad():
-        outputs = model.retrieval_model.forward_stage2(batch.images, batch.camera_ids, batch.person_ids)
-        model.tfc_bank.update(model.feature_head(outputs["retrieval"]), batch.person_ids)

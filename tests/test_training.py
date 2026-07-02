@@ -189,6 +189,34 @@ class TrainingLossTest(unittest.TestCase):
 
         self.assertLess(float(breakdown.identity.detach()), 0.01)
 
+    def test_stage2_loss_updates_tfc_centers_through_feature_head(self):
+        # Stage-2 must initialize/update TFC centers from the SAME forward's
+        # feature-head output before scoring — no separate no-grad forward and
+        # no RuntimeError on a fresh center bank.
+        model = _training_model(beta=0.0)
+        classifier = torch.nn.Linear(2, 2, bias=False)
+        head = torch.nn.Linear(2, 2, bias=False)
+        with torch.no_grad():
+            classifier.weight.copy_(torch.eye(2))
+            head.weight.copy_(torch.tensor([[1.0, 0.0], [0.0, 0.0]]))
+        batch = TrainingBatch(
+            images=torch.tensor([[1.0, 0.0], [0.9, 0.1], [0.0, 1.0]]),
+            camera_ids=torch.tensor([0, 0, 1]),
+            person_ids=torch.tensor([0, 0, 1]),
+        )
+        tfc_bank = TFCCenterBank(num_train_ids=2, feature_dim=2, momentum=0.5)
+
+        breakdown = stage2_loss_breakdown(
+            model,
+            batch,
+            Stage2LossInputs(classifier=classifier, tfc_bank=tfc_bank, feature_head=head),
+        )
+
+        self.assertTrue(bool(tfc_bank.initialized.all()))
+        # Centers live in feature-head space: the head zeroes dimension 1.
+        self.assertTrue(torch.allclose(tfc_bank.centers[:, 1], torch.zeros(2)))
+        self.assertGreaterEqual(float(breakdown.tfc.detach()), 0.0)
+
     def test_stage2_triplet_and_tfc_use_feature_head_output(self):
         model = _training_model(beta=0.0)
         classifier = torch.nn.Linear(2, 2, bias=False)
