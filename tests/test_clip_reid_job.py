@@ -29,6 +29,34 @@ class CLIPReIDJobTest(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             load_dataset_bundle(config, ImageAwareFakeImageProcessor())
 
+    def test_msmt17_training_split_merges_train_and_val_manifests(self):
+        # Standard MSMT17 protocol (TransReID/CLIP-ReID) trains on
+        # list_train.txt + list_val.txt; dropping val loses ~7% of the data.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "list_train.txt").write_text(
+                "0000/0000_000_01_0303morning_0015_0.jpg 0\n"
+                "0001/0001_000_02_0303morning_0016_0.jpg 1\n",
+                encoding="utf-8",
+            )
+            (root / "list_val.txt").write_text(
+                "0000/0000_001_03_0303morning_0017_0.jpg 0\n",
+                encoding="utf-8",
+            )
+            (root / "list_query.txt").write_text(
+                "0002/0002_000_01_0303morning_0018_0.jpg 2\n",
+                encoding="utf-8",
+            )
+            (root / "list_gallery.txt").write_text(
+                "0002/0002_000_02_0303morning_0019_0.jpg 2\n",
+                encoding="utf-8",
+            )
+
+            data = load_dataset_bundle(JobDataConfig("msmt17", root), ImageAwareFakeImageProcessor())
+
+        self.assertEqual(len(data.train), 3)
+        self.assertEqual(data.num_train_ids, 2)
+
     def test_load_dataset_bundle_uses_train_transform_only_for_train_split(self):
         class ConstantTransform:
             def __init__(self, value: float):
