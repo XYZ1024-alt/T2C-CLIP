@@ -614,7 +614,11 @@ def _load_split_samples(config: JobDataConfig) -> SplitSamples:
         )
     if config.dataset == "msmt17":
         return SplitSamples(
-            train=load_msmt17_manifest(config.root, "train"),
+            # Standard MSMT17 protocol trains on list_train.txt + list_val.txt.
+            train=[
+                *load_msmt17_manifest(config.root, "train"),
+                *load_msmt17_manifest(config.root, "val"),
+            ],
             query=load_msmt17_manifest(config.root, "query"),
             gallery=load_msmt17_manifest(config.root, "gallery"),
         )
