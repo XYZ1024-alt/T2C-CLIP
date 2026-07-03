@@ -16,6 +16,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field
 import importlib
 from pathlib import Path
+import random
 from typing import Any, Sequence
 
 import torch
@@ -103,8 +104,10 @@ class TwoStageTrainingJob:
 def main(argv: Sequence[str] | None = None, progress_factory: ProgressFactory | None = None) -> int:
     args = _build_parser().parse_args(argv)
     args.stage2_first_epoch = args.stage1_epochs + 1
+    _seed_random_generators(args.seed)
     with _mlflow_context_if_requested(args):
         job = _load_job_builder(args.job_builder)(args)
+        resume_state = _load_resume_state(args.resume)
         # Use a structural check rather than ``isinstance(job, TwoStageTrainingJob)``.
         # Under ``python -m scripts.train`` the entry module is loaded twice (once
         # as ``__main__`` and once as ``scripts.train``), so the ``TwoStageTrainingJob``
@@ -113,10 +116,37 @@ def main(argv: Sequence[str] | None = None, progress_factory: ProgressFactory | 
         # False and the two-stage job would be wrongly dispatched to the single
         # loop. Duck-typing on the public stage attributes sidesteps that.
         if _is_two_stage_job(job):
-            _run_two_stage_loop(job, args, progress_factory)
+            _run_two_stage_loop(job, args, progress_factory, resume_state)
         else:
-            _run_single_loop(job, args, progress_factory)
+            _run_single_loop(job, args, progress_factory, resume_state)
     return 0
+
+
+def _seed_random_generators(seed: int | None) -> None:
+    if seed is None:
+        return
+    random.seed(seed)
+    torch.manual_seed(seed)
+
+
+def _load_resume_state(checkpoint: Path | None) -> dict[str, Any] | None:
+    if checkpoint is None:
+        return None
+    if not checkpoint.exists():
+        raise FileNotFoundError(f"resume checkpoint does not exist: {checkpoint}")
+    return torch.load(checkpoint, map_location="cpu", weights_only=True)
+
+
+def _restore_job_state(job: TrainingJob, resume_state: dict[str, Any]) -> None:
+    job.model.load_state_dict(resume_state["model_state"])
+    if job.optimizer is not None and "optimizer_state" in resume_state:
+        job.optimizer.load_state_dict(resume_state["optimizer_state"])
+
+
+def _resume_best_map(resume_state: dict[str, Any] | None) -> float | None:
+    if resume_state is None:
+        return None
+    return resume_state.get("best_map")
 
 
 def _is_two_stage_job(job: Any) -> bool:
@@ -149,6 +179,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--epochs", type=int, default=DEFAULT_TOTAL_EPOCHS)
     parser.add_argument("--validation-interval", type=int, default=DEFAULT_VALIDATION_INTERVAL)
     parser.add_argument("--checkpoint-dir", type=Path, default=DEFAULT_CHECKPOINT_DIR)
+    parser.add_argument("--resume", type=Path)
+    parser.add_argument("--seed", type=int)
     parser.add_argument("--enable-mlflow", action="store_true")
     parser.add_argument("--tracking-db", type=Path, default=DEFAULT_TRACKING_DB)
     parser.add_argument("--artifact-root", type=Path, default=DEFAULT_ARTIFACT_ROOT)
@@ -215,7 +247,19 @@ def _mlflow_context_if_requested(args: argparse.Namespace):
     return start_mlflow_sqlite_run(config, run_name=args.run_name)
 
 
-def _run_two_stage_loop(job: TwoStageTrainingJob, args: argparse.Namespace, progress_factory: ProgressFactory | None) -> None:
+def _run_two_stage_loop(
+    job: TwoStageTrainingJob,
+    args: argparse.Namespace,
+    progress_factory: ProgressFactory | None,
+    resume_state: dict[str, Any] | None = None,
+) -> None:
+    completed_stage2_epochs = 0
+    if resume_state is not None:
+        resume_stage = resume_state.get("stage")
+        if resume_stage != "stage2":
+            raise ValueError(f"only stage2 checkpoints can be resumed, got stage: {resume_stage!r}")
+        _restore_job_state(job.stage2, resume_state)
+        completed_stage2_epochs = int(resume_state["epoch"]) - args.stage1_epochs
     if args.enable_mlflow and job.stage_metadata is not None:
         log_stage_params_to_mlflow(_stage_metadata_values(job.stage_metadata))
     stage1_loggers = _stage_metric_loggers_for("stage1", args)
@@ -229,7 +273,7 @@ def _run_two_stage_loop(job: TwoStageTrainingJob, args: argparse.Namespace, prog
         stage="stage1",
         validate_final_epoch=False,
     )
-    if args.stage1_epochs > 0:
+    if args.stage1_epochs > 0 and resume_state is None:
         run_training_loop(
             model=job.stage1.model,
             optimizer=job.stage1.optimizer,
@@ -242,9 +286,9 @@ def _run_two_stage_loop(job: TwoStageTrainingJob, args: argparse.Namespace, prog
             train_step_metric_logger=stage1_loggers[1],
         )
 
-    stage2_first_epoch = args.stage1_epochs + 1
+    stage2_first_epoch = args.stage1_epochs + completed_stage2_epochs + 1
     stage2_config = TrainingLoopConfig(
-        total_epochs=args.epochs,
+        total_epochs=args.epochs - completed_stage2_epochs,
         validation_interval=args.validation_interval,
         checkpoint_dir=args.checkpoint_dir,
         first_epoch=stage2_first_epoch,
@@ -264,15 +308,26 @@ def _run_two_stage_loop(job: TwoStageTrainingJob, args: argparse.Namespace, prog
         metric_logger=_metric_logger_if_requested(args),
         train_metric_logger=stage2_loggers[0],
         train_step_metric_logger=stage2_loggers[1],
+        initial_best_map=_resume_best_map(resume_state),
     )
 
 
-def _run_single_loop(job: TrainingJob, args: argparse.Namespace, progress_factory: ProgressFactory | None) -> None:
+def _run_single_loop(
+    job: TrainingJob,
+    args: argparse.Namespace,
+    progress_factory: ProgressFactory | None,
+    resume_state: dict[str, Any] | None = None,
+) -> None:
+    completed_epochs = 0
+    if resume_state is not None:
+        _restore_job_state(job, resume_state)
+        completed_epochs = int(resume_state["epoch"])
     loggers = _stage_metric_loggers_for("stage2", args)
     config = TrainingLoopConfig(
-        total_epochs=args.epochs,
+        total_epochs=args.epochs - completed_epochs,
         validation_interval=args.validation_interval,
         checkpoint_dir=args.checkpoint_dir,
+        first_epoch=completed_epochs + 1,
         progress_description="stage2",
         stage="stage2",
         sanity_check_offset=int(getattr(args, "sanity_gate_epochs", 0)),
@@ -288,6 +343,7 @@ def _run_single_loop(job: TrainingJob, args: argparse.Namespace, progress_factor
         metric_logger=_metric_logger_if_requested(args),
         train_metric_logger=loggers[0],
         train_step_metric_logger=loggers[1],
+        initial_best_map=_resume_best_map(resume_state),
     )
 
 
