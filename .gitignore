@@ -7,10 +7,12 @@ __pycache__/
 htmlcov/
 
 MSMT17_V1/
+MSMT17_V1.zip
 Market-1501/
 checkpoints/
 runs/
-outputs/
+output/
+tmp/
 mlflow/*.db
 mlflow/*.db-*
 mlruns/
