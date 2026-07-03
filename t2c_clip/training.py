@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 import torch
 from torch.nn import functional as F
 
-from t2c_clip.losses import batch_hard_triplet_loss, bidirectional_contrastive_loss
+from t2c_clip.losses import batch_hard_triplet_loss, supervised_bidirectional_contrastive_loss
 from t2c_clip.model import T2CClipModel
 from t2c_clip.tfc import TFCCenterBank
 
@@ -95,8 +95,8 @@ def stage1_alignment_loss(
     config: Stage1LossConfig,
 ) -> Stage1LossBreakdown:
     outputs = model.forward_stage1(batch.images, batch.camera_ids, batch.person_ids)
-    clip_dual = bidirectional_contrastive_loss(
-        outputs["visual"], outputs["text"], logit_scale=config.logit_scale
+    clip_dual = supervised_bidirectional_contrastive_loss(
+        outputs["visual"], outputs["text"], batch.person_ids, logit_scale=config.logit_scale
     )
     return Stage1LossBreakdown(clip_dual=clip_dual)
 
@@ -106,13 +106,20 @@ def stage2_loss_breakdown(
     batch: TrainingBatch,
     inputs: Stage2LossInputs,
 ) -> Stage2LossBreakdown:
+    """Compute the Stage-2 losses from a single forward pass.
+
+    The TFC centers are updated (detached, no-grad) from this forward's
+    feature-head output before scoring, so no separate center-update forward
+    is needed and the BNNeck running stats see each batch exactly once.
+    """
     outputs = model.forward_stage2(batch.images, batch.camera_ids, batch.person_ids)
     retrieval = outputs["retrieval"]
     reid_features = inputs.feature_head(retrieval)
+    inputs.tfc_bank.update(reid_features, batch.person_ids)
     logits = inputs.classifier(reid_features) * inputs.config.id_logit_scale
     return Stage2LossBreakdown(
-        clip_dual=bidirectional_contrastive_loss(
-            outputs["visual"], outputs["text"], inputs.config.logit_scale
+        clip_dual=supervised_bidirectional_contrastive_loss(
+            outputs["visual"], outputs["text"], batch.person_ids, logit_scale=inputs.config.logit_scale
         ),
         identity=F.cross_entropy(
             logits,

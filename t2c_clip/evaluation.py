@@ -88,7 +88,9 @@ def _rerank_distance(
     expanded_affinity = _query_expansion(affinity, initial_rank, config.k2)
     jaccard_distance = _jaccard_distance(expanded_affinity, query_features.shape[0])
     query_count = query_features.shape[0]
-    gallery_slice = original_distance[:query_count, query_count:]
+    # Zhong et al. take the original-distance term from the TRANSPOSED
+    # column-normalized matrix so each query row is scaled by one constant.
+    gallery_slice = transposed_distance[:query_count, query_count:]
     return (1.0 - config.lambda_value) * jaccard_distance + config.lambda_value * gallery_slice
 
 

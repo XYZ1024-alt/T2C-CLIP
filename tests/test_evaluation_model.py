@@ -19,6 +19,27 @@ class PromptMeanEncoder(torch.nn.Module):
 
 
 class EvaluationModelTest(unittest.TestCase):
+    def test_rerank_lambda_term_uses_transposed_normalized_distance(self):
+        # Zhong et al. build the original-distance term from the TRANSPOSED
+        # column-normalized matrix (np.transpose(dist / np.max(dist, axis=0))).
+        # With lambda=1 the rerank distance must equal exactly that slice.
+        from t2c_clip.evaluation import _pairwise_distance, _rerank_distance
+        from t2c_clip.features import l2_normalize
+
+        torch.manual_seed(0)
+        query = torch.randn(3, 4)
+        gallery = torch.randn(5, 4)
+        config = RerankConfig(k1=3, k2=2, lambda_value=1.0)
+
+        features = l2_normalize(torch.cat([query, gallery], dim=0))
+        original = _pairwise_distance(features)
+        original = original / original.max(dim=0, keepdim=True).values.clamp_min(1e-12)
+        expected = original.T.contiguous()[: query.shape[0], query.shape[0]:]
+
+        result = _rerank_distance(query, gallery, config)
+
+        self.assertTrue(torch.allclose(result, expected, atol=1e-6))
+
     def test_evaluate_reid_excludes_same_camera_matches(self):
         query = torch.tensor([[1.0, 0.0]])
         gallery = torch.tensor([[1.0, 0.0], [0.0, 1.0]])

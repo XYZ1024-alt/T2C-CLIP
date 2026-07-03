@@ -27,6 +27,47 @@ def bidirectional_contrastive_loss(
     return (image_loss + text_loss) / 2.0
 
 
+def supervised_bidirectional_contrastive_loss(
+    image_features: torch.Tensor,
+    text_features: torch.Tensor,
+    person_ids: torch.Tensor,
+    logit_scale: float = DEFAULT_LOGIT_SCALE,
+) -> torch.Tensor:
+    """CLIP-ReID-style multi-positive bidirectional contrastive loss.
+
+    Identity-balanced PK batches always contain several samples of the same
+    person. The plain ``targets=arange`` InfoNCE treats those rows as
+    negatives and actively pushes same-person pairs apart; here every row
+    sharing a person id is a positive, and the per-anchor loss averages the
+    log-probabilities over all positives (SupCon "out" formulation). With
+    unique ids per batch this reduces exactly to
+    :func:`bidirectional_contrastive_loss`.
+    """
+    if image_features.shape != text_features.shape:
+        raise ValueError("image_features and text_features must have identical shapes")
+    _validate_person_ids(person_ids, image_features.shape[0])
+    image = l2_normalize(image_features)
+    text = l2_normalize(text_features)
+    logits = logit_scale * image @ text.T
+    positives = (person_ids.unsqueeze(0) == person_ids.unsqueeze(1)).to(logits.dtype)
+    image_loss = _multi_positive_cross_entropy(logits, positives)
+    text_loss = _multi_positive_cross_entropy(logits.T, positives)
+    return (image_loss + text_loss) / 2.0
+
+
+def _multi_positive_cross_entropy(logits: torch.Tensor, positives: torch.Tensor) -> torch.Tensor:
+    log_probs = F.log_softmax(logits, dim=1)
+    positive_log_probs = (log_probs * positives).sum(dim=1) / positives.sum(dim=1)
+    return -positive_log_probs.mean()
+
+
+def _validate_person_ids(person_ids: torch.Tensor, batch_size: int) -> None:
+    if person_ids.dtype != torch.long or person_ids.ndim != 1:
+        raise ValueError("person_ids must be a rank-1 torch.long tensor")
+    if person_ids.shape[0] != batch_size:
+        raise ValueError("person_ids must match the contrastive batch size")
+
+
 def batch_hard_triplet_loss(
     features: torch.Tensor,
     labels: torch.Tensor,

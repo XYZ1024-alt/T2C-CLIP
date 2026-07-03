@@ -99,8 +99,12 @@ class FakeCLIP(nn.Module):
         self.visual_projection = nn.Linear(projection_dim, projection_dim, bias=False)
         self.logit_scale = nn.Parameter(torch.tensor(1.0))
         self.scale = nn.Parameter(torch.tensor(1.0))
+        self.last_interpolate_pos_encoding: bool | None = None
+        self.image_feature_calls = 0
 
-    def get_image_features(self, pixel_values: torch.Tensor) -> torch.Tensor:
+    def get_image_features(self, pixel_values: torch.Tensor, interpolate_pos_encoding: bool = False) -> torch.Tensor:
+        self.last_interpolate_pos_encoding = interpolate_pos_encoding
+        self.image_feature_calls += 1
         pooled = pixel_values.mean(dim=(2, 3))  # [B, channels]
         target_dim = self.config.vision_config.hidden_size
         if pooled.shape[1] < target_dim:
@@ -120,12 +124,16 @@ class FakeImageProcessor:
     """Mimics a CLIP image processor returning ``{"pixel_values": ...}``.
 
     Always returns a constant pixel tensor (default ones) independent of the
-    input image so tests can assert exact tensor equality.
+    input image so tests can assert exact tensor equality. Exposes identity
+    ``image_mean``/``image_std`` so ReID transforms can read normalization
+    stats without changing pixel values.
     """
 
     def __init__(self, fill_value: float = 1.0):
         self.call_count = 0
         self.fill_value = fill_value
+        self.image_mean = [0.0, 0.0, 0.0]
+        self.image_std = [1.0, 1.0, 1.0]
 
     def __call__(self, images, return_tensors: str = "pt") -> dict[str, torch.Tensor]:
         self.call_count += 1
@@ -137,6 +145,9 @@ class FakeImageProcessor:
 
 class ImageAwareFakeImageProcessor:
     """Returns pixel values derived from the actual pixel at coordinate (0, 0)."""
+
+    image_mean = [0.0, 0.0, 0.0]
+    image_std = [1.0, 1.0, 1.0]
 
     def __call__(self, images, return_tensors: str = "pt") -> dict[str, torch.Tensor]:
         pixel = torch.tensor(list(images.getpixel((0, 0))), dtype=torch.float32) / 255.0
