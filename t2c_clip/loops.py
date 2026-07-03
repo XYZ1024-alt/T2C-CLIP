@@ -160,9 +160,10 @@ def run_training_loop(
     metric_logger: MetricLogger | None = None,
     train_metric_logger: TrainMetricLogger | None = None,
     train_step_metric_logger: TrainStepMetricLogger | None = None,
+    initial_best_map: float | None = None,
 ) -> TrainingLoopResult:
     config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    best_map: float | None = None
+    best_map: float | None = initial_best_map
     first_validated_map: float | None = None
     validation_count = 0
     sanity_gate_triggered = False

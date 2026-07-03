@@ -150,6 +150,12 @@ Useful training arguments:
 - `--stage1-epochs N` (Stage-1 prompt alignment epochs; `0` skips Stage-1)
 - `--epochs N` (Stage-2 ReID training epochs)
 - `--validation-interval N` (Stage-2 mAP validation cadence)
+- `--resume checkpoints/last.pth` (restore model/optimizer state and continue
+  epoch numbering from a saved Stage-2 checkpoint; Stage-1 is skipped and the
+  saved best mAP is kept so `best.pth` is never overwritten by a worse epoch.
+  Pass the same `--stage1-epochs` and `--epochs` as the original run.)
+- `--seed 42` (seed Python `random` and torch before building the job, for
+  reproducible weight init, PK sampling, and augmentations)
 - `--batch-size 384`
 - `--num-workers 4`
 - `--lr 0.0001` (learning rate for the prompt bank, classifier, and unfrozen
