@@ -2,7 +2,11 @@ import unittest
 
 import torch
 
-from t2c_clip.losses import batch_hard_triplet_loss, bidirectional_contrastive_loss
+from t2c_clip.losses import (
+    batch_hard_triplet_loss,
+    bidirectional_contrastive_loss,
+    supervised_bidirectional_contrastive_loss,
+)
 from t2c_clip.tfc import TFCCenterBank
 
 
@@ -34,3 +38,34 @@ class TFCLossTest(unittest.TestCase):
         labels = torch.tensor([0, 0, 1])
         loss = batch_hard_triplet_loss(features, labels, margin=0.3)
         self.assertGreater(float(loss), 0.0)
+
+    def test_supervised_contrastive_matches_arange_loss_for_unique_ids(self):
+        torch.manual_seed(0)
+        image = torch.randn(4, 3)
+        text = torch.randn(4, 3)
+        ids = torch.tensor([3, 1, 0, 2])
+
+        supervised = supervised_bidirectional_contrastive_loss(image, text, ids, logit_scale=7.0)
+        plain = bidirectional_contrastive_loss(image, text, logit_scale=7.0)
+
+        self.assertTrue(torch.allclose(supervised, plain, atol=1e-6))
+
+    def test_supervised_contrastive_pulls_same_identity_text_toward_image(self):
+        # PK batches always contain same-person pairs. The plain arange loss
+        # pushes image 0 away from the same person's other text row; the
+        # supervised loss must treat it as a positive instead.
+        images = torch.tensor([[1.0, 0.0], [0.0, 1.0]], requires_grad=True)
+        texts = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+        ids = torch.tensor([0, 0])
+
+        loss = supervised_bidirectional_contrastive_loss(images, texts, ids, logit_scale=1.0)
+        loss.backward()
+
+        # Moving image 0 toward the same-person text 1 must decrease the loss.
+        self.assertLess(float(images.grad[0] @ texts[1]), 0.0)
+
+    def test_supervised_contrastive_validates_person_ids(self):
+        with self.assertRaises(ValueError):
+            supervised_bidirectional_contrastive_loss(torch.eye(2), torch.eye(2), torch.tensor([0]))
+        with self.assertRaises(ValueError):
+            supervised_bidirectional_contrastive_loss(torch.eye(2), torch.eye(2), torch.tensor([0.5, 1.5]))

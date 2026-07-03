@@ -177,3 +177,37 @@ class MLflowSQLiteTest(unittest.TestCase):
         self.assertEqual([point.step for point in loss_history], [1, 2])
         self.assertEqual([point.value for point in loss_history], [0.7, 0.6])
         self.assertEqual([point.step for point in lr_history], [1, 2])
+
+    def test_stage_params_logs_all_metadata_keys_including_dataset_and_new_args(self):
+        # Previously log_stage_params_to_mlflow used a hard-coded whitelist that
+        # silently dropped dataset, clip_model_name, batch_size, num_instances,
+        # stage2_lr_scheduler, stage2_warmup_epochs, and other key hyperparam.
+        with tempfile.TemporaryDirectory() as tmp:
+            config = MLflowSQLiteConfig(
+                tracking_db=Path(tmp) / "tracking.db",
+                artifact_root=Path(tmp) / "artifacts",
+                experiment_name="T2C-CLIP-FullParams-Test",
+            )
+            metadata = {
+                "dataset": "msmt17",
+                "clip_model_name": "openai/clip-vit-base-patch16",
+                "batch_size": 384,
+                "num_instances": 4,
+                "stage2_lr_scheduler": "cosine",
+                "stage2_warmup_epochs": 10,
+                "lr": 0.0001,
+                "retrieval_mode": "fused",
+                "id_logit_scale": 10.0,
+            }
+            with start_mlflow_sqlite_run(config, run_name="all-params-test") as run:
+                log_stage_params_to_mlflow(metadata)
+                run_id = run.run_id
+            client = MlflowClient(tracking_uri=run.tracking_uri)
+            logged = client.get_run(run_id)
+
+        for key in ("dataset", "clip_model_name", "batch_size", "num_instances",
+                    "stage2_lr_scheduler", "stage2_warmup_epochs", "lr", "id_logit_scale"):
+            self.assertIn(key, logged.data.params,
+                          f"expected MLflow to log '{key}' but it was missing")
+        self.assertEqual(logged.data.params["dataset"], "msmt17")
+        self.assertEqual(logged.data.params["num_instances"], "4")

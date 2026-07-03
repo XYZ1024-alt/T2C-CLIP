@@ -141,31 +141,13 @@ def make_stage_metric_loggers(stage: str) -> tuple["TrainMetricLogger", "TrainSt
 
 
 def log_stage_params_to_mlflow(metadata: Mapping[str, Any]) -> None:
-    """Record the two-stage training configuration as MLflow params/tags."""
-    mlflow.set_tag("t2c_clip.retrieval_mode", str(metadata.get("retrieval_mode", "fused")))
-    for key in (
-        "stage1_epochs",
-        "stage2_epochs",
-        "clip_checkpoint",
-        "validation_interval",
-        "freeze_image_encoder_stage1",
-        "freeze_image_encoder_stage2",
-        "freeze_text_encoder",
-        "freeze_prompt_bank_stage2",
-        "clip_weight",
-        "id_logit_scale",
-        "label_smoothing",
-        "tfc_weight",
-        "beta",
-        "beta_warmup_epochs",
-        "lr",
-        "image_encoder_lr",
-        "reid_head",
-        "retrieval_mode",
-        "report_rerank",
-    ):
-        if key in metadata:
-            mlflow.log_param(key, metadata[key])
+    """Record all two-stage training configuration keys as MLflow params/tags."""
+    if "retrieval_mode" in metadata:
+        mlflow.set_tag("t2c_clip.retrieval_mode", str(metadata["retrieval_mode"]))
+    for key in sorted(metadata):
+        value = metadata[key]
+        if value is not None:
+            mlflow.log_param(key, value)
 
 
 def mlflow_ui_command(

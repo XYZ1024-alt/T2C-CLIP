@@ -29,6 +29,34 @@ class CLIPReIDJobTest(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             load_dataset_bundle(config, ImageAwareFakeImageProcessor())
 
+    def test_msmt17_training_split_merges_train_and_val_manifests(self):
+        # Standard MSMT17 protocol (TransReID/CLIP-ReID) trains on
+        # list_train.txt + list_val.txt; dropping val loses ~7% of the data.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "list_train.txt").write_text(
+                "0000/0000_000_01_0303morning_0015_0.jpg 0\n"
+                "0001/0001_000_02_0303morning_0016_0.jpg 1\n",
+                encoding="utf-8",
+            )
+            (root / "list_val.txt").write_text(
+                "0000/0000_001_03_0303morning_0017_0.jpg 0\n",
+                encoding="utf-8",
+            )
+            (root / "list_query.txt").write_text(
+                "0002/0002_000_01_0303morning_0018_0.jpg 2\n",
+                encoding="utf-8",
+            )
+            (root / "list_gallery.txt").write_text(
+                "0002/0002_000_02_0303morning_0019_0.jpg 2\n",
+                encoding="utf-8",
+            )
+
+            data = load_dataset_bundle(JobDataConfig("msmt17", root), ImageAwareFakeImageProcessor())
+
+        self.assertEqual(len(data.train), 3)
+        self.assertEqual(data.num_train_ids, 2)
+
     def test_load_dataset_bundle_uses_train_transform_only_for_train_split(self):
         class ConstantTransform:
             def __init__(self, value: float):
@@ -295,34 +323,18 @@ class CLIPReIDJobTest(unittest.TestCase):
 
         self.assertFalse(torch.allclose(with_head.features, without_head.features))
 
-    def test_tfc_center_update_uses_feature_head_output(self):
-        from t2c_clip.jobs.clip_reid import _update_tfc_centers
-        from t2c_clip.tfc import TFCCenterBank
-        from t2c_clip.training import TrainingBatch
+    def test_stage2_training_step_runs_single_image_forward_per_batch(self):
+        # TFC center updates must reuse the loss forward's features instead of
+        # running a second full no-grad forward per batch.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            job = build_training_job(_training_args(root), clip_loader=_load_fake_clip)
+            clip = job.model.retrieval_model.image_encoder.clip_model
+            clip.image_feature_calls = 0
 
-        class StubRetrieval(torch.nn.Module):
-            def forward_stage2(self, images, camera_ids, person_ids):
-                return {"retrieval": images}
+            job.train_one_epoch(1, TrainBatchReporterRecorder())
 
-        head = torch.nn.Linear(2, 2, bias=False)
-        with torch.no_grad():
-            head.weight.copy_(torch.tensor([[1.0, 0.0], [0.0, 0.0]]))
-        model = CLIPReIDTrainingModel(
-            retrieval_model=StubRetrieval(),
-            classifier=torch.nn.Linear(2, 2),
-            tfc_bank=TFCCenterBank(num_train_ids=2, feature_dim=2, momentum=0.5),
-            feature_head=head,
-        )
-        batch = TrainingBatch(
-            images=torch.tensor([[1.0, 0.0], [0.8, 0.2], [0.0, 1.0], [0.0, 0.8]]),
-            camera_ids=torch.tensor([0, 0, 1, 1]),
-            person_ids=torch.tensor([0, 0, 1, 1]),
-        )
-
-        _update_tfc_centers(model, batch)
-
-        self.assertTrue(torch.allclose(model.tfc_bank.centers[0], torch.tensor([1.0, 0.0])))
-        self.assertTrue(torch.allclose(model.tfc_bank.centers[1], torch.tensor([0.0, 0.0])))
+        self.assertEqual(clip.image_feature_calls, 1)
 
     def test_default_args_freeze_image_encoder_stage2_is_false_when_attr_absent(self):
         # The job config must default Stage-2 image encoder to UNFROZEN (matching
@@ -535,6 +547,36 @@ class CLIPReIDJobTest(unittest.TestCase):
 
         self.assertEqual(loader.batch_sampler._instances_per_identity, 4)
         self.assertEqual(loader.batch_sampler._identities_per_batch, 2)
+
+    def test_stage_loss_configs_read_logit_scale_from_clip_model(self):
+        import math
+
+        from t2c_clip.jobs.clip_reid import (
+            _job_config_from_args,
+            _stage1_loss_config,
+            _stage2_loss_config,
+        )
+
+        clip = FakeCLIP(hidden_size=8, projection_dim=4)  # logit_scale parameter = 1.0
+
+        stage1 = _stage1_loss_config(clip)
+        self.assertAlmostEqual(stage1.logit_scale, math.e, places=5)
+
+        config = _job_config_from_args(_training_args(Path(".")))
+        stage2 = _stage2_loss_config(config, clip)
+        self.assertAlmostEqual(stage2.logit_scale, math.e, places=5)
+        self.assertEqual(stage2.triplet_margin, config.triplet_margin)
+        self.assertEqual(stage2.id_logit_scale, config.id_logit_scale)
+        self.assertEqual(stage2.clip_weight, config.clip_weight)
+
+    def test_clip_logit_scale_is_frozen_in_built_job(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+
+            job = build_training_job(_training_args(root), clip_loader=_load_fake_clip)
+
+        clip = job.model.retrieval_model.image_encoder.clip_model
+        self.assertFalse(clip.logit_scale.requires_grad)
 
 
 def _load_fake_clip(model_name: str) -> CLIPLoadResult:

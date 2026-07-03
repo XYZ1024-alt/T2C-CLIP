@@ -1,4 +1,13 @@
-"""Image transforms derived from CLIP processors."""
+"""Image transforms for CLIP-backed person ReID.
+
+CLIP's own image processor resizes the shortest edge to 224 and center-crops
+a 224x224 square. On tall person crops (aspect ratio ~1:2) that discards the
+head and feet — only the torso survives. These transforms therefore reuse only
+the processor's normalization statistics (``image_mean``/``image_std``) and
+resize the whole person image to a fixed ReID aspect ratio instead. The CLIP
+vision encoder consumes the non-square input through position-embedding
+interpolation (see ``TransformersCLIPImageEncoder``).
+"""
 
 from __future__ import annotations
 
@@ -7,15 +16,38 @@ from typing import Any
 from PIL import Image
 import torch
 from torchvision import transforms
+from torchvision.transforms import InterpolationMode
+
+# (height, width): standard whole-person ReID input resolution.
+DEFAULT_IMAGE_SIZE = (256, 128)
+
+
+def _processor_normalization(image_processor: Any) -> tuple[list[float], list[float]]:
+    mean = getattr(image_processor, "image_mean", None)
+    std = getattr(image_processor, "image_std", None)
+    if mean is None or std is None:
+        raise ValueError(
+            "image_processor must expose image_mean and image_std so ReID "
+            "transforms can normalize like the CLIP pretraining pipeline"
+        )
+    return [float(value) for value in mean], [float(value) for value in std]
 
 
 class CLIPImageTransform:
-    def __init__(self, image_processor: Any):
+    def __init__(self, image_processor: Any, image_size: tuple[int, int] = DEFAULT_IMAGE_SIZE):
         self.image_processor = image_processor
+        self.image_size = (int(image_size[0]), int(image_size[1]))
+        mean, std = _processor_normalization(image_processor)
+        self._pipeline = transforms.Compose(
+            [
+                transforms.Resize(self.image_size, interpolation=InterpolationMode.BICUBIC),
+                transforms.ToTensor(),
+                transforms.Normalize(mean, std),
+            ]
+        )
 
     def __call__(self, image: Image.Image) -> torch.Tensor:
-        encoded = self.image_processor(images=image, return_tensors="pt")
-        return encoded["pixel_values"][0]
+        return self._pipeline(image)
 
 
 class CLIPTrainImageTransform:
@@ -23,6 +55,7 @@ class CLIPTrainImageTransform:
         self,
         image_processor: Any,
         *,
+        image_size: tuple[int, int] = DEFAULT_IMAGE_SIZE,
         flip_prob: float = 0.5,
         color_jitter: tuple[float, float, float, float] = (0.2, 0.2, 0.2, 0.05),
         erase_prob: float = 0.5,
@@ -30,6 +63,7 @@ class CLIPTrainImageTransform:
         erase_ratio: tuple[float, float] = (0.3, 3.3),
     ):
         self.image_processor = image_processor
+        self._base = CLIPImageTransform(image_processor, image_size=image_size)
         self.pre_processor = transforms.Compose(
             [
                 transforms.RandomHorizontalFlip(p=flip_prob),
@@ -49,5 +83,4 @@ class CLIPTrainImageTransform:
         )
 
     def __call__(self, image: Image.Image) -> torch.Tensor:
-        encoded = self.image_processor(images=self.pre_processor(image), return_tensors="pt")
-        return self.random_erasing(encoded["pixel_values"][0])
+        return self.random_erasing(self._base(self.pre_processor(image)))
