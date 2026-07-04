@@ -50,18 +50,20 @@ class T2CClipModel(torch.nn.Module):
         retrieval_mode: str = FUSED_RETRIEVAL,
     ) -> torch.Tensor:
         """Inference / validation retrieval feature."""
-        bn_features = self.feature_head(self.encode_visual_raw(images))
+        bn_features = self.feature_head(self.encode_visual_raw(images, camera_ids))
         mode = require_retrieval_mode(retrieval_mode)
         if mode == IMAGE_ONLY_RETRIEVAL:
             return l2_normalize(bn_features)
         text = self.encode_inference_text(camera_ids)
         return fuse_features(bn_features, text, self.beta)
 
-    def encode_visual_raw(self, images: torch.Tensor) -> torch.Tensor:
-        return self.image_encoder(images)
+    def encode_visual_raw(self, images: torch.Tensor, camera_ids: torch.Tensor | None = None) -> torch.Tensor:
+        if camera_ids is None:
+            return self.image_encoder(images)
+        return self.image_encoder(images, camera_ids=camera_ids)
 
-    def encode_visual(self, images: torch.Tensor) -> torch.Tensor:
-        return l2_normalize(self.encode_visual_raw(images))
+    def encode_visual(self, images: torch.Tensor, camera_ids: torch.Tensor | None = None) -> torch.Tensor:
+        return l2_normalize(self.encode_visual_raw(images, camera_ids))
 
     def encode_inference_text(self, camera_ids: torch.Tensor) -> torch.Tensor:
         if self.inference_text_cache is not None:
@@ -95,7 +97,7 @@ class T2CClipModel(torch.nn.Module):
         person_ids: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         """Stage-1 prompt alignment forward."""
-        visual = self.encode_visual(images)
+        visual = self.encode_visual(images, camera_ids)
         text = self.encode_training_text(camera_ids, person_ids)
         return {"visual": visual, "text": text}
 
@@ -113,7 +115,7 @@ class T2CClipModel(torch.nn.Module):
         forwards share one signature.
         """
         _ = person_ids
-        visual_raw = self.encode_visual_raw(images)
+        visual_raw = self.encode_visual_raw(images, camera_ids)
         bn_features = self.feature_head(visual_raw)
         retrieval_text = self.encode_inference_text(camera_ids)
         retrieval = fuse_features(bn_features, retrieval_text, self.beta)

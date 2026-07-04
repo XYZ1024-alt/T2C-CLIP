@@ -150,6 +150,7 @@ class CLIPReIDJobConfig:
     stage2_lr_scheduler: str = "none"
     stage2_warmup_epochs: int = 0
     num_instances: int = DEFAULT_INSTANCES_PER_IDENTITY
+    sie_coe: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -442,6 +443,7 @@ def _job_config_from_args(args: Any) -> CLIPReIDJobConfig:
         stage2_lr_scheduler=str(getattr(args, "stage2_lr_scheduler", "none")),
         stage2_warmup_epochs=int(getattr(args, "stage2_warmup_epochs", 0)),
         num_instances=int(getattr(args, "num_instances", DEFAULT_INSTANCES_PER_IDENTITY)),
+        sie_coe=float(getattr(args, "sie_coe", 0.0)),
     )
 
 
@@ -500,6 +502,10 @@ def _apply_freezing(model: CLIPReIDTrainingModel, config: CLIPReIDJobConfig, sta
     text_trainable = not config.freeze_text_encoder
     _set_module_requires_grad(clip_model.vision_model, image_trainable)
     _set_module_requires_grad(clip_model.visual_projection, image_trainable)
+    # The SIE camera embedding feeds the vision tower, so it follows the
+    # image-encoder freeze state of the current stage.
+    if retrieval.image_encoder.sie_embedding is not None:
+        _set_module_requires_grad(retrieval.image_encoder.sie_embedding, image_trainable)
     _set_module_requires_grad(clip_model.text_model, text_trainable)
     _set_module_requires_grad(clip_model.text_projection, text_trainable)
     # The contrastive losses read logit_scale as a frozen constant; keep the
@@ -652,6 +658,7 @@ def _stage_metadata(config: CLIPReIDJobConfig) -> StageMetadata:
             "stage2_lr_scheduler": config.stage2_lr_scheduler,
             "stage2_warmup_epochs": config.stage2_warmup_epochs,
             "num_instances": config.num_instances,
+            "sie_coe": config.sie_coe,
         }
     )
 
@@ -705,7 +712,9 @@ def _build_training_model(
             embedding_dim=text_hidden_dim,
         )
     )
-    image_encoder = TransformersCLIPImageEncoder(clip_model)
+    image_encoder = TransformersCLIPImageEncoder(
+        clip_model, num_cameras=data.num_cameras, sie_coe=config.sie_coe
+    )
     text_encoder = TransformersCLIPTextEncoder(
         clip_model,
         context_length=config.context_length,

@@ -201,6 +201,7 @@ def _add_project_training_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--num-workers", type=int, default=DEFAULT_NUM_WORKERS)
     parser.add_argument("--lr", type=float, default=DEFAULT_LEARNING_RATE)
     parser.add_argument("--image-encoder-lr", type=float, default=DEFAULT_IMAGE_ENCODER_LR)
+    parser.add_argument("--sie-coe", type=float, default=0.0)
     parser.add_argument("--device", default=DEFAULT_DEVICE)
     parser.add_argument("--beta", type=float, default=DEFAULT_BETA)
     parser.add_argument("--beta-warmup-epochs", type=int, default=DEFAULT_BETA_WARMUP_EPOCHS)

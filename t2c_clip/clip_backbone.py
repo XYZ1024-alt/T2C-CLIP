@@ -12,19 +12,61 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+from t2c_clip.prompts import validate_index_tensor
+
 
 class TransformersCLIPImageEncoder(torch.nn.Module):
-    def __init__(self, clip_model: torch.nn.Module):
+    """Real CLIP image encoder with an optional SIE camera embedding.
+
+    With ``sie_coe == 0.0`` or ``num_cameras is None`` the encoder is a plain
+    wrapper around ``clip_model.get_image_features``. When enabled, a learnable
+    per-camera embedding (TransReID's Side Information Embedding) is added to
+    every vision token before the pre-layernorm, which requires manually
+    replicating the HF CLIP vision forward.
+    """
+
+    def __init__(
+        self,
+        clip_model: torch.nn.Module,
+        num_cameras: int | None = None,
+        sie_coe: float = 0.0,
+    ):
         super().__init__()
         self.clip_model = clip_model
+        self.sie_coe = float(sie_coe)
+        self.sie_embedding: torch.nn.Embedding | None = None
+        if self.sie_coe != 0.0 and num_cameras is not None:
+            _require_positive(num_cameras, "num_cameras")
+            self.sie_embedding = torch.nn.Embedding(num_cameras, clip_vision_hidden_dim(clip_model))
+            torch.nn.init.trunc_normal_(self.sie_embedding.weight, std=SIE_INIT_STD)
 
-    def forward(self, images: torch.Tensor) -> torch.Tensor:
-        # ReID inputs are non-square (e.g. 256x128); the pretrained CLIP ViT
-        # only accepts them with position-embedding interpolation enabled.
-        output = self.clip_model.get_image_features(
-            pixel_values=images, interpolate_pos_encoding=True
-        )
-        return _image_features_tensor(output)
+    def forward(self, images: torch.Tensor, camera_ids: torch.Tensor | None = None) -> torch.Tensor:
+        if self.sie_embedding is None:
+            # ReID inputs are non-square (e.g. 256x128); the pretrained CLIP ViT
+            # only accepts them with position-embedding interpolation enabled.
+            output = self.clip_model.get_image_features(
+                pixel_values=images, interpolate_pos_encoding=True
+            )
+            return _image_features_tensor(output)
+        if camera_ids is None:
+            raise ValueError("camera_ids is required when the SIE camera embedding is enabled")
+        validate_index_tensor(camera_ids, self.sie_embedding.num_embeddings, "camera_ids")
+        return self._forward_with_sie(images, camera_ids)
+
+    def _forward_with_sie(self, images: torch.Tensor, camera_ids: torch.Tensor) -> torch.Tensor:
+        # Manual replica of the HF CLIP vision forward (embeddings ->
+        # pre_layrnorm -> encoder -> post_layernorm on CLS -> visual_projection)
+        # with the SIE term broadcast over all tokens before the pre-layernorm.
+        vision_model = self.clip_model.vision_model
+        hidden_states = vision_model.embeddings(images, interpolate_pos_encoding=True)
+        hidden_states = hidden_states + self.sie_coe * self.sie_embedding(camera_ids).unsqueeze(1)
+        hidden_states = vision_model.pre_layrnorm(hidden_states)  # HF spells it 'pre_layrnorm'
+        encoder_outputs = vision_model.encoder(inputs_embeds=hidden_states)
+        last_hidden_state = encoder_outputs.last_hidden_state
+        if hasattr(last_hidden_state, "last_hidden_state"):
+            last_hidden_state = last_hidden_state.last_hidden_state
+        pooled = vision_model.post_layernorm(last_hidden_state[:, 0, :])
+        return self.clip_model.visual_projection(pooled)
 
 
 class TransformersCLIPTextEncoder(torch.nn.Module):
@@ -161,6 +203,16 @@ def clip_projection_dim(clip_model: Any) -> int:
     return projection_dim
 
 
+def clip_vision_hidden_dim(clip_model: Any) -> int:
+    hidden = getattr(
+        getattr(getattr(clip_model, "config", None), "vision_config", None), "hidden_size", None
+    )
+    if not isinstance(hidden, int):
+        raise ValueError("CLIP model config must expose integer vision_config.hidden_size")
+    _require_positive(hidden, "vision_hidden_dim")
+    return hidden
+
+
 def clip_text_hidden_dim(clip_model: Any) -> int:
     embedding = (
         getattr(getattr(getattr(clip_model, "text_model", None), "embeddings", None), "token_embedding", None)
@@ -191,3 +243,4 @@ def _require_positive(value: int, name: str) -> None:
 
 
 DEFAULT_EPS = 1e-12
+SIE_INIT_STD = 0.02
