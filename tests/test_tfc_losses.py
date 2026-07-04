@@ -39,6 +39,48 @@ class TFCLossTest(unittest.TestCase):
         loss = batch_hard_triplet_loss(features, labels, margin=0.3)
         self.assertGreater(float(loss), 0.0)
 
+    def test_batch_hard_triplet_loss_defaults_to_euclidean_hand_computed(self):
+        # d(a0,a1)=5, d(a0,a2)=10, d(a1,a2)=5 in raw euclidean space.
+        # anchor0: relu(5 - 10 + 0.3) = 0; anchor1: relu(5 - 5 + 0.3) = 0.3;
+        # anchor2 has no positive -> skipped. mean = 0.15.
+        features = torch.tensor([[0.0, 0.0], [3.0, 4.0], [6.0, 8.0]])
+        labels = torch.tensor([0, 0, 1])
+
+        loss = batch_hard_triplet_loss(features, labels, margin=0.3)
+
+        self.assertTrue(torch.allclose(loss, torch.tensor(0.15), atol=1e-6))
+
+    def test_batch_hard_triplet_loss_euclidean_ignores_feature_norm_direction(self):
+        # Euclidean must NOT l2-normalize: [3,4] and [6,8] share a direction
+        # (cosine distance 0) but are euclidean distance 5 apart.
+        features = torch.tensor([[3.0, 4.0], [6.0, 8.0], [0.0, 1.0]])
+        labels = torch.tensor([0, 0, 1])
+
+        euclidean = batch_hard_triplet_loss(features, labels, margin=0.3, metric="euclidean")
+        cosine = batch_hard_triplet_loss(features, labels, margin=0.3, metric="cosine")
+
+        self.assertGreater(float(euclidean), 0.0)
+        self.assertFalse(torch.allclose(euclidean, cosine))
+
+    def test_batch_hard_triplet_loss_cosine_preserves_previous_formula(self):
+        # Old formula: distances = 1 - l2n(f) @ l2n(f).T. For this fixture both
+        # valid anchors contribute 1 - (1 - 2**-0.5) + 0.3 = 0.3 + 2**-0.5.
+        features = torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
+        labels = torch.tensor([0, 0, 1])
+
+        loss = batch_hard_triplet_loss(features, labels, margin=0.3, metric="cosine")
+
+        expected = torch.tensor(0.3 + 2 ** -0.5)
+        self.assertTrue(torch.allclose(loss, expected, atol=1e-6))
+
+    def test_batch_hard_triplet_loss_rejects_unknown_metric(self):
+        features = torch.tensor([[1.0, 0.0], [0.9, 0.1], [0.8, 0.2]])
+        labels = torch.tensor([0, 0, 1])
+
+        with self.assertRaises(ValueError):
+            batch_hard_triplet_loss(features, labels, margin=0.3, metric="manhattan")
+
+
     def test_supervised_contrastive_matches_arange_loss_for_unique_ids(self):
         torch.manual_seed(0)
         image = torch.randn(4, 3)

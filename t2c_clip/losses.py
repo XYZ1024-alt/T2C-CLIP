@@ -9,6 +9,7 @@ from t2c_clip.features import l2_normalize
 
 DEFAULT_LOGIT_SCALE = 1.0
 DEFAULT_MARGIN = 0.3
+DEFAULT_TRIPLET_METRIC = "euclidean"
 
 
 def bidirectional_contrastive_loss(
@@ -72,13 +73,24 @@ def batch_hard_triplet_loss(
     features: torch.Tensor,
     labels: torch.Tensor,
     margin: float = DEFAULT_MARGIN,
+    metric: str = DEFAULT_TRIPLET_METRIC,
 ) -> torch.Tensor:
     _validate_triplet_inputs(features, labels)
-    distances = 1.0 - l2_normalize(features) @ l2_normalize(features).T
+    distances = _pairwise_distances(features, metric)
     losses = _valid_anchor_losses(distances, labels, margin)
     if not losses:
         raise ValueError("batch_hard_triplet_loss requires at least one valid positive and negative")
     return torch.stack(losses).mean()
+
+
+def _pairwise_distances(features: torch.Tensor, metric: str) -> torch.Tensor:
+    if metric == "euclidean":
+        squared_norms = features.pow(2).sum(dim=1)
+        squared = squared_norms.unsqueeze(1) + squared_norms.unsqueeze(0) - 2.0 * features @ features.T
+        return squared.clamp_min(1e-12).sqrt()
+    if metric == "cosine":
+        return 1.0 - l2_normalize(features) @ l2_normalize(features).T
+    raise ValueError(f"unsupported triplet metric: {metric!r}")
 
 
 def _valid_anchor_losses(distances: torch.Tensor, labels: torch.Tensor, margin: float) -> list[torch.Tensor]:

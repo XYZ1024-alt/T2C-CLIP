@@ -18,6 +18,17 @@ class FeaturePromptTest(unittest.TestCase):
         expected = torch.tensor([[2 ** -0.5, 2 ** -0.5]])
         self.assertTrue(torch.allclose(fused, expected))
 
+    def test_fuse_features_beta_zero_returns_l2_normalized_visual_bitwise(self):
+        # beta=0 must yield the pure image-side retrieval feature EXACTLY:
+        # double-normalization (l2n(l2n(v) + 0)) is not bitwise idempotent.
+        torch.manual_seed(0)
+        visual = torch.randn(8, 16)
+        text = torch.randn(8, 16)
+
+        fused = fuse_features(visual, text, beta=0.0)
+
+        self.assertTrue(torch.equal(fused, l2_normalize(visual)))
+
     def test_prompt_bank_training_adds_identity_prompt(self):
         bank = PromptBank(PromptConfig(num_cameras=2, num_train_ids=3, context_length=2, embedding_dim=2))
         with torch.no_grad():

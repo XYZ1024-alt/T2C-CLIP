@@ -17,4 +17,8 @@ def l2_normalize(features: torch.Tensor, eps: float = DEFAULT_EPS) -> torch.Tens
 def fuse_features(visual: torch.Tensor, text: torch.Tensor, beta: float) -> torch.Tensor:
     if visual.shape != text.shape:
         raise ValueError(f"visual and text shapes must match: {visual.shape} != {text.shape}")
+    if beta == 0.0:
+        # Return the pure image-side feature bitwise: double normalization is
+        # not exactly idempotent in floating point.
+        return l2_normalize(visual)
     return l2_normalize(l2_normalize(visual) + beta * l2_normalize(text))

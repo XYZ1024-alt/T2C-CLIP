@@ -258,8 +258,9 @@ class CLIPReIDJobTest(unittest.TestCase):
 
             job = build_training_job(args, clip_loader=_load_fake_clip)
 
-        self.assertTrue(hasattr(job.model, "feature_head"))
-        self.assertGreater(_trainable_parameter_count(job.model.feature_head), 0)
+        # The head lives inside the retrieval model so training and eval share one path.
+        self.assertFalse(hasattr(job.model, "feature_head"))
+        self.assertGreater(_trainable_parameter_count(job.model.retrieval_model.feature_head), 0)
 
     def test_bnneck_keeps_batch_norm_bias_frozen_in_stage2(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -269,33 +270,17 @@ class CLIPReIDJobTest(unittest.TestCase):
 
             job = build_training_job(args, clip_loader=_load_fake_clip)
 
-        self.assertFalse(job.model.feature_head.bn.bias.requires_grad)
+        self.assertFalse(job.model.retrieval_model.feature_head.bn.bias.requires_grad)
 
-    def test_clipreid_model_encode_retrieval_applies_feature_head(self):
-        # Retrieval/validation must pass the base feature through the same
-        # feature_head (e.g. BNNeck) the Stage-2 ID classifier is trained on.
-        # Otherwise the ID signal shapes BN(f) while retrieval uses raw f.
-        class StubRetrieval(torch.nn.Module):
-            def encode_retrieval(self, images, camera_ids, retrieval_mode="fused"):
-                return torch.ones(images.shape[0], 4)
+    def test_classifier_has_no_bias(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
 
-        head = torch.nn.Linear(4, 4, bias=False)
-        with torch.no_grad():
-            head.weight.copy_(torch.eye(4) * 2.0)
-        model = CLIPReIDTrainingModel(
-            retrieval_model=StubRetrieval(),
-            classifier=torch.nn.Linear(4, 2),
-            tfc_bank=torch.nn.Module(),
-            feature_head=head,
-        )
+            job = build_training_job(_training_args(root), clip_loader=_load_fake_clip)
 
-        output = model.encode_retrieval(torch.zeros(3, 3, 2, 2), torch.zeros(3, dtype=torch.long))
+        self.assertIsNone(job.model.classifier.bias)
 
-        self.assertTrue(torch.allclose(output, torch.full((3, 4), 2.0)))
-
-    def test_validation_extracts_features_through_bnneck_head(self):
-        # The built validation path must route retrieval through the BNNeck head,
-        # so extracted features differ from the raw pre-head retrieval feature.
+    def test_bnneck_head_params_land_in_new_optimizer_group(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
             args = _training_args(root)
@@ -303,10 +288,46 @@ class CLIPReIDJobTest(unittest.TestCase):
 
             job = build_training_job(args, clip_loader=_load_fake_clip)
 
-        head = job.model.feature_head
+        _, new_group = _lookup_param_groups(job.optimizer)
+        new_names = [_element_name(model=job.model, parameter=parameter) for parameter in new_group["params"]]
+        self.assertTrue(
+            any("feature_head" in name for name in new_names),
+            f"feature_head params missing from the 'new' group: {new_names}",
+        )
+
+    def test_clipreid_model_encode_retrieval_delegates_to_retrieval_model(self):
+        # The feature head now lives inside the retrieval model, so the wrapper
+        # must return the retrieval model's feature unchanged (no second head).
+        class StubRetrieval(torch.nn.Module):
+            def encode_retrieval(self, images, camera_ids, retrieval_mode="fused"):
+                return torch.ones(images.shape[0], 4)
+
+        model = CLIPReIDTrainingModel(
+            retrieval_model=StubRetrieval(),
+            classifier=torch.nn.Linear(4, 2),
+            tfc_bank=torch.nn.Module(),
+        )
+
+        output = model.encode_retrieval(torch.zeros(3, 3, 2, 2), torch.zeros(3, dtype=torch.long))
+
+        self.assertTrue(torch.equal(output, torch.ones(3, 4)))
+
+    def test_validation_extracts_features_through_bnneck_head(self):
+        # The built validation path must route retrieval through the BNNeck head
+        # inside the retrieval model, so extracted features change when the head
+        # applies a non-uniform per-dimension transform.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            args = _training_args(root)
+            args.reid_head = "bnneck"
+
+            job = build_training_job(args, clip_loader=_load_fake_clip)
+
+        head = job.model.retrieval_model.feature_head
         with torch.no_grad():
-            head.bn.weight.copy_(torch.full_like(head.bn.weight, 3.0))
-            head.bn.running_var.copy_(torch.full_like(head.bn.running_var, 4.0))
+            head.bn.weight.copy_(torch.tensor([1.0, 2.0, 3.0, 4.0]))
+            head.bn.running_mean.copy_(torch.tensor([0.0, 0.5, -0.5, 1.0]))
+            head.bn.running_var.copy_(torch.tensor([1.0, 4.0, 0.25, 9.0]))
         job.model.eval()
 
         batch = ReIDImageBatch(
@@ -319,7 +340,8 @@ class CLIPReIDJobTest(unittest.TestCase):
         device = torch.device("cpu")
 
         with_head = _extract_features(job.model, [batch], device, "fused")
-        without_head = _extract_features(job.model.retrieval_model, [batch], device, "fused")
+        job.model.retrieval_model.feature_head = torch.nn.Identity()
+        without_head = _extract_features(job.model, [batch], device, "fused")
 
         self.assertFalse(torch.allclose(with_head.features, without_head.features))
 
@@ -511,6 +533,36 @@ class CLIPReIDJobTest(unittest.TestCase):
 
         self.assertEqual(config.id_logit_scale, 10.0)
 
+    def test_job_config_reads_triplet_metric(self):
+        from t2c_clip.jobs.clip_reid import _job_config_from_args
+
+        args = _training_args(Path("."))
+        args.triplet_metric = "cosine"
+
+        config = _job_config_from_args(args)
+
+        self.assertEqual(config.triplet_metric, "cosine")
+
+    def test_job_config_triplet_metric_defaults_to_euclidean_when_absent(self):
+        from t2c_clip.jobs.clip_reid import _job_config_from_args
+
+        args = _training_args(Path("."))
+        del args.triplet_metric
+
+        config = _job_config_from_args(args)
+
+        self.assertEqual(config.triplet_metric, "euclidean")
+
+    def test_stage_metadata_includes_triplet_metric(self):
+        from t2c_clip.jobs.clip_reid import _job_config_from_args, _stage_metadata
+
+        args = _training_args(Path("."))
+        args.triplet_metric = "cosine"
+
+        metadata = _stage_metadata(_job_config_from_args(args))
+
+        self.assertEqual(metadata.get("triplet_metric"), "cosine")
+
     def test_job_config_num_instances_defaults_to_two_when_absent(self):
         from t2c_clip.jobs.clip_reid import _job_config_from_args
 
@@ -566,6 +618,7 @@ class CLIPReIDJobTest(unittest.TestCase):
         stage2 = _stage2_loss_config(config, clip)
         self.assertAlmostEqual(stage2.logit_scale, math.e, places=5)
         self.assertEqual(stage2.triplet_margin, config.triplet_margin)
+        self.assertEqual(stage2.triplet_metric, config.triplet_metric)
         self.assertEqual(stage2.id_logit_scale, config.id_logit_scale)
         self.assertEqual(stage2.clip_weight, config.clip_weight)
 
@@ -677,6 +730,7 @@ def _training_args(root: Path) -> Namespace:
         context_length=2,
         tfc_momentum=0.5,
         triplet_margin=0.3,
+        triplet_metric="euclidean",
         tfc_weight=1.0,
         clip_weight=0.1,
         label_smoothing=0.0,

@@ -3,10 +3,13 @@
 The model has three explicit forward paths:
 
 - ``forward_stage1``: prompt alignment with identity-aware training text.
-- ``forward_stage2``: ReID training. ReID losses use the same retrieval
-  feature as inference; identity-aware text is kept for CLIP alignment only.
+- ``forward_stage2``: ReID training. Discriminative losses act on the image
+  feature (``visual_raw``) and its ``feature_head`` (BNNeck) output; the fused
+  retrieval feature is built from the head output so training and inference
+  share one retrieval path. Identity-aware text is kept for CLIP alignment.
 - ``encode_retrieval``: validation and inference retrieval with either fused
-  global + camera prompts or image-only features.
+  global + camera prompts or image-only features, both routed through the
+  same ``feature_head``.
 """
 
 from __future__ import annotations
@@ -25,12 +28,14 @@ class T2CClipModel(torch.nn.Module):
         text_encoder: torch.nn.Module,
         prompt_bank: PromptBank,
         beta: float,
+        feature_head: torch.nn.Module | None = None,
     ):
         super().__init__()
         self.image_encoder = image_encoder
         self.text_encoder = text_encoder
         self.prompt_bank = prompt_bank
         self.beta = float(beta)
+        self.feature_head = torch.nn.Identity() if feature_head is None else feature_head
 
     def encode_retrieval(
         self,
@@ -39,16 +44,18 @@ class T2CClipModel(torch.nn.Module):
         retrieval_mode: str = FUSED_RETRIEVAL,
     ) -> torch.Tensor:
         """Inference / validation retrieval feature."""
-        visual = self.encode_visual(images)
+        bn_features = self.feature_head(self.encode_visual_raw(images))
         mode = require_retrieval_mode(retrieval_mode)
         if mode == IMAGE_ONLY_RETRIEVAL:
-            return visual
+            return l2_normalize(bn_features)
         text = self.encode_inference_text(camera_ids)
-        return fuse_features(visual, text, self.beta)
+        return fuse_features(bn_features, text, self.beta)
+
+    def encode_visual_raw(self, images: torch.Tensor) -> torch.Tensor:
+        return self.image_encoder(images)
 
     def encode_visual(self, images: torch.Tensor) -> torch.Tensor:
-        image_features = self.image_encoder(images)
-        return l2_normalize(image_features)
+        return l2_normalize(self.encode_visual_raw(images))
 
     def encode_inference_text(self, camera_ids: torch.Tensor) -> torch.Tensor:
         prompts = self.prompt_bank.inference_prompts(camera_ids)
@@ -76,11 +83,18 @@ class T2CClipModel(torch.nn.Module):
         person_ids: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         """Stage-2 ReID training forward."""
-        visual = self.encode_visual(images)
+        visual_raw = self.encode_visual_raw(images)
+        bn_features = self.feature_head(visual_raw)
         text = self.encode_training_text(camera_ids, person_ids)
         retrieval_text = self.encode_inference_text(camera_ids)
-        retrieval = fuse_features(visual, retrieval_text, self.beta)
-        return {"visual": visual, "text": text, "retrieval": retrieval}
+        retrieval = fuse_features(bn_features, retrieval_text, self.beta)
+        return {
+            "visual_raw": visual_raw,
+            "bn": bn_features,
+            "visual": l2_normalize(visual_raw),
+            "text": text,
+            "retrieval": retrieval,
+        }
 
     def forward_training(
         self,
