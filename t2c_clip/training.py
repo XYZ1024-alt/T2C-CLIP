@@ -25,6 +25,7 @@ from t2c_clip.tfc import TFCCenterBank
 
 DEFAULT_LOGIT_SCALE = 1.0
 DEFAULT_TRIPLET_MARGIN = 0.3
+DEFAULT_TRIPLET_METRIC = "euclidean"
 DEFAULT_TFC_WEIGHT = 1.0
 DEFAULT_CLIP_WEIGHT = 0.1
 DEFAULT_LABEL_SMOOTHING = 0.0
@@ -47,6 +48,7 @@ class Stage1LossConfig:
 class Stage2LossConfig:
     logit_scale: float = DEFAULT_LOGIT_SCALE
     triplet_margin: float = DEFAULT_TRIPLET_MARGIN
+    triplet_metric: str = DEFAULT_TRIPLET_METRIC
     tfc_weight: float = DEFAULT_TFC_WEIGHT
     clip_weight: float = DEFAULT_CLIP_WEIGHT
     label_smoothing: float = DEFAULT_LABEL_SMOOTHING
@@ -57,7 +59,6 @@ class Stage2LossConfig:
 class Stage2LossInputs:
     classifier: torch.nn.Module
     tfc_bank: TFCCenterBank
-    feature_head: torch.nn.Module = field(default_factory=torch.nn.Identity)
     config: Stage2LossConfig = field(default_factory=Stage2LossConfig)
 
 
@@ -108,15 +109,17 @@ def stage2_loss_breakdown(
 ) -> Stage2LossBreakdown:
     """Compute the Stage-2 losses from a single forward pass.
 
-    The TFC centers are updated (detached, no-grad) from this forward's
-    feature-head output before scoring, so no separate center-update forward
-    is needed and the BNNeck running stats see each batch exactly once.
+    CLIP-ReID-standard discriminative losses act on the image feature: the ID
+    cross-entropy on the BNNeck output (``bn``), the triplet loss on the
+    BN-pre feature (``visual_raw``). The TFC loss keeps acting on the fused
+    retrieval feature. TFC centers are updated (detached, no-grad) from this
+    forward's retrieval feature before scoring, so no separate center-update
+    forward is needed and the BNNeck running stats see each batch exactly once.
     """
     outputs = model.forward_stage2(batch.images, batch.camera_ids, batch.person_ids)
     retrieval = outputs["retrieval"]
-    reid_features = inputs.feature_head(retrieval)
-    inputs.tfc_bank.update(reid_features, batch.person_ids)
-    logits = inputs.classifier(reid_features) * inputs.config.id_logit_scale
+    inputs.tfc_bank.update(retrieval, batch.person_ids)
+    logits = inputs.classifier(outputs["bn"]) * inputs.config.id_logit_scale
     return Stage2LossBreakdown(
         clip_dual=supervised_bidirectional_contrastive_loss(
             outputs["visual"], outputs["text"], batch.person_ids, logit_scale=inputs.config.logit_scale
@@ -126,8 +129,13 @@ def stage2_loss_breakdown(
             batch.person_ids,
             label_smoothing=inputs.config.label_smoothing,
         ),
-        triplet=batch_hard_triplet_loss(reid_features, batch.person_ids, inputs.config.triplet_margin),
-        tfc=inputs.tfc_bank.loss(reid_features, batch.person_ids),
+        triplet=batch_hard_triplet_loss(
+            outputs["visual_raw"],
+            batch.person_ids,
+            inputs.config.triplet_margin,
+            metric=inputs.config.triplet_metric,
+        ),
+        tfc=inputs.tfc_bank.loss(retrieval, batch.person_ids),
         tfc_weight=inputs.config.tfc_weight,
         clip_weight=inputs.config.clip_weight,
     )

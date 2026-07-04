@@ -177,6 +177,7 @@ class TrainScriptTest(unittest.TestCase):
         self.assertEqual(RECORDED_ARGS.batch_size, 8)
         self.assertEqual(RECORDED_ARGS.num_workers, 2)
         self.assertEqual(RECORDED_ARGS.lr, 0.001)
+        self.assertEqual(RECORDED_ARGS.triplet_metric, "euclidean")
         self.assertEqual(RECORDED_ARGS.device, "cpu")
 
     def test_main_logs_validation_metrics_when_mlflow_enabled(self):

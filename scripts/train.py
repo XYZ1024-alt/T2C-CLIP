@@ -63,6 +63,7 @@ DEFAULT_BETA = 0.1
 DEFAULT_CONTEXT_LENGTH = 4
 DEFAULT_TFC_MOMENTUM = 0.5
 DEFAULT_TRIPLET_MARGIN = 0.3
+DEFAULT_TRIPLET_METRIC = "euclidean"
 DEFAULT_TFC_WEIGHT = 1.0
 DEFAULT_CLIP_WEIGHT = 0.1
 DEFAULT_ID_LOGIT_SCALE = 1.0
@@ -208,6 +209,7 @@ def _add_project_training_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--context-length", type=int, default=DEFAULT_CONTEXT_LENGTH)
     parser.add_argument("--tfc-momentum", type=float, default=DEFAULT_TFC_MOMENTUM)
     parser.add_argument("--triplet-margin", type=float, default=DEFAULT_TRIPLET_MARGIN)
+    parser.add_argument("--triplet-metric", choices=("euclidean", "cosine"), default=DEFAULT_TRIPLET_METRIC)
     parser.add_argument("--tfc-weight", type=float, default=DEFAULT_TFC_WEIGHT)
     parser.add_argument("--stage1-epochs", type=int, default=DEFAULT_STAGE1_EPOCHS)
     parser.add_argument("--clip-weight", type=float, default=DEFAULT_CLIP_WEIGHT)

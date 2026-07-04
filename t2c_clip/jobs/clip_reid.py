@@ -125,6 +125,7 @@ class CLIPReIDJobConfig:
     context_length: int
     tfc_momentum: float
     triplet_margin: float
+    triplet_metric: str
     tfc_weight: float
     clip_weight: float
     id_logit_scale: float
@@ -269,14 +270,11 @@ class CLIPReIDTrainingModel(torch.nn.Module):
         retrieval_model: T2CClipModel,
         classifier: torch.nn.Module,
         tfc_bank: TFCCenterBank,
-        *,
-        feature_head: torch.nn.Module | None = None,
     ):
         super().__init__()
         self.retrieval_model = retrieval_model
         self.classifier = classifier
         self.tfc_bank = tfc_bank
-        self.feature_head = torch.nn.Identity() if feature_head is None else feature_head
 
     def encode_retrieval(
         self,
@@ -286,16 +284,13 @@ class CLIPReIDTrainingModel(torch.nn.Module):
     ) -> torch.Tensor:
         """Validation / inference retrieval feature.
 
-        Route the base retrieval feature through the same ``feature_head`` the
-        Stage-2 ID classifier is trained on, so retrieval uses the BNNeck-normalized
-        feature rather than the raw pre-head feature. For the default ``linear``
-        head (``Identity``) this is unchanged; ``evaluate_reid`` L2-normalizes the
-        result before scoring either way.
+        The feature head (e.g. BNNeck) lives inside the retrieval model, so
+        training and eval share a single retrieval path; this wrapper only
+        delegates.
         """
-        features = self.retrieval_model.encode_retrieval(
+        return self.retrieval_model.encode_retrieval(
             images, camera_ids, retrieval_mode=retrieval_mode
         )
-        return self.feature_head(features)
 
 
 class BNNeck(torch.nn.Module):
@@ -421,6 +416,7 @@ def _job_config_from_args(args: Any) -> CLIPReIDJobConfig:
         context_length=int(args.context_length),
         tfc_momentum=float(args.tfc_momentum),
         triplet_margin=float(args.triplet_margin),
+        triplet_metric=str(getattr(args, "triplet_metric", "euclidean")),
         tfc_weight=float(args.tfc_weight),
         clip_weight=float(getattr(args, "clip_weight", 0.1)),
         id_logit_scale=float(getattr(args, "id_logit_scale", 1.0)),
@@ -496,9 +492,9 @@ def _apply_freezing(model: CLIPReIDTrainingModel, config: CLIPReIDJobConfig, sta
     prompt_trainable = stage == STAGE1 or not config.freeze_prompt_bank_stage2
     retrieval.prompt_bank.requires_grad_(prompt_trainable)
     model.classifier.requires_grad_(stage == STAGE2)
-    model.feature_head.requires_grad_(stage == STAGE2)
-    if isinstance(model.feature_head, BNNeck):
-        model.feature_head.freeze_bias()
+    retrieval.feature_head.requires_grad_(stage == STAGE2)
+    if isinstance(retrieval.feature_head, BNNeck):
+        retrieval.feature_head.freeze_bias()
 
 
 def _image_encoder_trainable(config: CLIPReIDJobConfig, stage: str) -> bool:
@@ -572,6 +568,7 @@ def _stage2_loss_config(config: CLIPReIDJobConfig, clip_model: torch.nn.Module) 
     return Stage2LossConfig(
         logit_scale=_contrastive_logit_scale(clip_model),
         triplet_margin=config.triplet_margin,
+        triplet_metric=config.triplet_metric,
         tfc_weight=config.tfc_weight,
         clip_weight=config.clip_weight,
         id_logit_scale=config.id_logit_scale,
@@ -623,6 +620,7 @@ def _stage_metadata(config: CLIPReIDJobConfig) -> StageMetadata:
             "label_smoothing": config.label_smoothing,
             "tfc_weight": config.tfc_weight,
             "triplet_margin": config.triplet_margin,
+            "triplet_metric": config.triplet_metric,
             "tfc_momentum": config.tfc_momentum,
             "context_length": config.context_length,
             "freeze_image_encoder_stage1": config.freeze_image_encoder_stage1,
@@ -703,11 +701,11 @@ def _build_training_model(
         text_encoder=text_encoder,
         prompt_bank=prompt_bank,
         beta=config.beta,
+        feature_head=_build_feature_head(config.reid_head, projection_dim),
     )
-    classifier = torch.nn.Linear(projection_dim, data.num_train_ids)
+    classifier = torch.nn.Linear(projection_dim, data.num_train_ids, bias=False)
     tfc_bank = TFCCenterBank(data.num_train_ids, projection_dim, config.tfc_momentum)
-    feature_head = _build_feature_head(config.reid_head, projection_dim)
-    return CLIPReIDTrainingModel(retrieval, classifier, tfc_bank, feature_head=feature_head)
+    return CLIPReIDTrainingModel(retrieval, classifier, tfc_bank)
 
 
 def _load_clip_checkpoint_if_requested(
@@ -937,7 +935,6 @@ def _stage2_step(runtime: StageTrainingRuntime, batch: TrainingBatch) -> Stage2L
     inputs = Stage2LossInputs(
         classifier=runtime.model.classifier,
         tfc_bank=runtime.model.tfc_bank,
-        feature_head=runtime.model.feature_head,
         config=runtime.loss_config,
     )
     return stage2_loss_breakdown(runtime.model.retrieval_model, batch, inputs)
