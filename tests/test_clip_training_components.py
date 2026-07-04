@@ -1,5 +1,7 @@
 import unittest
 
+from argparse import Namespace
+
 from PIL import Image
 import torch
 import torch.nn.functional as F
@@ -235,6 +237,120 @@ class CLIPTrainingComponentsTest(unittest.TestCase):
             official = F.normalize(clip.text_projection(pooled), p=2.0, dim=-1, eps=1e-12)
 
         self.assertTrue(torch.equal(output, official))
+
+
+class SIECameraEmbeddingTest(unittest.TestCase):
+    def test_sie_disabled_creates_no_embedding_and_accepts_images_only(self):
+        clip = FakeCLIP(projection_dim=2)
+        encoder = TransformersCLIPImageEncoder(clip, num_cameras=3, sie_coe=0.0)
+
+        output = encoder(torch.ones(2, 3, 2, 2))
+
+        self.assertIsNone(encoder.sie_embedding)
+        self.assertEqual(output.shape, (2, 2))
+        self.assertTrue(clip.last_interpolate_pos_encoding)
+
+    def test_sie_disabled_when_num_cameras_is_none(self):
+        encoder = TransformersCLIPImageEncoder(FakeCLIP(projection_dim=2), sie_coe=0.5)
+
+        self.assertIsNone(encoder.sie_embedding)
+
+    def test_sie_disabled_accepts_unused_camera_ids(self):
+        clip = FakeCLIP(projection_dim=2)
+        encoder = TransformersCLIPImageEncoder(clip)
+
+        output = encoder(torch.ones(2, 3, 2, 2), camera_ids=torch.tensor([0, 1]))
+
+        self.assertEqual(output.shape, (2, 2))
+        self.assertEqual(clip.image_feature_calls, 1)
+
+    def test_sie_manual_forward_with_zero_embedding_matches_get_image_features(self):
+        # The manual embeddings -> pre_layrnorm -> encoder -> post_layernorm ->
+        # visual_projection path must replicate the official HF forward exactly
+        # (bit-for-bit) on a non-square ReID-shaped input when the SIE term is zero.
+        torch.manual_seed(0)
+        clip = _tiny_clip_model().eval()
+        encoder = TransformersCLIPImageEncoder(clip, num_cameras=2, sie_coe=0.5)
+        with torch.no_grad():
+            encoder.sie_embedding.weight.zero_()
+        images = torch.randn(2, 3, 32, 16)
+
+        with torch.no_grad():
+            output = encoder(images, camera_ids=torch.tensor([0, 1]))
+            # v5 get_image_features returns the vision outputs with pooler_output
+            # replaced by the projected image features.
+            official = clip.get_image_features(
+                pixel_values=images, interpolate_pos_encoding=True
+            ).pooler_output
+
+        self.assertTrue(torch.equal(output, official))
+
+    def test_sie_enabled_distinguishes_cameras(self):
+        torch.manual_seed(0)
+        clip = _tiny_clip_model().eval()
+        encoder = TransformersCLIPImageEncoder(clip, num_cameras=3, sie_coe=1.0)
+        image = torch.randn(1, 3, 32, 16)
+        images = torch.cat([image, image], dim=0)
+
+        with torch.no_grad():
+            different = encoder(images, camera_ids=torch.tensor([0, 1]))
+            same = encoder(images, camera_ids=torch.tensor([1, 1]))
+
+        self.assertFalse(torch.allclose(different[0], different[1]))
+        self.assertTrue(torch.equal(same[0], same[1]))
+
+    def test_sie_enabled_requires_camera_ids(self):
+        encoder = TransformersCLIPImageEncoder(_tiny_clip_model(), num_cameras=2, sie_coe=0.5)
+
+        with self.assertRaisesRegex(ValueError, "camera_ids"):
+            encoder(torch.randn(1, 3, 32, 16))
+
+    def test_sie_enabled_rejects_out_of_range_camera_ids(self):
+        encoder = TransformersCLIPImageEncoder(_tiny_clip_model(), num_cameras=2, sie_coe=0.5)
+
+        with self.assertRaisesRegex(ValueError, "camera_ids"):
+            encoder(torch.randn(1, 3, 32, 16), camera_ids=torch.tensor([2]))
+
+    def test_sie_enabled_rejects_non_long_camera_ids(self):
+        encoder = TransformersCLIPImageEncoder(_tiny_clip_model(), num_cameras=2, sie_coe=0.5)
+
+        with self.assertRaisesRegex(ValueError, "camera_ids"):
+            encoder(torch.randn(1, 3, 32, 16), camera_ids=torch.tensor([0.0]))
+
+    def test_sie_enabled_requires_vision_hidden_dim(self):
+        clip = FakeCLIP(projection_dim=4)
+        clip.config = Namespace(projection_dim=4)  # no vision_config
+
+        with self.assertRaisesRegex(ValueError, "vision_config"):
+            TransformersCLIPImageEncoder(clip, num_cameras=2, sie_coe=0.5)
+
+
+def _tiny_clip_model():
+    from transformers import CLIPConfig, CLIPModel
+
+    config = CLIPConfig(
+        text_config={
+            "hidden_size": 32,
+            "intermediate_size": 64,
+            "num_attention_heads": 4,
+            "num_hidden_layers": 2,
+            "max_position_embeddings": 32,
+            "vocab_size": 1000,
+            "bos_token_id": 997,
+            "eos_token_id": 998,
+            "pad_token_id": 0,
+        },
+        vision_config={
+            "hidden_size": 32,
+            "intermediate_size": 64,
+            "num_attention_heads": 4,
+            "num_hidden_layers": 2,
+            "image_size": 32,
+            "patch_size": 16,
+        },
+        projection_dim=16,
+    )
+    return CLIPModel(config)
 
 
 def _expected_fake_eos_feature(

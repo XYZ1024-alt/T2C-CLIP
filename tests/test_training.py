@@ -22,7 +22,7 @@ from t2c_clip.training import (
 
 
 class IdentityEncoder(torch.nn.Module):
-    def forward(self, inputs):
+    def forward(self, inputs, camera_ids=None):
         return inputs
 
 

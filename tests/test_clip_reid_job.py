@@ -745,6 +745,92 @@ class CLIPReIDJobTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "tokenizer"):
                 build_training_job(_training_args(root), clip_loader=load_without_tokenizer)
 
+    def test_job_config_reads_sie_coe(self):
+        from t2c_clip.jobs.clip_reid import _job_config_from_args
+
+        args = _training_args(Path("."))
+        args.sie_coe = 1.5
+
+        config = _job_config_from_args(args)
+
+        self.assertEqual(config.sie_coe, 1.5)
+
+    def test_job_config_sie_coe_defaults_to_zero_when_absent(self):
+        from t2c_clip.jobs.clip_reid import _job_config_from_args
+
+        config = _job_config_from_args(_training_args(Path(".")))
+
+        self.assertEqual(config.sie_coe, 0.0)
+
+    def test_stage_metadata_includes_sie_coe(self):
+        from t2c_clip.jobs.clip_reid import _job_config_from_args, _stage_metadata
+
+        args = _training_args(Path("."))
+        args.sie_coe = 1.5
+
+        metadata = _stage_metadata(_job_config_from_args(args))
+
+        self.assertEqual(metadata.get("sie_coe"), 1.5)
+
+    def test_sie_disabled_by_default_creates_no_embedding(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+
+            job = build_training_job(_training_args(root), clip_loader=_load_fake_clip)
+
+        self.assertIsNone(job.model.retrieval_model.image_encoder.sie_embedding)
+
+    def test_sie_embedding_sized_by_dataset_cameras_when_enabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))  # two cameras: c1, c2
+            args = _training_args(root)
+            args.sie_coe = 1.0
+
+            job = build_training_job(args, clip_loader=_load_fake_clip)
+
+        sie = job.model.retrieval_model.image_encoder.sie_embedding
+        self.assertIsNotNone(sie)
+        self.assertEqual(sie.num_embeddings, 2)
+
+    def test_sie_params_land_in_new_optimizer_group(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            args = _training_args(root)
+            args.sie_coe = 1.0
+
+            job = build_training_job(args, clip_loader=_load_fake_clip)
+
+        backbone_group, new_group = _lookup_param_groups(job.optimizer)
+        backbone_names = [_element_name(model=job.model, parameter=p) for p in backbone_group["params"]]
+        new_names = [_element_name(model=job.model, parameter=p) for p in new_group["params"]]
+        self.assertTrue(
+            any("sie_embedding" in name for name in new_names),
+            f"sie_embedding params missing from the 'new' group: {new_names}",
+        )
+        self.assertFalse(any("sie_embedding" in name for name in backbone_names))
+
+    def test_sie_embedding_follows_image_encoder_freeze_per_stage(self):
+        from t2c_clip.jobs.clip_reid import _apply_freezing, _job_config_from_args
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            args = _training_args(root)
+            args.sie_coe = 1.0
+            args.stage1_epochs = 1
+            args.freeze_image_encoder_stage1 = True
+            args.freeze_image_encoder_stage2 = False
+
+            job = build_training_job(args, clip_loader=_load_fake_clip)
+            config = _job_config_from_args(args)
+            model = job.stage2.model
+            sie = model.retrieval_model.image_encoder.sie_embedding
+
+            _apply_freezing(model, config, "stage1")
+            self.assertFalse(sie.weight.requires_grad)
+
+            _apply_freezing(model, config, "stage2")
+            self.assertTrue(sie.weight.requires_grad)
+
 
 def _load_fake_clip(model_name: str) -> CLIPLoadResult:
     return CLIPLoadResult(
