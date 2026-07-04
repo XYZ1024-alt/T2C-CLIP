@@ -184,4 +184,4 @@ class EvaluationModelTest(unittest.TestCase):
         inference = model.encode_retrieval(images, camera_ids)
 
         self.assertTrue(torch.allclose(outputs["retrieval"], inference))
-        self.assertFalse(torch.allclose(outputs["text"], inference))
+        self.assertNotIn("text", outputs)

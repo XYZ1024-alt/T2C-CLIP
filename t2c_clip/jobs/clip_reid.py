@@ -21,9 +21,13 @@ Stage-2 ReID training:
   epoch 1 to ``config.beta`` at ``warmup_epochs + 1``, so the random
   camera-conditioned text feature does not pull ``f_eval`` below the
   image-only floor at startup.
+- The CLIP alignment term is CLIP-ReID's image-to-text cross entropy: the
+  image feature is classified against the identity anchor text matrix over
+  ALL train identities (frozen prompt bank: encoded once; otherwise re-encoded
+  at each Stage-2 epoch start, always detached).
 - Total loss is::
 
-      L_id + L_triplet + clip_weight * L_clip_dual + tfc_weight * L_TFC
+      L_id + L_triplet + clip_weight * L_i2t + tfc_weight * L_TFC
 
 Validation:
 
@@ -44,6 +48,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from scripts.train import StageMetadata, TrainingJob, TwoStageTrainingJob
+from t2c_clip.anchors import IdentityAnchorProvider
 from t2c_clip.clip_backbone import (
     TransformersCLIPImageEncoder,
     TransformersCLIPTextEncoder,
@@ -87,7 +92,7 @@ DEFAULT_CLIP_TOKEN_IDS = {"sot": 49406, "eos": 49407, "pad": 0}
 PROMPT_TEMPLATE_PREFIX = "a photo of a"
 PROMPT_TEMPLATE_SUFFIX = "person ."
 STAGE1_TRAIN_LOSS_METRIC_NAMES = ("loss", "clip_loss")
-STAGE2_TRAIN_LOSS_METRIC_NAMES = ("loss", "clip_loss", "reid_loss", "triplet_loss", "tfc_loss")
+STAGE2_TRAIN_LOSS_METRIC_NAMES = ("loss", "i2t_loss", "reid_loss", "triplet_loss", "tfc_loss")
 STAGE1 = "stage1"
 STAGE2 = "stage2"
 
@@ -187,6 +192,7 @@ class StageTrainingRuntime:
     beta_schedule: "BetaSchedule | None" = None
     freeze_config: "CLIPReIDJobConfig | None" = None
     lr_scheduler: "StageLRScheduler | None" = None
+    anchor_provider: IdentityAnchorProvider | None = None
 
 
 @dataclass(frozen=True)
@@ -327,7 +333,7 @@ def build_training_job(
     ).to(config.device)
     loaders = _build_loaders(data, config)
     stage1_runtime, stage2_runtime, optimizer_stage1, optimizer_stage2, stage2_beta_schedule = _build_runtimes(
-        config, shared_model, loaders
+        config, shared_model, loaders, data.num_train_ids
     )
     stage2_job = TrainingJob(
         model=shared_model,
@@ -443,6 +449,7 @@ def _build_runtimes(
     config: CLIPReIDJobConfig,
     model: CLIPReIDTrainingModel,
     loaders: LoaderBundle,
+    num_train_ids: int,
 ) -> tuple[
     StageTrainingRuntime,
     StageTrainingRuntime,
@@ -467,12 +474,18 @@ def _build_runtimes(
         first_epoch=config.stage2_first_epoch,
     )
     stage2_lr_scheduler = _build_stage2_lr_scheduler(optimizer_stage2, config)
+    stage2_anchor_provider = IdentityAnchorProvider(
+        model.retrieval_model,
+        num_train_ids=num_train_ids,
+        frozen=config.freeze_prompt_bank_stage2,
+    )
     stage2_runtime = StageTrainingRuntime(
         model=model, loaders=loaders, optimizer=optimizer_stage2, stage=STAGE2,
         loss_config=stage2_loss_config, device=config.device,
         beta_schedule=stage2_beta_schedule,
         freeze_config=config,
         lr_scheduler=stage2_lr_scheduler,
+        anchor_provider=stage2_anchor_provider,
     )
     return stage1_runtime, stage2_runtime, optimizer_stage1, optimizer_stage2, stage2_beta_schedule
 
@@ -491,6 +504,9 @@ def _apply_freezing(model: CLIPReIDTrainingModel, config: CLIPReIDJobConfig, sta
     clip_model.logit_scale.requires_grad_(False)
     prompt_trainable = stage == STAGE1 or not config.freeze_prompt_bank_stage2
     retrieval.prompt_bank.requires_grad_(prompt_trainable)
+    if stage == STAGE1:
+        # Stage-1 trains the prompt bank, so any precomputed camera text is stale.
+        retrieval.set_inference_text_cache(None)
     model.classifier.requires_grad_(stage == STAGE2)
     retrieval.feature_head.requires_grad_(stage == STAGE2)
     if isinstance(retrieval.feature_head, BNNeck):
@@ -803,6 +819,10 @@ def _train_one_epoch(runtime: StageTrainingRuntime):
             runtime.beta_schedule.apply(runtime.model, epoch)
         if runtime.lr_scheduler is not None:
             runtime.lr_scheduler.apply(runtime.optimizer, epoch)
+        if runtime.anchor_provider is not None:
+            runtime.anchor_provider.start_epoch()
+        if runtime.stage == STAGE2 and runtime.freeze_config is not None:
+            _ensure_camera_text_cache(runtime.model, runtime.freeze_config)
         runtime.model.train()
         metric_names = _train_metric_names(runtime.stage)
         totals = {name: 0.0 for name in metric_names}
@@ -828,6 +848,7 @@ def _noop_validate():
 def _validate(runtime: ValidationRuntime):
     def validate(epoch: int) -> ReIDMetrics:
         _apply_freezing(runtime.model, runtime.model_config, STAGE2)
+        _ensure_camera_text_cache(runtime.model, runtime.model_config)
         if runtime.beta_schedule is not None:
             runtime.beta_schedule.apply(runtime.model, epoch)
         runtime.model.eval()
@@ -932,12 +953,34 @@ def _stage1_step(runtime: StageTrainingRuntime, batch: TrainingBatch) -> Stage1L
 
 
 def _stage2_step(runtime: StageTrainingRuntime, batch: TrainingBatch) -> Stage2LossBreakdown:
+    if runtime.anchor_provider is None:
+        raise ValueError("stage2 training requires an identity anchor provider")
     inputs = Stage2LossInputs(
         classifier=runtime.model.classifier,
         tfc_bank=runtime.model.tfc_bank,
+        anchors=runtime.anchor_provider.anchors(),
         config=runtime.loss_config,
     )
     return stage2_loss_breakdown(runtime.model.retrieval_model, batch, inputs)
+
+
+def _ensure_camera_text_cache(model: CLIPReIDTrainingModel, config: CLIPReIDJobConfig) -> None:
+    """Precompute the per-camera retrieval text once when it is provably constant.
+
+    With the prompt bank frozen in Stage-2 AND the text encoder frozen, the
+    ``encode_inference_text`` output is a constant per camera, so it is
+    encoded once and indexed in every Stage-2 forward and validation pass.
+    """
+    if not (config.freeze_prompt_bank_stage2 and config.freeze_text_encoder):
+        return
+    retrieval = model.retrieval_model
+    if retrieval.inference_text_cache is not None:
+        return
+    camera_prompts = retrieval.prompt_bank.camera_prompts
+    camera_ids = torch.arange(camera_prompts.shape[0], device=camera_prompts.device)
+    with torch.no_grad():
+        cache = retrieval.encode_inference_text(camera_ids)
+    retrieval.set_inference_text_cache(cache.detach())
 
 
 def _train_metric_names(stage: str) -> tuple[str, ...]:
@@ -958,7 +1001,7 @@ def _stage2_metric_values(breakdown: Stage2LossBreakdown) -> dict[str, float]:
         "loss": _tensor_metric_value(breakdown.total),
         "reid_loss": _tensor_metric_value(breakdown.identity),
         "triplet_loss": _tensor_metric_value(breakdown.triplet),
-        "clip_loss": _tensor_metric_value(breakdown.clip_dual),
+        "i2t_loss": _tensor_metric_value(breakdown.i2t),
         "tfc_loss": _tensor_metric_value(breakdown.tfc),
     }
 

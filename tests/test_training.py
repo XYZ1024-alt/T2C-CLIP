@@ -3,7 +3,11 @@ import unittest
 import torch
 
 from t2c_clip.features import l2_normalize
-from t2c_clip.losses import batch_hard_triplet_loss, supervised_bidirectional_contrastive_loss
+from t2c_clip.losses import (
+    batch_hard_triplet_loss,
+    image_to_text_cross_entropy,
+    supervised_bidirectional_contrastive_loss,
+)
 from t2c_clip.model import T2CClipModel
 from t2c_clip.prompts import PromptBank, PromptConfig
 from t2c_clip.tfc import TFCCenterBank
@@ -60,7 +64,9 @@ class TrainingLossTest(unittest.TestCase):
 
         self.assertTrue(torch.allclose(breakdown.clip_dual, expected))
 
-    def test_stage2_clip_alignment_treats_same_identity_as_positive(self):
+    def test_stage2_i2t_classifies_visual_against_anchor_matrix(self):
+        # CLIP-ReID Stage-2: the L2-normalized image feature is classified
+        # against the frozen identity anchor matrix over ALL train ids.
         model = _training_model(beta=0.0)
         classifier = torch.nn.Linear(2, 2, bias=False)
         with torch.no_grad():
@@ -70,20 +76,46 @@ class TrainingLossTest(unittest.TestCase):
             camera_ids=torch.tensor([0, 1, 0]),
             person_ids=torch.tensor([0, 0, 1]),
         )
+        anchors = torch.tensor([[0.8, 0.6], [0.6, -0.8]])
         tfc_bank = TFCCenterBank(num_train_ids=2, feature_dim=2, momentum=0.5)
         tfc_bank.update(model.forward_stage2(batch.images, batch.camera_ids, batch.person_ids)["retrieval"], batch.person_ids)
         outputs = model.forward_stage2(batch.images, batch.camera_ids, batch.person_ids)
-        expected = supervised_bidirectional_contrastive_loss(
-            outputs["visual"], outputs["text"], batch.person_ids, logit_scale=Stage2LossConfig().logit_scale
+        expected = image_to_text_cross_entropy(
+            outputs["visual"], anchors, batch.person_ids, logit_scale=Stage2LossConfig().logit_scale
         )
 
         breakdown = stage2_loss_breakdown(
             model,
             batch,
-            Stage2LossInputs(classifier=classifier, tfc_bank=tfc_bank),
+            Stage2LossInputs(classifier=classifier, tfc_bank=tfc_bank, anchors=anchors),
         )
 
-        self.assertTrue(torch.allclose(breakdown.clip_dual, expected))
+        self.assertTrue(torch.allclose(breakdown.i2t, expected))
+
+    def test_stage2_i2t_uses_configured_label_smoothing(self):
+        model = _training_model(beta=0.0)
+        classifier = torch.nn.Linear(2, 2, bias=False)
+        batch = TrainingBatch(
+            images=torch.tensor([[1.0, 0.0], [0.9, 0.1], [0.0, 1.0], [0.1, 0.9]]),
+            camera_ids=torch.tensor([0, 0, 1, 1]),
+            person_ids=torch.tensor([0, 0, 1, 1]),
+        )
+        anchors = torch.eye(2)
+        breakdowns = {}
+        for smoothing in (0.0, 0.4):
+            tfc_bank = TFCCenterBank(num_train_ids=2, feature_dim=2, momentum=0.5)
+            breakdowns[smoothing] = stage2_loss_breakdown(
+                model,
+                batch,
+                Stage2LossInputs(
+                    classifier=classifier,
+                    tfc_bank=tfc_bank,
+                    anchors=anchors,
+                    config=Stage2LossConfig(logit_scale=20.0, label_smoothing=smoothing),
+                ),
+            )
+
+        self.assertGreater(float(breakdowns[0.4].i2t.detach()), float(breakdowns[0.0].i2t.detach()))
 
     def test_stage2_loss_breakdown_combines_clip_reid_and_tfc(self):
         model = _training_model(beta=0.0)
@@ -100,6 +132,7 @@ class TrainingLossTest(unittest.TestCase):
         inputs = Stage2LossInputs(
             classifier=classifier,
             tfc_bank=tfc_bank,
+            anchors=torch.eye(2),
             config=Stage2LossConfig(tfc_weight=0.5, clip_weight=1.0),
         )
 
@@ -107,7 +140,7 @@ class TrainingLossTest(unittest.TestCase):
 
         expected = (
             breakdown.identity + breakdown.triplet
-            + breakdown.clip_weight * breakdown.clip_dual
+            + breakdown.clip_weight * breakdown.i2t
             + breakdown.tfc_weight * breakdown.tfc
         )
         self.assertTrue(torch.allclose(breakdown.total, expected))
@@ -131,7 +164,7 @@ class TrainingLossTest(unittest.TestCase):
         breakdown = stage2_loss_breakdown(
             model,
             batch,
-            Stage2LossInputs(classifier=classifier, tfc_bank=tfc_bank, config=config),
+            Stage2LossInputs(classifier=classifier, tfc_bank=tfc_bank, anchors=torch.eye(2), config=config),
         )
 
         self.assertGreater(float(breakdown.identity.detach()), 0.0)
@@ -152,7 +185,7 @@ class TrainingLossTest(unittest.TestCase):
         unscaled = stage2_loss_breakdown(
             model,
             batch,
-            Stage2LossInputs(classifier=classifier, tfc_bank=tfc_bank),
+            Stage2LossInputs(classifier=classifier, tfc_bank=tfc_bank, anchors=torch.eye(2)),
         )
         scaled = stage2_loss_breakdown(
             model,
@@ -160,6 +193,7 @@ class TrainingLossTest(unittest.TestCase):
             Stage2LossInputs(
                 classifier=classifier,
                 tfc_bank=tfc_bank,
+                anchors=torch.eye(2),
                 config=Stage2LossConfig(id_logit_scale=10.0),
             ),
         )
@@ -185,7 +219,7 @@ class TrainingLossTest(unittest.TestCase):
         breakdown = stage2_loss_breakdown(
             model,
             batch,
-            Stage2LossInputs(classifier=classifier, tfc_bank=tfc_bank),
+            Stage2LossInputs(classifier=classifier, tfc_bank=tfc_bank, anchors=torch.eye(2)),
         )
 
         self.assertLess(float(breakdown.identity.detach()), 0.01)
@@ -209,7 +243,7 @@ class TrainingLossTest(unittest.TestCase):
             breakdown = stage2_loss_breakdown(
                 model,
                 batch,
-                Stage2LossInputs(classifier=classifier, tfc_bank=tfc_bank),
+                Stage2LossInputs(classifier=classifier, tfc_bank=tfc_bank, anchors=torch.eye(2)),
             )
             losses.append(breakdown.identity)
         # Sanity: a nonzero camera prompt with beta>0 does change the fused feature.
@@ -242,7 +276,7 @@ class TrainingLossTest(unittest.TestCase):
         breakdown = stage2_loss_breakdown(
             model,
             batch,
-            Stage2LossInputs(classifier=classifier, tfc_bank=tfc_bank, config=config),
+            Stage2LossInputs(classifier=classifier, tfc_bank=tfc_bank, anchors=torch.eye(2), config=config),
         )
 
         expected = batch_hard_triplet_loss(
@@ -273,6 +307,7 @@ class TrainingLossTest(unittest.TestCase):
                 Stage2LossInputs(
                     classifier=classifier,
                     tfc_bank=tfc_bank,
+                    anchors=torch.eye(2),
                     config=Stage2LossConfig(triplet_metric=metric),
                 ),
             )
@@ -306,7 +341,7 @@ class TrainingLossTest(unittest.TestCase):
         breakdown = stage2_loss_breakdown(
             model,
             batch,
-            Stage2LossInputs(classifier=classifier, tfc_bank=tfc_bank),
+            Stage2LossInputs(classifier=classifier, tfc_bank=tfc_bank, anchors=torch.eye(2)),
         )
 
         self.assertTrue(bool(tfc_bank.initialized.all()))
@@ -334,13 +369,22 @@ class TrainingLossTest(unittest.TestCase):
         breakdown = stage2_loss_breakdown(
             model,
             batch,
-            Stage2LossInputs(classifier=classifier, tfc_bank=tfc_bank),
+            Stage2LossInputs(classifier=classifier, tfc_bank=tfc_bank, anchors=torch.eye(2)),
         )
 
         self.assertLess(float(breakdown.tfc.detach()), 0.01)
 
 
 class Stage2ForwardLayoutTest(unittest.TestCase):
+    def test_forward_stage2_returns_image_side_features_only(self):
+        # The i2t term classifies against the precomputed identity anchor
+        # matrix, so Stage-2 must not encode per-sample training text anymore.
+        model = _training_model(beta=0.0)
+
+        outputs = model.forward_stage2(torch.eye(2), torch.tensor([0, 1]), torch.tensor([0, 1]))
+
+        self.assertEqual(set(outputs), {"visual_raw", "bn", "visual", "retrieval"})
+
     def test_forward_stage2_beta_zero_retrieval_equals_l2n_bn(self):
         head = torch.nn.Linear(2, 2, bias=False)
         with torch.no_grad():
@@ -397,6 +441,61 @@ class Stage2ForwardLayoutTest(unittest.TestCase):
 
         self.assertTrue(torch.equal(raw, images))
         self.assertTrue(torch.allclose(model.encode_visual(images), l2_normalize(images)))
+
+
+class InferenceTextCacheTest(unittest.TestCase):
+    def test_cached_inference_text_matches_online_encoding_bitwise(self):
+        model = _training_model(beta=0.7, camera_prompt=torch.tensor([[0.6, 0.8]]))
+        with torch.no_grad():
+            model.prompt_bank.camera_prompts[1] = torch.tensor([[1.0, -2.0]])
+        camera_ids = torch.tensor([1, 0, 1])
+        online = model.encode_inference_text(camera_ids)
+
+        cache = model.encode_inference_text(torch.arange(2))
+        model.set_inference_text_cache(cache)
+        cached = model.encode_inference_text(camera_ids)
+
+        self.assertTrue(torch.equal(cached, online))
+
+    def test_installed_cache_bypasses_the_text_encoder(self):
+        model = _training_model(beta=0.0)
+        cache = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+        model.set_inference_text_cache(cache)
+        with torch.no_grad():
+            model.prompt_bank.camera_prompts.fill_(123.0)  # must not matter while cached
+
+        output = model.encode_inference_text(torch.tensor([1, 1, 0]))
+
+        self.assertTrue(torch.equal(output, cache[torch.tensor([1, 1, 0])]))
+
+    def test_clearing_cache_restores_online_encoding(self):
+        model = _training_model(beta=0.0, camera_prompt=torch.tensor([[0.6, 0.8]]))
+        camera_ids = torch.tensor([0, 1])
+        online = model.encode_inference_text(camera_ids)
+        model.set_inference_text_cache(torch.zeros(2, 2))
+
+        model.set_inference_text_cache(None)
+
+        self.assertTrue(torch.equal(model.encode_inference_text(camera_ids), online))
+
+    def test_set_inference_text_cache_validates_shape(self):
+        model = _training_model(beta=0.0)
+
+        with self.assertRaises(ValueError):
+            model.set_inference_text_cache(torch.zeros(2))
+        with self.assertRaises(ValueError):
+            model.set_inference_text_cache(torch.zeros(3, 2))  # bank has 2 cameras
+
+    def test_cached_encode_inference_text_validates_camera_ids(self):
+        model = _training_model(beta=0.0)
+        model.set_inference_text_cache(torch.zeros(2, 2))
+
+        with self.assertRaises(ValueError):
+            model.encode_inference_text(torch.tensor([0.5]))
+        with self.assertRaises(ValueError):
+            model.encode_inference_text(torch.tensor([2]))
+        with self.assertRaises(ValueError):
+            model.encode_inference_text(torch.tensor([-1]))
 
 
 def _training_model(

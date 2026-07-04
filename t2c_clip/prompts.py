@@ -59,6 +59,16 @@ class PromptBank(torch.nn.Module):
         base_prompt = self.inference_prompts(camera_ids)
         return base_prompt + self.identity_prompts[person_ids]
 
+    def identity_anchor_prompts(self, person_ids: torch.Tensor) -> torch.Tensor:
+        """Camera-agnostic identity prototype prompts: global + identity only.
+
+        Used as the Stage-2 image-to-text classification anchors; the camera
+        component is deliberately excluded so camera prompts stay dedicated
+        to retrieval fusion.
+        """
+        self._validate_identity_ids(person_ids)
+        return self.global_prompt.unsqueeze(0) + self.identity_prompts[person_ids]
+
     def _validate_camera_ids(self, camera_ids: torch.Tensor) -> None:
         _validate_index_tensor(camera_ids, self.camera_prompts.shape[0], "camera_ids")
 

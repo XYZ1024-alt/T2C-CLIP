@@ -58,8 +58,13 @@ class FakeClipTextEncoder(nn.Module):
 
 
 class _FakeClipEncoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.call_count = 0
+
     def forward(self, inputs_embeds: torch.Tensor, attention_mask: Any = None, is_causal: bool = True, **kwargs) -> BaseModelOutput:
         _ = attention_mask, is_causal, kwargs
+        self.call_count += 1
         self.last_inputs_embeds = inputs_embeds
         return BaseModelOutput(last_hidden_state=inputs_embeds)
 

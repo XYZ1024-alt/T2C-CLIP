@@ -5,7 +5,11 @@ Stage-1 only computes the bidirectional image-text contrastive loss between
 
 Stage-2 total loss is::
 
-    L_total = L_id + L_triplet + clip_weight * L_clip_dual + tfc_weight * L_TFC
+    L_total = L_id + L_triplet + clip_weight * L_i2t + tfc_weight * L_TFC
+
+``L_i2t`` is CLIP-ReID's image-to-text cross entropy: the L2-normalized image
+feature is classified against the (detached) identity anchor text matrix over
+ALL train identities, not just the batch's.
 
 ``clip_weight`` is a configurable hyperparameter (default 0.1) — it must not
 be hard-coded to 1.0, since an oversized CLIP alignment signal suppresses
@@ -19,7 +23,11 @@ from dataclasses import dataclass, field
 import torch
 from torch.nn import functional as F
 
-from t2c_clip.losses import batch_hard_triplet_loss, supervised_bidirectional_contrastive_loss
+from t2c_clip.losses import (
+    batch_hard_triplet_loss,
+    image_to_text_cross_entropy,
+    supervised_bidirectional_contrastive_loss,
+)
 from t2c_clip.model import T2CClipModel
 from t2c_clip.tfc import TFCCenterBank
 
@@ -59,6 +67,7 @@ class Stage2LossConfig:
 class Stage2LossInputs:
     classifier: torch.nn.Module
     tfc_bank: TFCCenterBank
+    anchors: torch.Tensor
     config: Stage2LossConfig = field(default_factory=Stage2LossConfig)
 
 
@@ -73,7 +82,7 @@ class Stage1LossBreakdown:
 
 @dataclass(frozen=True)
 class Stage2LossBreakdown:
-    clip_dual: torch.Tensor
+    i2t: torch.Tensor
     identity: torch.Tensor
     triplet: torch.Tensor
     tfc: torch.Tensor
@@ -85,7 +94,7 @@ class Stage2LossBreakdown:
         return (
             self.identity
             + self.triplet
-            + self.clip_weight * self.clip_dual
+            + self.clip_weight * self.i2t
             + self.tfc_weight * self.tfc
         )
 
@@ -111,18 +120,26 @@ def stage2_loss_breakdown(
 
     CLIP-ReID-standard discriminative losses act on the image feature: the ID
     cross-entropy on the BNNeck output (``bn``), the triplet loss on the
-    BN-pre feature (``visual_raw``). The TFC loss keeps acting on the fused
-    retrieval feature. TFC centers are updated (detached, no-grad) from this
-    forward's retrieval feature before scoring, so no separate center-update
-    forward is needed and the BNNeck running stats see each batch exactly once.
+    BN-pre feature (``visual_raw``). The image-to-text cross entropy
+    classifies the L2-normalized image feature (``visual``, pre-BN — the
+    space CLIP pretraining aligned with text) against ``inputs.anchors``, the
+    detached identity anchor matrix over all train identities. The TFC loss
+    keeps acting on the fused retrieval feature. TFC centers are updated
+    (detached, no-grad) from this forward's retrieval feature before scoring,
+    so no separate center-update forward is needed and the BNNeck running
+    stats see each batch exactly once.
     """
     outputs = model.forward_stage2(batch.images, batch.camera_ids, batch.person_ids)
     retrieval = outputs["retrieval"]
     inputs.tfc_bank.update(retrieval, batch.person_ids)
     logits = inputs.classifier(outputs["bn"]) * inputs.config.id_logit_scale
     return Stage2LossBreakdown(
-        clip_dual=supervised_bidirectional_contrastive_loss(
-            outputs["visual"], outputs["text"], batch.person_ids, logit_scale=inputs.config.logit_scale
+        i2t=image_to_text_cross_entropy(
+            outputs["visual"],
+            inputs.anchors,
+            batch.person_ids,
+            logit_scale=inputs.config.logit_scale,
+            label_smoothing=inputs.config.label_smoothing,
         ),
         identity=F.cross_entropy(
             logits,
