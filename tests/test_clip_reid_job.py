@@ -89,7 +89,7 @@ class CLIPReIDJobTest(unittest.TestCase):
 
         self.assertEqual(len(reporter.batch_reports), 1)
         self.assertIn("loss", train_metrics)
-        self.assertIn("clip_loss", train_metrics)
+        self.assertIn("i2t_loss", train_metrics)
         self.assertIn("reid_loss", train_metrics)
         self.assertIn("triplet_loss", train_metrics)
         self.assertIn("tfc_loss", train_metrics)
@@ -239,6 +239,69 @@ class CLIPReIDJobTest(unittest.TestCase):
 
         prompt_bank = job.stage2.model.retrieval_model.prompt_bank
         self.assertEqual(_trainable_parameter_count(prompt_bank), 0)
+
+    def test_stage2_frozen_prompts_encode_text_only_in_first_epoch(self):
+        # With the prompt bank frozen in Stage-2 and the text encoder frozen,
+        # the first epoch encodes the identity anchors (1 chunk: 2 train ids)
+        # plus the per-camera retrieval text cache (1 call); afterwards the
+        # text tower must never run again.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            args = _training_args(root)
+            args.freeze_prompt_bank_stage2 = True
+            args.freeze_text_encoder = True
+            args.epochs = 2
+
+            job = build_training_job(args, clip_loader=_load_fake_clip)
+            encoder = job.model.retrieval_model.image_encoder.clip_model.text_model.encoder
+            encoder.call_count = 0
+            job.train_one_epoch(1, TrainBatchReporterRecorder())
+            first_epoch_calls = encoder.call_count
+            job.train_one_epoch(2, TrainBatchReporterRecorder())
+            second_epoch_calls = encoder.call_count - first_epoch_calls
+
+        self.assertEqual(first_epoch_calls, 2)
+        self.assertEqual(second_epoch_calls, 0)
+
+    def test_stage2_unfrozen_prompts_recompute_anchors_each_epoch(self):
+        # Unfrozen prompt bank: the anchors act as a slowly-moving teacher and
+        # are re-encoded at each Stage-2 epoch start (1 chunk) on top of the
+        # per-batch retrieval text (1 batch in this fixture); no camera cache.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            args = _training_args(root)
+            args.epochs = 2
+
+            job = build_training_job(args, clip_loader=_load_fake_clip)
+            encoder = job.model.retrieval_model.image_encoder.clip_model.text_model.encoder
+            encoder.call_count = 0
+            job.train_one_epoch(1, TrainBatchReporterRecorder())
+            first_epoch_calls = encoder.call_count
+            job.train_one_epoch(2, TrainBatchReporterRecorder())
+            second_epoch_calls = encoder.call_count - first_epoch_calls
+
+        self.assertIsNone(job.model.retrieval_model.inference_text_cache)
+        self.assertEqual(first_epoch_calls, 2)
+        self.assertEqual(second_epoch_calls, 2)
+
+    def test_stage2_camera_text_cache_matches_online_encoding(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            args = _training_args(root)
+            args.freeze_prompt_bank_stage2 = True
+            args.freeze_text_encoder = True
+
+            job = build_training_job(args, clip_loader=_load_fake_clip)
+            job.train_one_epoch(1, TrainBatchReporterRecorder())
+
+            retrieval = job.model.retrieval_model
+            cache = retrieval.inference_text_cache
+            self.assertIsNotNone(cache)
+            retrieval.set_inference_text_cache(None)
+            with torch.no_grad():
+                online = retrieval.encode_inference_text(torch.arange(cache.shape[0]))
+
+        self.assertTrue(torch.equal(cache, online))
 
     def test_stage2_prompt_bank_remains_trainable_by_default(self):
         with tempfile.TemporaryDirectory() as tmp:
