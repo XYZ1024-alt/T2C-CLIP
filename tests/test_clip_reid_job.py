@@ -263,6 +263,30 @@ class CLIPReIDJobTest(unittest.TestCase):
         self.assertEqual(first_epoch_calls, 2)
         self.assertEqual(second_epoch_calls, 0)
 
+    def test_stage2_frozen_prompts_with_trainable_text_encoder_recompute_anchors_each_epoch(self):
+        # The anchors pass through the text encoder too: with the prompt bank
+        # frozen but the text tower still training, the anchor matrix must be
+        # re-encoded at every Stage-2 epoch start (and no camera cache may
+        # exist), exactly like the fully unfrozen case.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            args = _training_args(root)
+            args.freeze_prompt_bank_stage2 = True
+            args.freeze_text_encoder = False
+            args.epochs = 2
+
+            job = build_training_job(args, clip_loader=_load_fake_clip)
+            encoder = job.model.retrieval_model.image_encoder.clip_model.text_model.encoder
+            encoder.call_count = 0
+            job.train_one_epoch(1, TrainBatchReporterRecorder())
+            first_epoch_calls = encoder.call_count
+            job.train_one_epoch(2, TrainBatchReporterRecorder())
+            second_epoch_calls = encoder.call_count - first_epoch_calls
+
+        self.assertIsNone(job.model.retrieval_model.inference_text_cache)
+        self.assertEqual(first_epoch_calls, 2)
+        self.assertEqual(second_epoch_calls, 2)
+
     def test_stage2_unfrozen_prompts_recompute_anchors_each_epoch(self):
         # Unfrozen prompt bank: the anchors act as a slowly-moving teacher and
         # are re-encoded at each Stage-2 epoch start (1 chunk) on top of the

@@ -70,10 +70,10 @@ class PromptBank(torch.nn.Module):
         return self.global_prompt.unsqueeze(0) + self.identity_prompts[person_ids]
 
     def _validate_camera_ids(self, camera_ids: torch.Tensor) -> None:
-        _validate_index_tensor(camera_ids, self.camera_prompts.shape[0], "camera_ids")
+        validate_index_tensor(camera_ids, self.camera_prompts.shape[0], "camera_ids")
 
     def _validate_identity_ids(self, person_ids: torch.Tensor) -> None:
-        _validate_index_tensor(person_ids, self.identity_prompts.shape[0], "person_ids")
+        validate_index_tensor(person_ids, self.identity_prompts.shape[0], "person_ids")
 
 
 def _validate_config(config: PromptConfig) -> None:
@@ -88,7 +88,8 @@ def _validate_config(config: PromptConfig) -> None:
         raise ValueError(f"PromptConfig values must be positive: {', '.join(invalid)}")
 
 
-def _validate_index_tensor(indices: torch.Tensor, upper_bound: int, name: str) -> None:
+def validate_index_tensor(indices: torch.Tensor, upper_bound: int, name: str) -> None:
+    """Require a torch.long index tensor whose values all fall in ``[0, upper_bound)``."""
     if indices.dtype != torch.long:
         raise ValueError(f"{name} must be a torch.long tensor")
     if torch.any(indices < 0) or torch.any(indices >= upper_bound):

@@ -22,7 +22,7 @@ from __future__ import annotations
 import torch
 
 from t2c_clip.features import fuse_features, l2_normalize
-from t2c_clip.prompts import PromptBank, _validate_index_tensor
+from t2c_clip.prompts import PromptBank, validate_index_tensor
 from t2c_clip.retrieval import FUSED_RETRIEVAL, IMAGE_ONLY_RETRIEVAL, require_retrieval_mode
 
 
@@ -65,7 +65,7 @@ class T2CClipModel(torch.nn.Module):
 
     def encode_inference_text(self, camera_ids: torch.Tensor) -> torch.Tensor:
         if self.inference_text_cache is not None:
-            _validate_index_tensor(camera_ids, self.inference_text_cache.shape[0], "camera_ids")
+            validate_index_tensor(camera_ids, self.inference_text_cache.shape[0], "camera_ids")
             return self.inference_text_cache[camera_ids]
         prompts = self.prompt_bank.inference_prompts(camera_ids)
         return self.encode_text(prompts)
