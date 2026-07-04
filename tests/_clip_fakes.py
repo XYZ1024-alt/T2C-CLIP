@@ -60,7 +60,25 @@ class FakeClipTextEncoder(nn.Module):
 class _FakeClipEncoder(nn.Module):
     def forward(self, inputs_embeds: torch.Tensor, attention_mask: Any = None, is_causal: bool = True, **kwargs) -> BaseModelOutput:
         _ = attention_mask, is_causal, kwargs
+        self.last_inputs_embeds = inputs_embeds
         return BaseModelOutput(last_hidden_state=inputs_embeds)
+
+
+class FakeCLIPTokenizer:
+    """Word-level stand-in for the CLIP BPE tokenizer.
+
+    Knows only the prompt-template words and wraps encodings in SOT/EOS like
+    the real tokenizer, so job-builder tests can verify special-token stripping.
+    """
+
+    bos_token_id = 49406
+    eos_token_id = 49407
+
+    _word_ids = {"a": 320, "photo": 1125, "of": 539, "person": 2533, ".": 269}
+
+    def __call__(self, text: str) -> dict[str, list[int]]:
+        ids = [self._word_ids[word] for word in text.split()]
+        return {"input_ids": [self.bos_token_id, *ids, self.eos_token_id]}
 
 
 class FakeCLIP(nn.Module):

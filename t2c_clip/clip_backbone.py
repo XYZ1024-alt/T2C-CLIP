@@ -34,6 +34,13 @@ class TransformersCLIPTextEncoder(torch.nn.Module):
     context block between the SOT and EOS tokens, then the CLIP text
     transformer + ``text_projection`` are run as usual. Output features are
     L2-normalized so callers can fuse them with image features directly.
+
+    ``prefix_token_ids`` / ``suffix_token_ids`` optionally frame the learnable
+    block in a natural-language template::
+
+        [SOT] + prefix tokens + <context_length slots> + suffix tokens + [EOS]
+
+    Empty tuples (the default) keep the bare ``[SOT] + slots + [EOS]`` sequence.
     """
 
     def __init__(
@@ -44,6 +51,8 @@ class TransformersCLIPTextEncoder(torch.nn.Module):
         eos_token_id: int,
         pad_token_id: int = 0,
         trainable_embeddings: bool = True,
+        prefix_token_ids: tuple[int, ...] = (),
+        suffix_token_ids: tuple[int, ...] = (),
     ):
         super().__init__()
         _require_positive(context_length, "context_length")
@@ -52,6 +61,8 @@ class TransformersCLIPTextEncoder(torch.nn.Module):
         self.sot_token_id = int(sot_token_id)
         self.eos_token_id = int(eos_token_id)
         self.pad_token_id = int(pad_token_id)
+        self.prefix_token_ids = tuple(int(token_id) for token_id in prefix_token_ids)
+        self.suffix_token_ids = tuple(int(token_id) for token_id in suffix_token_ids)
         self._freeze_unfreeze(trainable_embeddings)
 
     def forward(self, prompt_embeddings: torch.Tensor) -> torch.Tensor:
@@ -73,20 +84,22 @@ class TransformersCLIPTextEncoder(torch.nn.Module):
 
     def _build_hidden_states(self, prompt_embeddings: torch.Tensor, batch_size: int) -> torch.Tensor:
         device = prompt_embeddings.device
-        seq_len = self.context_length + 2
-        template = torch.full(
-            (batch_size, seq_len),
-            self.pad_token_id,
-            dtype=torch.long,
-            device=device,
+        template_ids = (
+            self.sot_token_id,
+            *self.prefix_token_ids,
+            *((self.pad_token_id,) * self.context_length),
+            *self.suffix_token_ids,
+            self.eos_token_id,
         )
-        template[:, 0] = self.sot_token_id
-        template[:, self.context_length + 1] = self.eos_token_id
+        seq_len = len(template_ids)
+        template = torch.tensor(template_ids, dtype=torch.long, device=device)
+        template = template.unsqueeze(0).expand(batch_size, seq_len)
         token_embedding = self.clip_model.text_model.embeddings.token_embedding
         position_embedding = self.clip_model.text_model.embeddings.position_embedding
         token_embeds = token_embedding(template)
         token_embeds = token_embeds.clone()
-        prompt_block = slice(1, self.context_length + 1)
+        prompt_start = 1 + len(self.prefix_token_ids)
+        prompt_block = slice(prompt_start, prompt_start + self.context_length)
         token_embeds[:, prompt_block, :] = prompt_embeddings
         position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, seq_len)
         position_embeds = position_embedding(position_ids)
@@ -109,9 +122,9 @@ class TransformersCLIPTextEncoder(torch.nn.Module):
 
     def _pool_eos(self, hidden_states: torch.Tensor, batch_size: int) -> torch.Tensor:
         device = hidden_states.device
-        seq_len = self.context_length + 2
         # EOS sits at the last position of our fixed template.
-        eos_position = torch.full((batch_size,), self.context_length + 1, dtype=torch.long, device=device)
+        eos_index = 1 + len(self.prefix_token_ids) + self.context_length + len(self.suffix_token_ids)
+        eos_position = torch.full((batch_size,), eos_index, dtype=torch.long, device=device)
         return hidden_states[torch.arange(batch_size, device=device), eos_position]
 
     def _freeze_unfreeze(self, trainable: bool) -> None:
