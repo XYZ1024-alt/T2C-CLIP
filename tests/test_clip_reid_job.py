@@ -19,7 +19,7 @@ from t2c_clip.jobs.clip_reid import (
     load_dataset_bundle,
 )
 from t2c_clip.retrieval import IMAGE_ONLY_RETRIEVAL
-from tests._clip_fakes import FakeCLIP, ImageAwareFakeImageProcessor
+from tests._clip_fakes import FakeCLIP, FakeCLIPTokenizer, ImageAwareFakeImageProcessor
 
 
 class CLIPReIDJobTest(unittest.TestCase):
@@ -578,9 +578,40 @@ class CLIPReIDJobTest(unittest.TestCase):
         clip = job.model.retrieval_model.image_encoder.clip_model
         self.assertFalse(clip.logit_scale.requires_grad)
 
+    def test_build_training_job_wraps_prompts_in_natural_language_template(self):
+        # The learnable slots must be framed as
+        # "a photo of a <slots> person ." with tokenizer-encoded template ids
+        # (SOT/EOS stripped from the encoded fragments).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+
+            job = build_training_job(_training_args(root), clip_loader=_load_fake_clip)
+
+        text_encoder = job.model.retrieval_model.text_encoder
+        self.assertEqual(text_encoder.prefix_token_ids, (320, 1125, 539, 320))
+        self.assertEqual(text_encoder.suffix_token_ids, (2533, 269))
+
+    def test_build_training_job_requires_tokenizer_for_prompt_template(self):
+        def load_without_tokenizer(model_name: str) -> CLIPLoadResult:
+            return CLIPLoadResult(
+                FakeCLIP(hidden_size=8, projection_dim=4),
+                ImageAwareFakeImageProcessor(),
+                tokenizer=None,
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+
+            with self.assertRaisesRegex(ValueError, "tokenizer"):
+                build_training_job(_training_args(root), clip_loader=load_without_tokenizer)
+
 
 def _load_fake_clip(model_name: str) -> CLIPLoadResult:
-    return CLIPLoadResult(FakeCLIP(hidden_size=8, projection_dim=4), ImageAwareFakeImageProcessor(), tokenizer=None)
+    return CLIPLoadResult(
+        FakeCLIP(hidden_size=8, projection_dim=4),
+        ImageAwareFakeImageProcessor(),
+        tokenizer=FakeCLIPTokenizer(),
+    )
 
 
 def _trainable_parameter_count(module: torch.nn.Module) -> int:

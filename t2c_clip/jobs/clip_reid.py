@@ -81,6 +81,11 @@ from t2c_clip.transforms import CLIPImageTransform, CLIPTrainImageTransform
 DEFAULT_RANKS = (1, 5, 10)
 SUPPORTED_DATASETS = ("market1501", "msmt17")
 DEFAULT_CLIP_TOKEN_IDS = {"sot": 49406, "eos": 49407, "pad": 0}
+# Natural-language frame around the learnable prompt slots. Keeping the text
+# tower close to its pretraining distribution matters (CLIP-ReID ablation):
+# the encoded sequence is [SOT] + prefix + <slots> + suffix + [EOS].
+PROMPT_TEMPLATE_PREFIX = "a photo of a"
+PROMPT_TEMPLATE_SUFFIX = "person ."
 STAGE1_TRAIN_LOSS_METRIC_NAMES = ("loss", "clip_loss")
 STAGE2_TRAIN_LOSS_METRIC_NAMES = ("loss", "clip_loss", "reid_loss", "triplet_loss", "tfc_loss")
 STAGE1 = "stage1"
@@ -318,7 +323,13 @@ def build_training_job(
         eval=CLIPImageTransform(loaded_clip.image_processor),
     )
     data = load_dataset_bundle(JobDataConfig(config.dataset, config.data_root), transforms)
-    shared_model = _build_training_model(config, loaded_clip.model, data).to(config.device)
+    shared_model = _build_training_model(
+        config,
+        loaded_clip.model,
+        data,
+        prefix_token_ids=_encode_template_token_ids(loaded_clip.tokenizer, PROMPT_TEMPLATE_PREFIX),
+        suffix_token_ids=_encode_template_token_ids(loaded_clip.tokenizer, PROMPT_TEMPLATE_SUFFIX),
+    ).to(config.device)
     loaders = _build_loaders(data, config)
     stage1_runtime, stage2_runtime, optimizer_stage1, optimizer_stage2, stage2_beta_schedule = _build_runtimes(
         config, shared_model, loaders
@@ -359,12 +370,12 @@ def load_transformers_clip(model_name: str) -> CLIPLoadResult:
         raise ImportError("transformers is required for the CLIP ReID training job") from exc
     model = CLIPModel.from_pretrained(model_name)
     processor = CLIPProcessor.from_pretrained(model_name)
-    tokenizer = None
     try:
         tokenizer = AutoTokenizer.from_pretrained(model_name)
     except Exception:
-        # Tokenizer is only used for sot/eos lookup. Fall back to known CLIP token ids.
-        tokenizer = None
+        # The prompt template must be encoded with the model's tokenizer;
+        # CLIPProcessor bundles one, so fall back to it.
+        tokenizer = getattr(processor, "tokenizer", None)
     image_processor = getattr(processor, "image_processor", processor)
     return CLIPLoadResult(model, image_processor, tokenizer)
 
@@ -663,6 +674,8 @@ def _build_training_model(
     config: CLIPReIDJobConfig,
     clip_model: torch.nn.Module,
     data: DatasetBundle,
+    prefix_token_ids: tuple[int, ...],
+    suffix_token_ids: tuple[int, ...],
 ) -> CLIPReIDTrainingModel:
     text_hidden_dim = clip_text_hidden_dim(clip_model)
     projection_dim = clip_projection_dim(clip_model)
@@ -682,6 +695,8 @@ def _build_training_model(
         sot_token_id=sot_id,
         eos_token_id=eos_id,
         pad_token_id=pad_id,
+        prefix_token_ids=prefix_token_ids,
+        suffix_token_ids=suffix_token_ids,
     )
     retrieval = T2CClipModel(
         image_encoder=image_encoder,
@@ -735,6 +750,19 @@ def _resolve_clip_token_ids(clip_model: torch.nn.Module, config: CLIPReIDJobConf
     if eos_id == bos:  # Some CLIP configs reuse BOS as EOS (eos_token_id == 2 historically).
         eos_id = DEFAULT_CLIP_TOKEN_IDS["eos"]
     return sot, eos_id, pad_id
+
+
+def _encode_template_token_ids(tokenizer: Any, text: str) -> tuple[int, ...]:
+    """Encode a constant template fragment, stripping the tokenizer's SOT/EOS wrap."""
+    if tokenizer is None:
+        raise ValueError("a CLIP tokenizer is required to encode the prompt template")
+    encoded = tokenizer(text)
+    input_ids = encoded["input_ids"]
+    special_ids = {getattr(tokenizer, "bos_token_id", None), getattr(tokenizer, "eos_token_id", None)}
+    token_ids = tuple(int(token_id) for token_id in input_ids if token_id not in special_ids)
+    if not token_ids:
+        raise ValueError(f"prompt template fragment {text!r} encoded to no token ids")
+    return token_ids
 
 
 def _build_loaders(data: DatasetBundle, config: CLIPReIDJobConfig) -> LoaderBundle:
