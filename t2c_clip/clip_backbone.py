@@ -54,9 +54,11 @@ class TransformersCLIPImageEncoder(torch.nn.Module):
         return self._forward_with_sie(images, camera_ids)
 
     def _forward_with_sie(self, images: torch.Tensor, camera_ids: torch.Tensor) -> torch.Tensor:
-        # Manual replica of the HF CLIP vision forward (embeddings ->
+        # Manual replica of transformers v5 ``CLIPVisionModel.forward`` (embeddings ->
         # pre_layrnorm -> encoder -> post_layernorm on CLS -> visual_projection)
         # with the SIE term broadcast over all tokens before the pre-layernorm.
+        # The zeroed-SIE bit-exact test against ``get_image_features`` is the
+        # canary for transformers upgrades changing this pipeline.
         vision_model = self.clip_model.vision_model
         hidden_states = vision_model.embeddings(images, interpolate_pos_encoding=True)
         hidden_states = hidden_states + self.sie_coe * self.sie_embedding(camera_ids).unsqueeze(1)

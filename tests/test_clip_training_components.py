@@ -299,6 +299,23 @@ class SIECameraEmbeddingTest(unittest.TestCase):
         self.assertFalse(torch.allclose(different[0], different[1]))
         self.assertTrue(torch.equal(same[0], same[1]))
 
+    def test_sie_coe_scales_the_camera_injection(self):
+        # A dropped `sie_coe *` factor (effectively 1.0) must not stay green:
+        # the same encoder with the same embedding weights but a different
+        # coefficient must produce a different output.
+        torch.manual_seed(0)
+        clip = _tiny_clip_model().eval()
+        encoder = TransformersCLIPImageEncoder(clip, num_cameras=2, sie_coe=0.5)
+        images = torch.randn(1, 3, 32, 16)
+        camera_ids = torch.tensor([0])
+
+        with torch.no_grad():
+            half = encoder(images, camera_ids=camera_ids)
+            encoder.sie_coe = 2.0
+            double = encoder(images, camera_ids=camera_ids)
+
+        self.assertFalse(torch.allclose(half, double))
+
     def test_sie_enabled_requires_camera_ids(self):
         encoder = TransformersCLIPImageEncoder(_tiny_clip_model(), num_cameras=2, sie_coe=0.5)
 
