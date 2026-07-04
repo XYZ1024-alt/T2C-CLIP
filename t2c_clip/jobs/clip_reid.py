@@ -23,8 +23,8 @@ Stage-2 ReID training:
   image-only floor at startup.
 - The CLIP alignment term is CLIP-ReID's image-to-text cross entropy: the
   image feature is classified against the identity anchor text matrix over
-  ALL train identities (frozen prompt bank: encoded once; otherwise re-encoded
-  at each Stage-2 epoch start, always detached).
+  ALL train identities (prompt bank and text encoder both frozen: encoded
+  once; otherwise re-encoded at each Stage-2 epoch start, always detached).
 - Total loss is::
 
       L_id + L_triplet + clip_weight * L_i2t + tfc_weight * L_TFC
@@ -477,7 +477,10 @@ def _build_runtimes(
     stage2_anchor_provider = IdentityAnchorProvider(
         model.retrieval_model,
         num_train_ids=num_train_ids,
-        frozen=config.freeze_prompt_bank_stage2,
+        # The anchors pass through the prompt bank AND the text encoder, so
+        # true CLIP-ReID fixation requires both frozen (same gate as
+        # _ensure_camera_text_cache); otherwise re-encode every epoch.
+        frozen=config.freeze_prompt_bank_stage2 and config.freeze_text_encoder,
     )
     stage2_runtime = StageTrainingRuntime(
         model=model, loaders=loaders, optimizer=optimizer_stage2, stage=STAGE2,

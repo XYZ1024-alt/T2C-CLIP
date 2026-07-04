@@ -9,9 +9,10 @@ text encoder through this term.
 
 Freshness semantics:
 
-- ``frozen=True`` (prompt bank frozen in Stage-2): the matrix is computed
-  once lazily at first use and cached for the whole stage — true CLIP-ReID
-  text-feature fixation. Epoch boundaries are ignored.
+- ``frozen=True`` (the whole anchor path is frozen in Stage-2 — prompt bank
+  AND text encoder): the matrix is computed once lazily at first use and
+  cached for the whole stage — true CLIP-ReID text-feature fixation. Epoch
+  boundaries are ignored.
 - ``frozen=False``: :meth:`start_epoch` invalidates the cache, so the matrix
   is re-encoded at the start of every Stage-2 epoch and acts as a
   slowly-moving teacher.
@@ -47,7 +48,7 @@ class IdentityAnchorProvider:
         self._cache: torch.Tensor | None = None
 
     def start_epoch(self) -> None:
-        """Stage-2 epoch boundary hook: drop the cache unless the prompts are frozen."""
+        """Stage-2 epoch boundary hook: drop the cache unless the anchor path is frozen."""
         if not self._frozen:
             self._cache = None
 
