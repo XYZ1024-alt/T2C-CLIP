@@ -58,8 +58,6 @@ class T2CClipModel(torch.nn.Module):
         return fuse_features(bn_features, text, self.beta)
 
     def encode_visual_raw(self, images: torch.Tensor, camera_ids: torch.Tensor | None = None) -> torch.Tensor:
-        if camera_ids is None:
-            return self.image_encoder(images)
         return self.image_encoder(images, camera_ids=camera_ids)
 
     def encode_visual(self, images: torch.Tensor, camera_ids: torch.Tensor | None = None) -> torch.Tensor:
