@@ -1,7 +1,9 @@
 from argparse import Namespace
 from pathlib import Path
+import random
 import tempfile
 import unittest
+from unittest import mock
 
 from PIL import Image
 import torch
@@ -19,6 +21,7 @@ from t2c_clip.jobs.clip_reid import (
     load_dataset_bundle,
 )
 from t2c_clip.retrieval import IMAGE_ONLY_RETRIEVAL
+from t2c_clip.transforms import CLIPImageTransform
 from tests._clip_fakes import FakeCLIP, FakeCLIPTokenizer, ImageAwareFakeImageProcessor
 
 
@@ -830,6 +833,162 @@ class CLIPReIDJobTest(unittest.TestCase):
 
             _apply_freezing(model, config, "stage2")
             self.assertTrue(sie.weight.requires_grad)
+
+    def test_job_config_stage1_feature_cache_defaults_true(self):
+        from t2c_clip.jobs.clip_reid import _job_config_from_args
+
+        config = _job_config_from_args(_training_args(Path(".")))
+
+        self.assertTrue(config.stage1_feature_cache)
+
+    def test_stage_metadata_includes_stage1_feature_cache(self):
+        from t2c_clip.jobs.clip_reid import _job_config_from_args, _stage_metadata
+
+        metadata = _stage_metadata(_job_config_from_args(_training_args(Path("."))))
+
+        self.assertIs(metadata.get("stage1_feature_cache"), True)
+
+    def test_stage1_feature_cache_rejects_trainable_stage1_image_encoder(self):
+        # Cached image features are only valid while the Stage-1 image tower
+        # is frozen; the conflicting flag combination must fail at build time.
+        args = _training_args(Path("."))
+        args.freeze_image_encoder_stage1 = False
+        args.stage1_feature_cache = True
+
+        with self.assertRaisesRegex(
+            ValueError, r"stage1-feature-cache.*freeze-image-encoder-stage1"
+        ):
+            build_training_job(args, clip_loader=_load_fake_clip)
+
+    def test_stage1_feature_cache_can_be_disabled_with_trainable_image_encoder(self):
+        from t2c_clip.jobs.clip_reid import _job_config_from_args
+
+        args = _training_args(Path("."))
+        args.freeze_image_encoder_stage1 = False
+        args.stage1_feature_cache = False
+
+        config = _job_config_from_args(args)
+
+        self.assertFalse(config.stage1_feature_cache)
+
+    def test_load_dataset_bundle_builds_train_eval_view_with_eval_transform(self):
+        class ConstantTransform:
+            def __init__(self, value: float):
+                self.value = value
+
+            def __call__(self, image):
+                return torch.full((3, image.height, image.width), self.value)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            transforms = TransformBundle(
+                train=ConstantTransform(2.0),
+                eval=ConstantTransform(1.0),
+            )
+
+            data = load_dataset_bundle(JobDataConfig("market1501", root), transforms)
+
+            self.assertEqual(len(data.train_eval), len(data.train))
+            self.assertEqual(data.train_eval.person_ids, data.train.person_ids)
+            self.assertTrue(torch.equal(data.train_eval[0].image, torch.ones(3, 2, 2)))
+
+    def test_stage1_cache_runs_image_tower_only_in_first_epoch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            args = _training_args(root)
+            args.stage1_epochs = 2
+
+            job = build_training_job(args, clip_loader=_load_fake_clip)
+            clip = job.stage1.model.retrieval_model.image_encoder.clip_model
+            clip.image_feature_calls = 0
+            first_reporter = TrainBatchReporterRecorder()
+            job.stage1.train_one_epoch(1, first_reporter)
+            first_epoch_calls = clip.image_feature_calls
+            second_reporter = TrainBatchReporterRecorder()
+            job.stage1.train_one_epoch(2, second_reporter)
+            second_epoch_calls = clip.image_feature_calls - first_epoch_calls
+
+        # Extraction is one sequential pass (4 train images, batch 4 -> 1 call);
+        # every training step afterwards must come from the cache.
+        self.assertEqual(first_epoch_calls, 1)
+        self.assertEqual(second_epoch_calls, 0)
+        # The first epoch trains too, with the same number of steps per epoch.
+        self.assertEqual(len(first_reporter.batch_reports), 1)
+        self.assertEqual(len(second_reporter.batch_reports), 1)
+        self.assertIn("loss", first_reporter.batch_reports[0])
+        self.assertIn("lr", first_reporter.batch_reports[0])
+
+    def test_stage1_cache_disabled_runs_image_tower_every_epoch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            args = _training_args(root)
+            args.stage1_epochs = 2
+            args.stage1_feature_cache = False
+
+            job = build_training_job(args, clip_loader=_load_fake_clip)
+            clip = job.stage1.model.retrieval_model.image_encoder.clip_model
+            clip.image_feature_calls = 0
+            job.stage1.train_one_epoch(1, TrainBatchReporterRecorder())
+            first_epoch_calls = clip.image_feature_calls
+            job.stage1.train_one_epoch(2, TrainBatchReporterRecorder())
+            second_epoch_calls = clip.image_feature_calls - first_epoch_calls
+
+        self.assertEqual(first_epoch_calls, 1)
+        self.assertEqual(second_epoch_calls, 1)
+
+    def test_stage1_cache_extraction_uses_eval_transform(self):
+        # The train transform is poisoned: with the cache enabled, Stage-1 must
+        # never load images through it (extraction uses the eval transform and
+        # later steps read the cache), so the epoch completes without raising.
+        class PoisonTrainTransform:
+            def __init__(self, image_processor):
+                self.image_processor = image_processor
+
+            def __call__(self, image):
+                raise AssertionError(
+                    "train transform must not run while the stage1 feature cache is enabled"
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            args = _training_args(root)
+            args.stage1_epochs = 1
+            with mock.patch(
+                "t2c_clip.jobs.clip_reid.CLIPTrainImageTransform", PoisonTrainTransform
+            ):
+                job = build_training_job(args, clip_loader=_load_fake_clip)
+                metrics = job.stage1.train_one_epoch(1, TrainBatchReporterRecorder())
+
+        self.assertIn("loss", metrics)
+
+    def test_stage1_cached_epoch_losses_match_online(self):
+        # With a deterministic transform (train == eval) and seeded PK sampling,
+        # the cached path must reproduce the online per-epoch losses exactly.
+        def run_stage1(root: Path, feature_cache: bool) -> list[float]:
+            random.seed(7)
+            torch.manual_seed(7)
+            args = _training_args(root)
+            args.stage1_epochs = 2
+            args.stage1_feature_cache = feature_cache
+            with mock.patch(
+                "t2c_clip.jobs.clip_reid.CLIPTrainImageTransform", CLIPImageTransform
+            ):
+                job = build_training_job(args, clip_loader=_load_fake_clip)
+            losses = []
+            for epoch in (1, 2):
+                random.seed(100 + epoch)
+                metrics = job.stage1.train_one_epoch(epoch, TrainBatchReporterRecorder())
+                losses.append(metrics["loss"])
+            return losses
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            cached = run_stage1(root, feature_cache=True)
+            online = run_stage1(root, feature_cache=False)
+
+        self.assertEqual(len(cached), 2)
+        for cached_loss, online_loss in zip(cached, online):
+            self.assertAlmostEqual(cached_loss, online_loss, places=10)
 
 
 def _load_fake_clip(model_name: str) -> CLIPLoadResult:

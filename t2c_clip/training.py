@@ -104,9 +104,31 @@ def stage1_alignment_loss(
     batch: TrainingBatch,
     config: Stage1LossConfig,
 ) -> Stage1LossBreakdown:
-    outputs = model.forward_stage1(batch.images, batch.camera_ids, batch.person_ids)
+    visual = model.encode_visual(batch.images, batch.camera_ids)
+    return stage1_alignment_loss_from_visual(
+        model,
+        visual,
+        camera_ids=batch.camera_ids,
+        person_ids=batch.person_ids,
+        config=config,
+    )
+
+
+def stage1_alignment_loss_from_visual(
+    model: T2CClipModel,
+    visual: torch.Tensor,
+    camera_ids: torch.Tensor,
+    person_ids: torch.Tensor,
+    config: Stage1LossConfig,
+) -> Stage1LossBreakdown:
+    """Stage-1 alignment loss from a precomputed L2-normalized image feature.
+
+    Shared by the online path (fresh image forward per batch) and the
+    frozen-tower feature-cache path so the two loss computations cannot drift.
+    """
+    text = model.encode_training_text(camera_ids, person_ids)
     clip_dual = supervised_bidirectional_contrastive_loss(
-        outputs["visual"], outputs["text"], batch.person_ids, logit_scale=config.logit_scale
+        visual, text, person_ids, logit_scale=config.logit_scale
     )
     return Stage1LossBreakdown(clip_dual=clip_dual)
 
