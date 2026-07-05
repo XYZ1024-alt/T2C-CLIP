@@ -17,6 +17,7 @@ from t2c_clip.training import (
     Stage2LossInputs,
     TrainingBatch,
     stage1_alignment_loss,
+    stage1_alignment_loss_from_visual,
     stage2_loss_breakdown,
 )
 
@@ -63,6 +64,29 @@ class TrainingLossTest(unittest.TestCase):
         breakdown = stage1_alignment_loss(model, batch, config)
 
         self.assertTrue(torch.allclose(breakdown.clip_dual, expected))
+
+    def test_stage1_alignment_loss_from_visual_matches_full_loss(self):
+        # The cached Stage-1 path feeds a precomputed normalized image feature
+        # into the shared loss helper; it must match the online loss bitwise.
+        model = _training_model(beta=0.0)
+        batch = TrainingBatch(
+            images=torch.tensor([[1.0, 0.0], [0.0, 1.0], [0.7, 0.7]]),
+            camera_ids=torch.tensor([0, 1, 0]),
+            person_ids=torch.tensor([0, 0, 1]),
+        )
+        config = Stage1LossConfig(logit_scale=5.0)
+        visual = model.encode_visual(batch.images, batch.camera_ids)
+        expected = stage1_alignment_loss(model, batch, config)
+
+        breakdown = stage1_alignment_loss_from_visual(
+            model,
+            visual,
+            camera_ids=batch.camera_ids,
+            person_ids=batch.person_ids,
+            config=config,
+        )
+
+        self.assertTrue(torch.equal(breakdown.clip_dual, expected.clip_dual))
 
     def test_stage2_i2t_classifies_visual_against_anchor_matrix(self):
         # CLIP-ReID Stage-2: the L2-normalized image feature is classified

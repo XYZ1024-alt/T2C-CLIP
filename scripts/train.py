@@ -213,6 +213,11 @@ def _add_project_training_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--triplet-metric", choices=("euclidean", "cosine"), default=DEFAULT_TRIPLET_METRIC)
     parser.add_argument("--tfc-weight", type=float, default=DEFAULT_TFC_WEIGHT)
     parser.add_argument("--stage1-epochs", type=int, default=DEFAULT_STAGE1_EPOCHS)
+    parser.add_argument(
+        "--stage1-feature-cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--clip-weight", type=float, default=DEFAULT_CLIP_WEIGHT)
     parser.add_argument("--id-logit-scale", type=float, default=DEFAULT_ID_LOGIT_SCALE)
     parser.add_argument("--label-smoothing", type=float, default=0.0)

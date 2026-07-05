@@ -4,6 +4,9 @@ Stage-1 prompt alignment:
 
 - Trains the learnable prompt bank via real CLIP text encoder + text_projection.
 - CLIP image encoder is frozen by default (``--freeze-image-encoder-stage1``).
+- With ``--stage1-feature-cache`` (default) the frozen image tower runs once:
+  train-split features are extracted with the eval transform at the start of
+  the first Stage-1 epoch and every Stage-1 step is served from the cache.
 - Loss is ``bidirectional_contrastive_loss(f_v, f_t_id)`` only.
 - No classifier / triplet / TFC gradients flow in Stage-1.
 
@@ -39,7 +42,7 @@ from __future__ import annotations
 
 import math
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -67,6 +70,7 @@ from t2c_clip.datasets import (
     collate_reid_batches,
 )
 from t2c_clip.evaluation import ReIDMetrics, evaluate_reid, evaluate_reid_with_rerank
+from t2c_clip.features import l2_normalize
 from t2c_clip.model import T2CClipModel
 from t2c_clip.prompts import PromptBank, PromptConfig
 from t2c_clip.retrieval import FUSED_RETRIEVAL, require_retrieval_mode
@@ -79,6 +83,7 @@ from t2c_clip.training import (
     Stage2LossInputs,
     TrainingBatch,
     stage1_alignment_loss,
+    stage1_alignment_loss_from_visual,
     stage2_loss_breakdown,
 )
 from t2c_clip.transforms import CLIPImageTransform, CLIPTrainImageTransform
@@ -151,11 +156,15 @@ class CLIPReIDJobConfig:
     stage2_warmup_epochs: int = 0
     num_instances: int = DEFAULT_INSTANCES_PER_IDENTITY
     sie_coe: float = 0.0
+    stage1_feature_cache: bool = True
 
 
 @dataclass(frozen=True)
 class DatasetBundle:
     train: ReIDImageDataset
+    # Train split re-viewed through the eval transform: the Stage-1 feature
+    # cache extracts frozen image features without augmentation noise.
+    train_eval: ReIDImageDataset
     query: ReIDImageDataset
     gallery: ReIDImageDataset
     num_train_ids: int
@@ -183,6 +192,74 @@ class TransformBundle:
 
 
 @dataclass(frozen=True)
+class Stage1CachedBatch:
+    """One identity-balanced Stage-1 training batch served from the feature cache."""
+
+    visual_raw: torch.Tensor
+    person_ids: torch.Tensor
+    camera_ids: torch.Tensor
+
+
+class Stage1FeatureCache:
+    """Frozen Stage-1 train-split image features, extracted lazily once per run.
+
+    Only valid while the Stage-1 image tower is frozen (enforced at job build
+    time). Extraction runs the eval-transform view of the train split under
+    ``torch.no_grad()`` at the start of the first Stage-1 training epoch, so
+    the cached ``visual_raw`` features are exactly what the frozen tower
+    (including any SIE camera injection) would produce for every later epoch.
+    """
+
+    def __init__(self, dataset: ReIDImageDataset, config: CLIPReIDJobConfig):
+        self._dataset = dataset
+        self._config = config
+        self._visual_raw: torch.Tensor | None = None
+        self._person_ids: torch.Tensor | None = None
+        self._camera_ids: torch.Tensor | None = None
+
+    def ensure_extracted(self, model: "CLIPReIDTrainingModel") -> None:
+        if self._visual_raw is not None:
+            return
+        loader = _loader(self._dataset, self._config, shuffle=False)
+        was_training = model.training
+        model.eval()
+        visual_parts: list[torch.Tensor] = []
+        person_parts: list[torch.Tensor] = []
+        camera_parts: list[torch.Tensor] = []
+        with torch.no_grad():
+            for batch in loader:
+                images = batch.images.to(self._config.device)
+                cameras = batch.camera_ids.to(self._config.device)
+                visual_parts.append(model.retrieval_model.encode_visual_raw(images, cameras))
+                person_parts.append(batch.person_ids.to(self._config.device))
+                camera_parts.append(cameras)
+        if was_training:
+            model.train()
+        if not visual_parts:
+            raise ValueError("stage1 feature cache extraction produced no batches")
+        self._visual_raw = torch.cat(visual_parts)
+        self._person_ids = torch.cat(person_parts)
+        self._camera_ids = torch.cat(camera_parts)
+
+    def batches(self) -> Iterator[Stage1CachedBatch]:
+        """Identity-balanced batches over the cached tensors (same PK sampling as the train loader)."""
+        if self._visual_raw is None or self._person_ids is None or self._camera_ids is None:
+            raise ValueError("stage1 feature cache must be extracted before batching")
+        sampler = IdentityBalancedBatchSampler(
+            self._person_ids.tolist(),
+            batch_size=self._config.batch_size,
+            instances_per_identity=self._config.num_instances,
+        )
+        for batch_indices in sampler:
+            indices = torch.tensor(batch_indices, dtype=torch.long, device=self._visual_raw.device)
+            yield Stage1CachedBatch(
+                visual_raw=self._visual_raw[indices],
+                person_ids=self._person_ids[indices],
+                camera_ids=self._camera_ids[indices],
+            )
+
+
+@dataclass(frozen=True)
 class StageTrainingRuntime:
     model: "CLIPReIDTrainingModel"
     loaders: LoaderBundle
@@ -194,6 +271,7 @@ class StageTrainingRuntime:
     freeze_config: "CLIPReIDJobConfig | None" = None
     lr_scheduler: "StageLRScheduler | None" = None
     anchor_provider: IdentityAnchorProvider | None = None
+    feature_cache: Stage1FeatureCache | None = None
 
 
 @dataclass(frozen=True)
@@ -334,7 +412,8 @@ def build_training_job(
     ).to(config.device)
     loaders = _build_loaders(data, config)
     stage1_runtime, stage2_runtime, optimizer_stage1, optimizer_stage2, stage2_beta_schedule = _build_runtimes(
-        config, shared_model, loaders, data.num_train_ids
+        config, shared_model, loaders, data.num_train_ids,
+        stage1_feature_cache=_build_stage1_feature_cache(config, data),
     )
     stage2_job = TrainingJob(
         model=shared_model,
@@ -391,6 +470,7 @@ def load_dataset_bundle(config: JobDataConfig, transforms) -> DatasetBundle:
     bundle = _transform_bundle(transforms)
     return DatasetBundle(
         train=ReIDImageDataset(ReIDImageDatasetConfig(splits.train, train_person_map, camera_map, bundle.train)),
+        train_eval=ReIDImageDataset(ReIDImageDatasetConfig(splits.train, train_person_map, camera_map, bundle.eval)),
         query=ReIDImageDataset(ReIDImageDatasetConfig(splits.query, eval_person_map, camera_map, bundle.eval)),
         gallery=ReIDImageDataset(ReIDImageDatasetConfig(splits.gallery, eval_person_map, camera_map, bundle.eval)),
         num_train_ids=len(train_person_map),
@@ -409,6 +489,14 @@ def _job_config_from_args(args: Any) -> CLIPReIDJobConfig:
         raise ValueError("--dataset is required for t2c_clip.jobs.clip_reid")
     if args.data_root is None:
         raise ValueError("--data-root is required for t2c_clip.jobs.clip_reid")
+    freeze_image_encoder_stage1 = bool(getattr(args, "freeze_image_encoder_stage1", True))
+    stage1_feature_cache = bool(getattr(args, "stage1_feature_cache", True))
+    if stage1_feature_cache and not freeze_image_encoder_stage1:
+        raise ValueError(
+            "--stage1-feature-cache requires --freeze-image-encoder-stage1: a trainable "
+            "Stage-1 image encoder makes the cached image features stale; pass "
+            "--no-stage1-feature-cache or keep the Stage-1 image encoder frozen"
+        )
     return CLIPReIDJobConfig(
         dataset=args.dataset,
         data_root=args.data_root,
@@ -431,7 +519,7 @@ def _job_config_from_args(args: Any) -> CLIPReIDJobConfig:
         stage1_epochs=int(getattr(args, "stage1_epochs", 0)),
         stage2_epochs=int(getattr(args, "epochs", 120)),
         validation_interval=int(getattr(args, "validation_interval", 5)),
-        freeze_image_encoder_stage1=bool(getattr(args, "freeze_image_encoder_stage1", True)),
+        freeze_image_encoder_stage1=freeze_image_encoder_stage1,
         freeze_image_encoder_stage2=bool(getattr(args, "freeze_image_encoder_stage2", False)),
         freeze_text_encoder=bool(getattr(args, "freeze_text_encoder", True)),
         stage2_first_epoch=int(getattr(args, "stage2_first_epoch", int(getattr(args, "stage1_epochs", 0)) + 1)),
@@ -444,6 +532,7 @@ def _job_config_from_args(args: Any) -> CLIPReIDJobConfig:
         stage2_warmup_epochs=int(getattr(args, "stage2_warmup_epochs", 0)),
         num_instances=int(getattr(args, "num_instances", DEFAULT_INSTANCES_PER_IDENTITY)),
         sie_coe=float(getattr(args, "sie_coe", 0.0)),
+        stage1_feature_cache=stage1_feature_cache,
     )
 
 
@@ -452,6 +541,7 @@ def _build_runtimes(
     model: CLIPReIDTrainingModel,
     loaders: LoaderBundle,
     num_train_ids: int,
+    stage1_feature_cache: Stage1FeatureCache | None,
 ) -> tuple[
     StageTrainingRuntime,
     StageTrainingRuntime,
@@ -466,6 +556,7 @@ def _build_runtimes(
         model=model, loaders=loaders, optimizer=optimizer_stage1, stage=STAGE1,
         loss_config=_stage1_loss_config(clip_model), device=config.device,
         freeze_config=config,
+        feature_cache=stage1_feature_cache,
     )
     _apply_freezing(model, config, stage=STAGE2)
     optimizer_stage2 = _build_optimizer(model, config)
@@ -493,6 +584,15 @@ def _build_runtimes(
         anchor_provider=stage2_anchor_provider,
     )
     return stage1_runtime, stage2_runtime, optimizer_stage1, optimizer_stage2, stage2_beta_schedule
+
+
+def _build_stage1_feature_cache(
+    config: CLIPReIDJobConfig,
+    data: DatasetBundle,
+) -> Stage1FeatureCache | None:
+    if not config.stage1_feature_cache:
+        return None
+    return Stage1FeatureCache(data.train_eval, config)
 
 
 def _apply_freezing(model: CLIPReIDTrainingModel, config: CLIPReIDJobConfig, stage: str) -> None:
@@ -659,6 +759,7 @@ def _stage_metadata(config: CLIPReIDJobConfig) -> StageMetadata:
             "stage2_warmup_epochs": config.stage2_warmup_epochs,
             "num_instances": config.num_instances,
             "sie_coe": config.sie_coe,
+            "stage1_feature_cache": config.stage1_feature_cache,
         }
     )
 
@@ -839,7 +940,7 @@ def _train_one_epoch(runtime: StageTrainingRuntime):
         metric_names = _train_metric_names(runtime.stage)
         totals = {name: 0.0 for name in metric_names}
         batch_count = 0
-        for batch in reporter.batches(runtime.loaders.train):
+        for batch in reporter.batches(_train_batches(runtime)):
             values = _train_batch(runtime, batch, runtime.stage)
             reporter.report_batch(values)
             totals = {name: totals[name] + values[name] for name in metric_names}
@@ -847,6 +948,19 @@ def _train_one_epoch(runtime: StageTrainingRuntime):
         return _average_train_metrics(totals, batch_count, runtime.optimizer, runtime.stage)
 
     return train
+
+
+def _train_batches(runtime: StageTrainingRuntime):
+    """The epoch's batch source: the PK train loader, or Stage-1 cached features.
+
+    With the Stage-1 feature cache enabled, the (frozen) image tower runs once
+    — lazily, at the start of the first Stage-1 training epoch — and every
+    training step of every Stage-1 epoch is served from the cached tensors.
+    """
+    if runtime.stage == STAGE1 and runtime.feature_cache is not None:
+        runtime.feature_cache.ensure_extracted(runtime.model)
+        return runtime.feature_cache.batches()
+    return runtime.loaders.train
 
 
 def _noop_validate():
@@ -945,14 +1059,17 @@ def _training_batch(batch: ReIDImageBatch, device: torch.device) -> TrainingBatc
     )
 
 
-def _train_batch(runtime: StageTrainingRuntime, batch: ReIDImageBatch, stage: str) -> dict[str, float]:
-    training_batch = _training_batch(batch, runtime.device)
+def _train_batch(
+    runtime: StageTrainingRuntime,
+    batch: ReIDImageBatch | Stage1CachedBatch,
+    stage: str,
+) -> dict[str, float]:
     runtime.optimizer.zero_grad()
     if stage == STAGE1:
-        breakdown = _stage1_step(runtime, training_batch)
+        breakdown = _stage1_step(runtime, batch)
         values = _stage1_metric_values(breakdown)
     else:
-        breakdown = _stage2_step(runtime, training_batch)
+        breakdown = _stage2_step(runtime, _training_batch(batch, runtime.device))
         values = _stage2_metric_values(breakdown)
     breakdown.total.backward()
     runtime.optimizer.step()
@@ -960,8 +1077,20 @@ def _train_batch(runtime: StageTrainingRuntime, batch: ReIDImageBatch, stage: st
     return values
 
 
-def _stage1_step(runtime: StageTrainingRuntime, batch: TrainingBatch) -> Stage1LossBreakdown:
-    return stage1_alignment_loss(runtime.model.retrieval_model, batch, runtime.loss_config)
+def _stage1_step(
+    runtime: StageTrainingRuntime,
+    batch: ReIDImageBatch | Stage1CachedBatch,
+) -> Stage1LossBreakdown:
+    model = runtime.model.retrieval_model
+    if isinstance(batch, Stage1CachedBatch):
+        return stage1_alignment_loss_from_visual(
+            model,
+            l2_normalize(batch.visual_raw),
+            camera_ids=batch.camera_ids,
+            person_ids=batch.person_ids,
+            config=runtime.loss_config,
+        )
+    return stage1_alignment_loss(model, _training_batch(batch, runtime.device), runtime.loss_config)
 
 
 def _stage2_step(runtime: StageTrainingRuntime, batch: TrainingBatch) -> Stage2LossBreakdown:
