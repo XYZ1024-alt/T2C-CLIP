@@ -9,7 +9,7 @@ from t2c_clip.retrieval import IMAGE_ONLY_RETRIEVAL
 
 
 class IdentityEncoder(torch.nn.Module):
-    def forward(self, inputs):
+    def forward(self, inputs, camera_ids=None):
         return inputs
 
 
@@ -184,4 +184,54 @@ class EvaluationModelTest(unittest.TestCase):
         inference = model.encode_retrieval(images, camera_ids)
 
         self.assertTrue(torch.allclose(outputs["retrieval"], inference))
-        self.assertFalse(torch.allclose(outputs["text"], inference))
+        self.assertNotIn("text", outputs)
+
+
+class CameraRecordingImageEncoder(torch.nn.Module):
+    """Records the camera_ids keyword the model threads into the image encoder."""
+
+    def __init__(self):
+        super().__init__()
+        self.received_camera_ids: list = []
+
+    def forward(self, images, camera_ids=None):
+        self.received_camera_ids.append(camera_ids)
+        return images
+
+
+class CameraIdThreadingTest(unittest.TestCase):
+    def _model(self) -> tuple[T2CClipModel, CameraRecordingImageEncoder]:
+        prompt_bank = PromptBank(PromptConfig(num_cameras=2, num_train_ids=2, context_length=1, embedding_dim=2))
+        encoder = CameraRecordingImageEncoder()
+        return T2CClipModel(encoder, PromptMeanEncoder(), prompt_bank, beta=0.5), encoder
+
+    def test_encode_retrieval_passes_camera_ids_to_image_encoder(self):
+        model, encoder = self._model()
+        camera_ids = torch.tensor([0, 1])
+
+        model.encode_retrieval(torch.eye(2), camera_ids)
+
+        self.assertIs(encoder.received_camera_ids[-1], camera_ids)
+
+    def test_forward_stage1_passes_camera_ids_to_image_encoder(self):
+        model, encoder = self._model()
+        camera_ids = torch.tensor([1, 0])
+
+        model.forward_stage1(torch.eye(2), camera_ids, torch.tensor([0, 1]))
+
+        self.assertIs(encoder.received_camera_ids[-1], camera_ids)
+
+    def test_forward_stage2_passes_camera_ids_to_image_encoder(self):
+        model, encoder = self._model()
+        camera_ids = torch.tensor([1, 1])
+
+        model.forward_stage2(torch.eye(2), camera_ids, torch.tensor([0, 1]))
+
+        self.assertIs(encoder.received_camera_ids[-1], camera_ids)
+
+    def test_encode_visual_without_camera_ids_calls_encoder_with_images_only(self):
+        model, encoder = self._model()
+
+        model.encode_visual(torch.eye(2))
+
+        self.assertEqual(encoder.received_camera_ids, [None])
