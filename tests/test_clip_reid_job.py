@@ -1,7 +1,9 @@
 from argparse import Namespace
 from pathlib import Path
+import random
 import tempfile
 import unittest
+from unittest import mock
 
 from PIL import Image
 import torch
@@ -19,7 +21,8 @@ from t2c_clip.jobs.clip_reid import (
     load_dataset_bundle,
 )
 from t2c_clip.retrieval import IMAGE_ONLY_RETRIEVAL
-from tests._clip_fakes import FakeCLIP, ImageAwareFakeImageProcessor
+from t2c_clip.transforms import CLIPImageTransform
+from tests._clip_fakes import FakeCLIP, FakeCLIPTokenizer, ImageAwareFakeImageProcessor
 
 
 class CLIPReIDJobTest(unittest.TestCase):
@@ -89,7 +92,7 @@ class CLIPReIDJobTest(unittest.TestCase):
 
         self.assertEqual(len(reporter.batch_reports), 1)
         self.assertIn("loss", train_metrics)
-        self.assertIn("clip_loss", train_metrics)
+        self.assertIn("i2t_loss", train_metrics)
         self.assertIn("reid_loss", train_metrics)
         self.assertIn("triplet_loss", train_metrics)
         self.assertIn("tfc_loss", train_metrics)
@@ -240,6 +243,93 @@ class CLIPReIDJobTest(unittest.TestCase):
         prompt_bank = job.stage2.model.retrieval_model.prompt_bank
         self.assertEqual(_trainable_parameter_count(prompt_bank), 0)
 
+    def test_stage2_frozen_prompts_encode_text_only_in_first_epoch(self):
+        # With the prompt bank frozen in Stage-2 and the text encoder frozen,
+        # the first epoch encodes the identity anchors (1 chunk: 2 train ids)
+        # plus the per-camera retrieval text cache (1 call); afterwards the
+        # text tower must never run again.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            args = _training_args(root)
+            args.freeze_prompt_bank_stage2 = True
+            args.freeze_text_encoder = True
+            args.epochs = 2
+
+            job = build_training_job(args, clip_loader=_load_fake_clip)
+            encoder = job.model.retrieval_model.image_encoder.clip_model.text_model.encoder
+            encoder.call_count = 0
+            job.train_one_epoch(1, TrainBatchReporterRecorder())
+            first_epoch_calls = encoder.call_count
+            job.train_one_epoch(2, TrainBatchReporterRecorder())
+            second_epoch_calls = encoder.call_count - first_epoch_calls
+
+        self.assertEqual(first_epoch_calls, 2)
+        self.assertEqual(second_epoch_calls, 0)
+
+    def test_stage2_frozen_prompts_with_trainable_text_encoder_recompute_anchors_each_epoch(self):
+        # The anchors pass through the text encoder too: with the prompt bank
+        # frozen but the text tower still training, the anchor matrix must be
+        # re-encoded at every Stage-2 epoch start (and no camera cache may
+        # exist), exactly like the fully unfrozen case.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            args = _training_args(root)
+            args.freeze_prompt_bank_stage2 = True
+            args.freeze_text_encoder = False
+            args.epochs = 2
+
+            job = build_training_job(args, clip_loader=_load_fake_clip)
+            encoder = job.model.retrieval_model.image_encoder.clip_model.text_model.encoder
+            encoder.call_count = 0
+            job.train_one_epoch(1, TrainBatchReporterRecorder())
+            first_epoch_calls = encoder.call_count
+            job.train_one_epoch(2, TrainBatchReporterRecorder())
+            second_epoch_calls = encoder.call_count - first_epoch_calls
+
+        self.assertIsNone(job.model.retrieval_model.inference_text_cache)
+        self.assertEqual(first_epoch_calls, 2)
+        self.assertEqual(second_epoch_calls, 2)
+
+    def test_stage2_unfrozen_prompts_recompute_anchors_each_epoch(self):
+        # Unfrozen prompt bank: the anchors act as a slowly-moving teacher and
+        # are re-encoded at each Stage-2 epoch start (1 chunk) on top of the
+        # per-batch retrieval text (1 batch in this fixture); no camera cache.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            args = _training_args(root)
+            args.epochs = 2
+
+            job = build_training_job(args, clip_loader=_load_fake_clip)
+            encoder = job.model.retrieval_model.image_encoder.clip_model.text_model.encoder
+            encoder.call_count = 0
+            job.train_one_epoch(1, TrainBatchReporterRecorder())
+            first_epoch_calls = encoder.call_count
+            job.train_one_epoch(2, TrainBatchReporterRecorder())
+            second_epoch_calls = encoder.call_count - first_epoch_calls
+
+        self.assertIsNone(job.model.retrieval_model.inference_text_cache)
+        self.assertEqual(first_epoch_calls, 2)
+        self.assertEqual(second_epoch_calls, 2)
+
+    def test_stage2_camera_text_cache_matches_online_encoding(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            args = _training_args(root)
+            args.freeze_prompt_bank_stage2 = True
+            args.freeze_text_encoder = True
+
+            job = build_training_job(args, clip_loader=_load_fake_clip)
+            job.train_one_epoch(1, TrainBatchReporterRecorder())
+
+            retrieval = job.model.retrieval_model
+            cache = retrieval.inference_text_cache
+            self.assertIsNotNone(cache)
+            retrieval.set_inference_text_cache(None)
+            with torch.no_grad():
+                online = retrieval.encode_inference_text(torch.arange(cache.shape[0]))
+
+        self.assertTrue(torch.equal(cache, online))
+
     def test_stage2_prompt_bank_remains_trainable_by_default(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
@@ -258,8 +348,9 @@ class CLIPReIDJobTest(unittest.TestCase):
 
             job = build_training_job(args, clip_loader=_load_fake_clip)
 
-        self.assertTrue(hasattr(job.model, "feature_head"))
-        self.assertGreater(_trainable_parameter_count(job.model.feature_head), 0)
+        # The head lives inside the retrieval model so training and eval share one path.
+        self.assertFalse(hasattr(job.model, "feature_head"))
+        self.assertGreater(_trainable_parameter_count(job.model.retrieval_model.feature_head), 0)
 
     def test_bnneck_keeps_batch_norm_bias_frozen_in_stage2(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -269,33 +360,17 @@ class CLIPReIDJobTest(unittest.TestCase):
 
             job = build_training_job(args, clip_loader=_load_fake_clip)
 
-        self.assertFalse(job.model.feature_head.bn.bias.requires_grad)
+        self.assertFalse(job.model.retrieval_model.feature_head.bn.bias.requires_grad)
 
-    def test_clipreid_model_encode_retrieval_applies_feature_head(self):
-        # Retrieval/validation must pass the base feature through the same
-        # feature_head (e.g. BNNeck) the Stage-2 ID classifier is trained on.
-        # Otherwise the ID signal shapes BN(f) while retrieval uses raw f.
-        class StubRetrieval(torch.nn.Module):
-            def encode_retrieval(self, images, camera_ids, retrieval_mode="fused"):
-                return torch.ones(images.shape[0], 4)
+    def test_classifier_has_no_bias(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
 
-        head = torch.nn.Linear(4, 4, bias=False)
-        with torch.no_grad():
-            head.weight.copy_(torch.eye(4) * 2.0)
-        model = CLIPReIDTrainingModel(
-            retrieval_model=StubRetrieval(),
-            classifier=torch.nn.Linear(4, 2),
-            tfc_bank=torch.nn.Module(),
-            feature_head=head,
-        )
+            job = build_training_job(_training_args(root), clip_loader=_load_fake_clip)
 
-        output = model.encode_retrieval(torch.zeros(3, 3, 2, 2), torch.zeros(3, dtype=torch.long))
+        self.assertIsNone(job.model.classifier.bias)
 
-        self.assertTrue(torch.allclose(output, torch.full((3, 4), 2.0)))
-
-    def test_validation_extracts_features_through_bnneck_head(self):
-        # The built validation path must route retrieval through the BNNeck head,
-        # so extracted features differ from the raw pre-head retrieval feature.
+    def test_bnneck_head_params_land_in_new_optimizer_group(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
             args = _training_args(root)
@@ -303,10 +378,46 @@ class CLIPReIDJobTest(unittest.TestCase):
 
             job = build_training_job(args, clip_loader=_load_fake_clip)
 
-        head = job.model.feature_head
+        _, new_group = _lookup_param_groups(job.optimizer)
+        new_names = [_element_name(model=job.model, parameter=parameter) for parameter in new_group["params"]]
+        self.assertTrue(
+            any("feature_head" in name for name in new_names),
+            f"feature_head params missing from the 'new' group: {new_names}",
+        )
+
+    def test_clipreid_model_encode_retrieval_delegates_to_retrieval_model(self):
+        # The feature head now lives inside the retrieval model, so the wrapper
+        # must return the retrieval model's feature unchanged (no second head).
+        class StubRetrieval(torch.nn.Module):
+            def encode_retrieval(self, images, camera_ids, retrieval_mode="fused"):
+                return torch.ones(images.shape[0], 4)
+
+        model = CLIPReIDTrainingModel(
+            retrieval_model=StubRetrieval(),
+            classifier=torch.nn.Linear(4, 2),
+            tfc_bank=torch.nn.Module(),
+        )
+
+        output = model.encode_retrieval(torch.zeros(3, 3, 2, 2), torch.zeros(3, dtype=torch.long))
+
+        self.assertTrue(torch.equal(output, torch.ones(3, 4)))
+
+    def test_validation_extracts_features_through_bnneck_head(self):
+        # The built validation path must route retrieval through the BNNeck head
+        # inside the retrieval model, so extracted features change when the head
+        # applies a non-uniform per-dimension transform.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            args = _training_args(root)
+            args.reid_head = "bnneck"
+
+            job = build_training_job(args, clip_loader=_load_fake_clip)
+
+        head = job.model.retrieval_model.feature_head
         with torch.no_grad():
-            head.bn.weight.copy_(torch.full_like(head.bn.weight, 3.0))
-            head.bn.running_var.copy_(torch.full_like(head.bn.running_var, 4.0))
+            head.bn.weight.copy_(torch.tensor([1.0, 2.0, 3.0, 4.0]))
+            head.bn.running_mean.copy_(torch.tensor([0.0, 0.5, -0.5, 1.0]))
+            head.bn.running_var.copy_(torch.tensor([1.0, 4.0, 0.25, 9.0]))
         job.model.eval()
 
         batch = ReIDImageBatch(
@@ -319,7 +430,8 @@ class CLIPReIDJobTest(unittest.TestCase):
         device = torch.device("cpu")
 
         with_head = _extract_features(job.model, [batch], device, "fused")
-        without_head = _extract_features(job.model.retrieval_model, [batch], device, "fused")
+        job.model.retrieval_model.feature_head = torch.nn.Identity()
+        without_head = _extract_features(job.model, [batch], device, "fused")
 
         self.assertFalse(torch.allclose(with_head.features, without_head.features))
 
@@ -511,6 +623,36 @@ class CLIPReIDJobTest(unittest.TestCase):
 
         self.assertEqual(config.id_logit_scale, 10.0)
 
+    def test_job_config_reads_triplet_metric(self):
+        from t2c_clip.jobs.clip_reid import _job_config_from_args
+
+        args = _training_args(Path("."))
+        args.triplet_metric = "cosine"
+
+        config = _job_config_from_args(args)
+
+        self.assertEqual(config.triplet_metric, "cosine")
+
+    def test_job_config_triplet_metric_defaults_to_euclidean_when_absent(self):
+        from t2c_clip.jobs.clip_reid import _job_config_from_args
+
+        args = _training_args(Path("."))
+        del args.triplet_metric
+
+        config = _job_config_from_args(args)
+
+        self.assertEqual(config.triplet_metric, "euclidean")
+
+    def test_stage_metadata_includes_triplet_metric(self):
+        from t2c_clip.jobs.clip_reid import _job_config_from_args, _stage_metadata
+
+        args = _training_args(Path("."))
+        args.triplet_metric = "cosine"
+
+        metadata = _stage_metadata(_job_config_from_args(args))
+
+        self.assertEqual(metadata.get("triplet_metric"), "cosine")
+
     def test_job_config_num_instances_defaults_to_two_when_absent(self):
         from t2c_clip.jobs.clip_reid import _job_config_from_args
 
@@ -566,6 +708,7 @@ class CLIPReIDJobTest(unittest.TestCase):
         stage2 = _stage2_loss_config(config, clip)
         self.assertAlmostEqual(stage2.logit_scale, math.e, places=5)
         self.assertEqual(stage2.triplet_margin, config.triplet_margin)
+        self.assertEqual(stage2.triplet_metric, config.triplet_metric)
         self.assertEqual(stage2.id_logit_scale, config.id_logit_scale)
         self.assertEqual(stage2.clip_weight, config.clip_weight)
 
@@ -578,9 +721,323 @@ class CLIPReIDJobTest(unittest.TestCase):
         clip = job.model.retrieval_model.image_encoder.clip_model
         self.assertFalse(clip.logit_scale.requires_grad)
 
+    def test_build_training_job_wraps_prompts_in_natural_language_template(self):
+        # The learnable slots must be framed as
+        # "a photo of a <slots> person ." with tokenizer-encoded template ids
+        # (SOT/EOS stripped from the encoded fragments).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+
+            job = build_training_job(_training_args(root), clip_loader=_load_fake_clip)
+
+        text_encoder = job.model.retrieval_model.text_encoder
+        self.assertEqual(text_encoder.prefix_token_ids, (320, 1125, 539, 320))
+        self.assertEqual(text_encoder.suffix_token_ids, (2533, 269))
+
+    def test_build_training_job_requires_tokenizer_for_prompt_template(self):
+        def load_without_tokenizer(model_name: str) -> CLIPLoadResult:
+            return CLIPLoadResult(
+                FakeCLIP(hidden_size=8, projection_dim=4),
+                ImageAwareFakeImageProcessor(),
+                tokenizer=None,
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+
+            with self.assertRaisesRegex(ValueError, "tokenizer"):
+                build_training_job(_training_args(root), clip_loader=load_without_tokenizer)
+
+    def test_job_config_reads_sie_coe(self):
+        from t2c_clip.jobs.clip_reid import _job_config_from_args
+
+        args = _training_args(Path("."))
+        args.sie_coe = 1.5
+
+        config = _job_config_from_args(args)
+
+        self.assertEqual(config.sie_coe, 1.5)
+
+    def test_job_config_sie_coe_defaults_to_zero_when_absent(self):
+        from t2c_clip.jobs.clip_reid import _job_config_from_args
+
+        config = _job_config_from_args(_training_args(Path(".")))
+
+        self.assertEqual(config.sie_coe, 0.0)
+
+    def test_stage_metadata_includes_sie_coe(self):
+        from t2c_clip.jobs.clip_reid import _job_config_from_args, _stage_metadata
+
+        args = _training_args(Path("."))
+        args.sie_coe = 1.5
+
+        metadata = _stage_metadata(_job_config_from_args(args))
+
+        self.assertEqual(metadata.get("sie_coe"), 1.5)
+
+    def test_sie_disabled_by_default_creates_no_embedding(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+
+            job = build_training_job(_training_args(root), clip_loader=_load_fake_clip)
+
+        self.assertIsNone(job.model.retrieval_model.image_encoder.sie_embedding)
+
+    def test_sie_embedding_sized_by_dataset_cameras_when_enabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))  # two cameras: c1, c2
+            args = _training_args(root)
+            args.sie_coe = 1.0
+
+            job = build_training_job(args, clip_loader=_load_fake_clip)
+
+        sie = job.model.retrieval_model.image_encoder.sie_embedding
+        self.assertIsNotNone(sie)
+        self.assertEqual(sie.num_embeddings, 2)
+
+    def test_sie_params_land_in_new_optimizer_group(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            args = _training_args(root)
+            args.sie_coe = 1.0
+
+            job = build_training_job(args, clip_loader=_load_fake_clip)
+
+        backbone_group, new_group = _lookup_param_groups(job.optimizer)
+        backbone_names = [_element_name(model=job.model, parameter=p) for p in backbone_group["params"]]
+        new_names = [_element_name(model=job.model, parameter=p) for p in new_group["params"]]
+        self.assertTrue(
+            any("sie_embedding" in name for name in new_names),
+            f"sie_embedding params missing from the 'new' group: {new_names}",
+        )
+        self.assertFalse(any("sie_embedding" in name for name in backbone_names))
+
+    def test_sie_embedding_follows_image_encoder_freeze_per_stage(self):
+        from t2c_clip.jobs.clip_reid import _apply_freezing, _job_config_from_args
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            args = _training_args(root)
+            args.sie_coe = 1.0
+            args.stage1_epochs = 1
+            args.freeze_image_encoder_stage1 = True
+            args.freeze_image_encoder_stage2 = False
+
+            job = build_training_job(args, clip_loader=_load_fake_clip)
+            config = _job_config_from_args(args)
+            model = job.stage2.model
+            sie = model.retrieval_model.image_encoder.sie_embedding
+
+            _apply_freezing(model, config, "stage1")
+            self.assertFalse(sie.weight.requires_grad)
+
+            _apply_freezing(model, config, "stage2")
+            self.assertTrue(sie.weight.requires_grad)
+
+    def test_job_config_stage1_feature_cache_defaults_true(self):
+        from t2c_clip.jobs.clip_reid import _job_config_from_args
+
+        config = _job_config_from_args(_training_args(Path(".")))
+
+        self.assertTrue(config.stage1_feature_cache)
+
+    def test_stage_metadata_includes_stage1_feature_cache(self):
+        from t2c_clip.jobs.clip_reid import _job_config_from_args, _stage_metadata
+
+        metadata = _stage_metadata(_job_config_from_args(_training_args(Path("."))))
+
+        self.assertIs(metadata.get("stage1_feature_cache"), True)
+
+    def test_stage_metadata_includes_image_size_and_prompt_template(self):
+        from t2c_clip.jobs.clip_reid import _job_config_from_args, _stage_metadata
+
+        metadata = _stage_metadata(_job_config_from_args(_training_args(Path("."))))
+
+        self.assertEqual(metadata.get("image_size"), "256x128")
+        self.assertEqual(metadata.get("prompt_template_prefix"), "a photo of a")
+        self.assertEqual(metadata.get("prompt_template_suffix"), "person .")
+
+    def test_optimizer_uses_no_decay_groups_for_norms_bias_prompts_and_sie(self):
+        # CLIP-ReID-style AdamW grouping: 1-D parameters (norm weights/biases),
+        # the prompt bank, and the SIE embedding train without weight decay;
+        # every other weight uses 1e-4.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            args = _training_args(root)
+            args.reid_head = "bnneck"
+            args.sie_coe = 3.0
+
+            job = build_training_job(args, clip_loader=_load_fake_clip)
+
+        parameters_by_name = dict(job.model.named_parameters())
+        seen_no_decay = 0
+        seen_decay = 0
+        for group in job.optimizer.param_groups:
+            for parameter in group["params"]:
+                name = _element_name(model=job.model, parameter=parameter)
+                expects_no_decay = (
+                    parameters_by_name[name].ndim <= 1
+                    or name.startswith("retrieval_model.prompt_bank.")
+                    or name.startswith("retrieval_model.image_encoder.sie_embedding.")
+                )
+                if expects_no_decay:
+                    self.assertEqual(float(group["weight_decay"]), 0.0, name)
+                    seen_no_decay += 1
+                else:
+                    self.assertEqual(float(group["weight_decay"]), 1e-4, name)
+                    seen_decay += 1
+        self.assertGreater(seen_no_decay, 0)
+        self.assertGreater(seen_decay, 0)
+
+    def test_stage1_feature_cache_rejects_trainable_stage1_image_encoder(self):
+        # Cached image features are only valid while the Stage-1 image tower
+        # is frozen; the conflicting flag combination must fail at build time.
+        args = _training_args(Path("."))
+        args.freeze_image_encoder_stage1 = False
+        args.stage1_feature_cache = True
+
+        with self.assertRaisesRegex(
+            ValueError, r"stage1-feature-cache.*freeze-image-encoder-stage1"
+        ):
+            build_training_job(args, clip_loader=_load_fake_clip)
+
+    def test_stage1_feature_cache_can_be_disabled_with_trainable_image_encoder(self):
+        from t2c_clip.jobs.clip_reid import _job_config_from_args
+
+        args = _training_args(Path("."))
+        args.freeze_image_encoder_stage1 = False
+        args.stage1_feature_cache = False
+
+        config = _job_config_from_args(args)
+
+        self.assertFalse(config.stage1_feature_cache)
+
+    def test_load_dataset_bundle_builds_train_eval_view_with_eval_transform(self):
+        class ConstantTransform:
+            def __init__(self, value: float):
+                self.value = value
+
+            def __call__(self, image):
+                return torch.full((3, image.height, image.width), self.value)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            transforms = TransformBundle(
+                train=ConstantTransform(2.0),
+                eval=ConstantTransform(1.0),
+            )
+
+            data = load_dataset_bundle(JobDataConfig("market1501", root), transforms)
+
+            self.assertEqual(len(data.train_eval), len(data.train))
+            self.assertEqual(data.train_eval.person_ids, data.train.person_ids)
+            self.assertTrue(torch.equal(data.train_eval[0].image, torch.ones(3, 2, 2)))
+
+    def test_stage1_cache_runs_image_tower_only_in_first_epoch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            args = _training_args(root)
+            args.stage1_epochs = 2
+
+            job = build_training_job(args, clip_loader=_load_fake_clip)
+            clip = job.stage1.model.retrieval_model.image_encoder.clip_model
+            clip.image_feature_calls = 0
+            first_reporter = TrainBatchReporterRecorder()
+            job.stage1.train_one_epoch(1, first_reporter)
+            first_epoch_calls = clip.image_feature_calls
+            second_reporter = TrainBatchReporterRecorder()
+            job.stage1.train_one_epoch(2, second_reporter)
+            second_epoch_calls = clip.image_feature_calls - first_epoch_calls
+
+        # Extraction is one sequential pass (4 train images, batch 4 -> 1 call);
+        # every training step afterwards must come from the cache.
+        self.assertEqual(first_epoch_calls, 1)
+        self.assertEqual(second_epoch_calls, 0)
+        # The first epoch trains too, with the same number of steps per epoch.
+        self.assertEqual(len(first_reporter.batch_reports), 1)
+        self.assertEqual(len(second_reporter.batch_reports), 1)
+        self.assertIn("loss", first_reporter.batch_reports[0])
+        self.assertIn("lr", first_reporter.batch_reports[0])
+
+    def test_stage1_cache_disabled_runs_image_tower_every_epoch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            args = _training_args(root)
+            args.stage1_epochs = 2
+            args.stage1_feature_cache = False
+
+            job = build_training_job(args, clip_loader=_load_fake_clip)
+            clip = job.stage1.model.retrieval_model.image_encoder.clip_model
+            clip.image_feature_calls = 0
+            job.stage1.train_one_epoch(1, TrainBatchReporterRecorder())
+            first_epoch_calls = clip.image_feature_calls
+            job.stage1.train_one_epoch(2, TrainBatchReporterRecorder())
+            second_epoch_calls = clip.image_feature_calls - first_epoch_calls
+
+        self.assertEqual(first_epoch_calls, 1)
+        self.assertEqual(second_epoch_calls, 1)
+
+    def test_stage1_cache_extraction_uses_eval_transform(self):
+        # The train transform is poisoned: with the cache enabled, Stage-1 must
+        # never load images through it (extraction uses the eval transform and
+        # later steps read the cache), so the epoch completes without raising.
+        class PoisonTrainTransform:
+            def __init__(self, image_processor):
+                self.image_processor = image_processor
+
+            def __call__(self, image):
+                raise AssertionError(
+                    "train transform must not run while the stage1 feature cache is enabled"
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            args = _training_args(root)
+            args.stage1_epochs = 1
+            with mock.patch(
+                "t2c_clip.jobs.clip_reid.CLIPTrainImageTransform", PoisonTrainTransform
+            ):
+                job = build_training_job(args, clip_loader=_load_fake_clip)
+                metrics = job.stage1.train_one_epoch(1, TrainBatchReporterRecorder())
+
+        self.assertIn("loss", metrics)
+
+    def test_stage1_cached_epoch_losses_match_online(self):
+        # With a deterministic transform (train == eval) and seeded PK sampling,
+        # the cached path must reproduce the online per-epoch losses exactly.
+        def run_stage1(root: Path, feature_cache: bool) -> list[float]:
+            random.seed(7)
+            torch.manual_seed(7)
+            args = _training_args(root)
+            args.stage1_epochs = 2
+            args.stage1_feature_cache = feature_cache
+            with mock.patch(
+                "t2c_clip.jobs.clip_reid.CLIPTrainImageTransform", CLIPImageTransform
+            ):
+                job = build_training_job(args, clip_loader=_load_fake_clip)
+            losses = []
+            for epoch in (1, 2):
+                random.seed(100 + epoch)
+                metrics = job.stage1.train_one_epoch(epoch, TrainBatchReporterRecorder())
+                losses.append(metrics["loss"])
+            return losses
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            cached = run_stage1(root, feature_cache=True)
+            online = run_stage1(root, feature_cache=False)
+
+        self.assertEqual(len(cached), 2)
+        for cached_loss, online_loss in zip(cached, online):
+            self.assertAlmostEqual(cached_loss, online_loss, places=10)
+
 
 def _load_fake_clip(model_name: str) -> CLIPLoadResult:
-    return CLIPLoadResult(FakeCLIP(hidden_size=8, projection_dim=4), ImageAwareFakeImageProcessor(), tokenizer=None)
+    return CLIPLoadResult(
+        FakeCLIP(hidden_size=8, projection_dim=4),
+        ImageAwareFakeImageProcessor(),
+        tokenizer=FakeCLIPTokenizer(),
+    )
 
 
 def _trainable_parameter_count(module: torch.nn.Module) -> int:
@@ -588,15 +1045,25 @@ def _trainable_parameter_count(module: torch.nn.Module) -> int:
 
 
 def _lookup_param_groups(optimizer: torch.optim.Optimizer) -> tuple[dict, dict]:
-    """Return the (backbone, new) param groups used by the grouped-learning-rate optimizer."""
-    by_name = {group.get("name", ""): group for group in optimizer.param_groups}
+    """Return synthetic (backbone, new) param groups for the grouped-lr optimizer.
+
+    The optimizer splits each lr family into a decay and a no-decay group;
+    tests that only care about lr-family membership see the merged view.
+    """
+    merged: dict[str, dict] = {}
+    for group in optimizer.param_groups:
+        name = str(group.get("name", ""))
+        family = "backbone" if name.startswith("backbone") else "new" if name.startswith("new") else name
+        if family not in merged:
+            merged[family] = {"params": [], "lr": group["lr"], "name": family}
+        merged[family]["params"].extend(group["params"])
     for required in ("backbone", "new"):
-        if required not in by_name:
+        if required not in merged:
             raise AssertionError(
                 f"optimizer is missing required param group {required!r}; "
-                f"found names: {sorted(by_name)}"
+                f"found names: {sorted(str(group.get('name', '')) for group in optimizer.param_groups)}"
             )
-    return by_name["backbone"], by_name["new"]
+    return merged["backbone"], merged["new"]
 
 
 def _element_name(model: torch.nn.Module, parameter: torch.nn.Parameter) -> str:
@@ -646,6 +1113,7 @@ def _training_args(root: Path) -> Namespace:
         context_length=2,
         tfc_momentum=0.5,
         triplet_margin=0.3,
+        triplet_metric="euclidean",
         tfc_weight=1.0,
         clip_weight=0.1,
         label_smoothing=0.0,
