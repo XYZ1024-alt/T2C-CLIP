@@ -9,6 +9,7 @@ from t2c_clip.features import l2_normalize
 
 DEFAULT_LOGIT_SCALE = 1.0
 DEFAULT_MARGIN = 0.3
+DEFAULT_TRIPLET_METRIC = "euclidean"
 
 
 def bidirectional_contrastive_loss(
@@ -61,6 +62,33 @@ def _multi_positive_cross_entropy(logits: torch.Tensor, positives: torch.Tensor)
     return -positive_log_probs.mean()
 
 
+def image_to_text_cross_entropy(
+    image_features: torch.Tensor,
+    text_anchors: torch.Tensor,
+    person_ids: torch.Tensor,
+    logit_scale: float = DEFAULT_LOGIT_SCALE,
+    label_smoothing: float = 0.0,
+) -> torch.Tensor:
+    """CLIP-ReID Stage-2 image-to-text cross entropy.
+
+    Each image feature is classified against the text anchors of ALL train
+    identities (not just the batch's): ``person_ids`` index rows of
+    ``text_anchors``. Both sides are L2-normalized before the similarity.
+    """
+    if image_features.ndim != 2:
+        raise ValueError("image_features must be a rank-2 tensor")
+    if text_anchors.ndim != 2:
+        raise ValueError("text_anchors must be a rank-2 tensor")
+    if image_features.shape[1] != text_anchors.shape[1]:
+        raise ValueError("image_features and text_anchors must share the feature dimension")
+    _validate_person_ids(person_ids, image_features.shape[0])
+    num_anchors = text_anchors.shape[0]
+    if torch.any(person_ids < 0) or torch.any(person_ids >= num_anchors):
+        raise ValueError(f"person_ids contains indices outside [0, {num_anchors})")
+    logits = logit_scale * l2_normalize(image_features) @ l2_normalize(text_anchors).T
+    return F.cross_entropy(logits, person_ids, label_smoothing=label_smoothing)
+
+
 def _validate_person_ids(person_ids: torch.Tensor, batch_size: int) -> None:
     if person_ids.dtype != torch.long or person_ids.ndim != 1:
         raise ValueError("person_ids must be a rank-1 torch.long tensor")
@@ -72,13 +100,24 @@ def batch_hard_triplet_loss(
     features: torch.Tensor,
     labels: torch.Tensor,
     margin: float = DEFAULT_MARGIN,
+    metric: str = DEFAULT_TRIPLET_METRIC,
 ) -> torch.Tensor:
     _validate_triplet_inputs(features, labels)
-    distances = 1.0 - l2_normalize(features) @ l2_normalize(features).T
+    distances = _pairwise_distances(features, metric)
     losses = _valid_anchor_losses(distances, labels, margin)
     if not losses:
         raise ValueError("batch_hard_triplet_loss requires at least one valid positive and negative")
     return torch.stack(losses).mean()
+
+
+def _pairwise_distances(features: torch.Tensor, metric: str) -> torch.Tensor:
+    if metric == "euclidean":
+        squared_norms = features.pow(2).sum(dim=1)
+        squared = squared_norms.unsqueeze(1) + squared_norms.unsqueeze(0) - 2.0 * features @ features.T
+        return squared.clamp_min(1e-12).sqrt()
+    if metric == "cosine":
+        return 1.0 - l2_normalize(features) @ l2_normalize(features).T
+    raise ValueError(f"unsupported triplet metric: {metric!r}")
 
 
 def _valid_anchor_losses(distances: torch.Tensor, labels: torch.Tensor, margin: float) -> list[torch.Tensor]:

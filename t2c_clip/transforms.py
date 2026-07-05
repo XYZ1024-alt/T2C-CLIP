@@ -58,23 +58,34 @@ class CLIPTrainImageTransform:
         image_size: tuple[int, int] = DEFAULT_IMAGE_SIZE,
         flip_prob: float = 0.5,
         color_jitter: tuple[float, float, float, float] = (0.2, 0.2, 0.2, 0.05),
+        crop_padding: int = 10,
         erase_prob: float = 0.5,
         erase_scale: tuple[float, float] = (0.02, 0.2),
         erase_ratio: tuple[float, float] = (0.3, 3.3),
     ):
+        if crop_padding < 0:
+            raise ValueError("crop_padding must be non-negative")
         self.image_processor = image_processor
-        self._base = CLIPImageTransform(image_processor, image_size=image_size)
-        self.pre_processor = transforms.Compose(
-            [
-                transforms.RandomHorizontalFlip(p=flip_prob),
-                transforms.ColorJitter(
-                    brightness=color_jitter[0],
-                    contrast=color_jitter[1],
-                    saturation=color_jitter[2],
-                    hue=color_jitter[3],
-                ),
-            ]
-        )
+        self.image_size = (int(image_size[0]), int(image_size[1]))
+        mean, std = _processor_normalization(image_processor)
+        steps: list[Any] = [
+            transforms.RandomHorizontalFlip(p=flip_prob),
+            transforms.ColorJitter(
+                brightness=color_jitter[0],
+                contrast=color_jitter[1],
+                saturation=color_jitter[2],
+                hue=color_jitter[3],
+            ),
+            transforms.Resize(self.image_size, interpolation=InterpolationMode.BICUBIC),
+        ]
+        if crop_padding > 0:
+            # Standard ReID strong-baseline augmentation: zero-pad the resized
+            # image and randomly crop back to the target size.
+            steps.append(transforms.Pad(crop_padding))
+            steps.append(transforms.RandomCrop(self.image_size))
+        steps.append(transforms.ToTensor())
+        steps.append(transforms.Normalize(mean, std))
+        self._pipeline = transforms.Compose(steps)
         self.random_erasing = transforms.RandomErasing(
             p=erase_prob,
             scale=erase_scale,
@@ -83,4 +94,4 @@ class CLIPTrainImageTransform:
         )
 
     def __call__(self, image: Image.Image) -> torch.Tensor:
-        return self.random_erasing(self._base(self.pre_processor(image)))
+        return self.random_erasing(self._pipeline(image))
