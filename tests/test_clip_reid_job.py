@@ -848,6 +848,47 @@ class CLIPReIDJobTest(unittest.TestCase):
 
         self.assertIs(metadata.get("stage1_feature_cache"), True)
 
+    def test_stage_metadata_includes_image_size_and_prompt_template(self):
+        from t2c_clip.jobs.clip_reid import _job_config_from_args, _stage_metadata
+
+        metadata = _stage_metadata(_job_config_from_args(_training_args(Path("."))))
+
+        self.assertEqual(metadata.get("image_size"), "256x128")
+        self.assertEqual(metadata.get("prompt_template_prefix"), "a photo of a")
+        self.assertEqual(metadata.get("prompt_template_suffix"), "person .")
+
+    def test_optimizer_uses_no_decay_groups_for_norms_bias_prompts_and_sie(self):
+        # CLIP-ReID-style AdamW grouping: 1-D parameters (norm weights/biases),
+        # the prompt bank, and the SIE embedding train without weight decay;
+        # every other weight uses 1e-4.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            args = _training_args(root)
+            args.reid_head = "bnneck"
+            args.sie_coe = 3.0
+
+            job = build_training_job(args, clip_loader=_load_fake_clip)
+
+        parameters_by_name = dict(job.model.named_parameters())
+        seen_no_decay = 0
+        seen_decay = 0
+        for group in job.optimizer.param_groups:
+            for parameter in group["params"]:
+                name = _element_name(model=job.model, parameter=parameter)
+                expects_no_decay = (
+                    parameters_by_name[name].ndim <= 1
+                    or name.startswith("retrieval_model.prompt_bank.")
+                    or name.startswith("retrieval_model.image_encoder.sie_embedding.")
+                )
+                if expects_no_decay:
+                    self.assertEqual(float(group["weight_decay"]), 0.0, name)
+                    seen_no_decay += 1
+                else:
+                    self.assertEqual(float(group["weight_decay"]), 1e-4, name)
+                    seen_decay += 1
+        self.assertGreater(seen_no_decay, 0)
+        self.assertGreater(seen_decay, 0)
+
     def test_stage1_feature_cache_rejects_trainable_stage1_image_encoder(self):
         # Cached image features are only valid while the Stage-1 image tower
         # is frozen; the conflicting flag combination must fail at build time.
@@ -1004,15 +1045,25 @@ def _trainable_parameter_count(module: torch.nn.Module) -> int:
 
 
 def _lookup_param_groups(optimizer: torch.optim.Optimizer) -> tuple[dict, dict]:
-    """Return the (backbone, new) param groups used by the grouped-learning-rate optimizer."""
-    by_name = {group.get("name", ""): group for group in optimizer.param_groups}
+    """Return synthetic (backbone, new) param groups for the grouped-lr optimizer.
+
+    The optimizer splits each lr family into a decay and a no-decay group;
+    tests that only care about lr-family membership see the merged view.
+    """
+    merged: dict[str, dict] = {}
+    for group in optimizer.param_groups:
+        name = str(group.get("name", ""))
+        family = "backbone" if name.startswith("backbone") else "new" if name.startswith("new") else name
+        if family not in merged:
+            merged[family] = {"params": [], "lr": group["lr"], "name": family}
+        merged[family]["params"].extend(group["params"])
     for required in ("backbone", "new"):
-        if required not in by_name:
+        if required not in merged:
             raise AssertionError(
                 f"optimizer is missing required param group {required!r}; "
-                f"found names: {sorted(by_name)}"
+                f"found names: {sorted(str(group.get('name', '')) for group in optimizer.param_groups)}"
             )
-    return by_name["backbone"], by_name["new"]
+    return merged["backbone"], merged["new"]
 
 
 def _element_name(model: torch.nn.Module, parameter: torch.nn.Parameter) -> str:

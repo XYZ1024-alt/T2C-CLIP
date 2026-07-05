@@ -9,11 +9,8 @@ Stage-2 total loss is::
 
 ``L_i2t`` is CLIP-ReID's image-to-text cross entropy: the L2-normalized image
 feature is classified against the (detached) identity anchor text matrix over
-ALL train identities, not just the batch's.
-
-``clip_weight`` is a configurable hyperparameter (default 0.1) — it must not
-be hard-coded to 1.0, since an oversized CLIP alignment signal suppresses
-ReID signals early in Stage-2.
+ALL train identities, not just the batch's. ``clip_weight`` defaults to 1.0,
+matching CLIP-ReID's weighting of the i2t term.
 """
 
 from __future__ import annotations
@@ -35,7 +32,7 @@ DEFAULT_LOGIT_SCALE = 1.0
 DEFAULT_TRIPLET_MARGIN = 0.3
 DEFAULT_TRIPLET_METRIC = "euclidean"
 DEFAULT_TFC_WEIGHT = 1.0
-DEFAULT_CLIP_WEIGHT = 0.1
+DEFAULT_CLIP_WEIGHT = 1.0
 DEFAULT_LABEL_SMOOTHING = 0.0
 DEFAULT_ID_LOGIT_SCALE = 1.0
 
@@ -150,6 +147,11 @@ def stage2_loss_breakdown(
     (detached, no-grad) from this forward's retrieval feature before scoring,
     so no separate center-update forward is needed and the BNNeck running
     stats see each batch exactly once.
+
+    ``id_logit_scale`` is a legacy knob from when the ID logits were cosine
+    similarities on unit-norm features; on the free-scale BNNeck logits it
+    stays at its default of 1.0 (a no-op) and is kept only for CLI
+    compatibility.
     """
     outputs = model.forward_stage2(batch.images, batch.camera_ids, batch.person_ids)
     retrieval = outputs["retrieval"]
