@@ -140,6 +140,41 @@ the image-only floor at startup. `--sanity-gate-epochs` fails the run early
 if mAP stays pinned to the random floor (sign the ReID signal isn't acting
 on `f_eval`).
 
+### Milestone recipes toward SOTA mAP
+
+**M1 — CLIP-ReID alignment + SIE (innovations off, framework check):**
+
+```bash
+python -m scripts.train \
+  --job-builder t2c_clip.jobs.clip_reid:build_training_job \
+  --dataset msmt17 --data-root MSMT17_V1 \
+  --clip-model-name openai/clip-vit-base-patch16 \
+  --seed 42 \
+  --stage1-epochs 120 --epochs 60 --validation-interval 5 \
+  --batch-size 128 --num-instances 4 --num-workers 4 \
+  --lr 5e-5 --image-encoder-lr 1e-5 \
+  --stage2-lr-scheduler cosine --stage2-warmup-epochs 10 \
+  --label-smoothing 0.1 --reid-head bnneck \
+  --beta 0.0 --beta-warmup-epochs 0 --tfc-weight 0.0 --clip-weight 1.0 \
+  --freeze-image-encoder-stage1 --no-freeze-image-encoder-stage2 \
+  --freeze-prompt-bank-stage2 \
+  --sie-coe 3.0 \
+  --checkpoint-dir checkpoints_m1_clipreid_sie \
+  --enable-mlflow --run-name msmt17-m1-clipreid-align-sie
+```
+
+Gate: mAP >= 0.55. If it lands below 0.50, inspect `stage1_clip_loss`
+(should fall well under ln(batch)) and the first-10-epoch mAP slope before
+touching the recipe.
+
+**M2 — full T2C recipe (fused retrieval + TFC on):** same command with
+`--beta 0.05 --beta-warmup-epochs 10 --tfc-weight 1.0` and a fresh
+checkpoint dir / run name. Gate: mAP >= M1 and >= 0.60. If M2 < M1, bisect
+with (`--tfc-weight 1.0 --beta 0.0`) and (`--tfc-weight 0.0 --beta 0.05`).
+
+Interrupted runs resume with `--resume <checkpoint-dir>/last.pth` and the
+original arguments.
+
 Useful training arguments:
 
 - `--dataset market1501|msmt17`
@@ -160,9 +195,10 @@ Useful training arguments:
 - `--num-workers 4`
 - `--lr 0.0001` (learning rate for the prompt bank, classifier, and unfrozen
   text encoder)
-- `--image-encoder-lr 0.00005` (learning rate for the CLIP vision backbone
-  and visual projection; smaller than `--lr` to avoid catastrophic
-  forgetting of the pretrained visual features)
+- `--image-encoder-lr 0.00001` (learning rate for the CLIP vision backbone
+  and visual projection; CLIP-ReID ViT recipe ~5e-6 x batch/64, far smaller
+  than `--lr` to avoid catastrophic forgetting of the pretrained visual
+  features)
 - `--device cuda`
 - `--beta 0.1`
 - `--beta-warmup-epochs 0` (linear ramp of the fused retrieval beta from
@@ -172,8 +208,19 @@ Useful training arguments:
 - `--triplet-margin 0.3`
 - `--tfc-weight 1.0`
 - `--clip-weight 0.1`
-- `--id-logit-scale 1.0` (multiplies Stage-2 ID-classification logits;
-  try `10.0` when normalized retrieval features make CE logits too small)
+- `--id-logit-scale 1.0` (legacy knob from when ID logits were cosine
+  similarities on unit-norm features; the BNNeck logits are free-scale, so
+  leave it at the 1.0 no-op default)
+- `--clip-weight 1.0` (weight of the Stage-2 image-to-text cross entropy
+  against the frozen identity anchor texts; 1.0 matches CLIP-ReID)
+- `--sie-coe 0.0` (SIE camera embedding coefficient on the vision tokens;
+  `0` disables SIE, TransReID uses `3.0` on MSMT17)
+- `--triplet-metric euclidean|cosine` (batch-hard triplet distance; euclidean
+  is the strong-baseline standard)
+- `--stage1-feature-cache / --no-stage1-feature-cache` (default on: extract
+  frozen train-split image features once with the eval transform and serve
+  every Stage-1 epoch from the cache; requires the Stage-1 image encoder to
+  stay frozen)
 - `--label-smoothing 0.0` (Stage-2 identity classification label smoothing;
   strong ReID recipes commonly use `0.1`)
 - `--reid-head linear|bnneck` (`bnneck` classifies BN-normalized retrieval
