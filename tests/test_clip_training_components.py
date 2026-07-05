@@ -67,6 +67,38 @@ class CLIPTrainingComponentsTest(unittest.TestCase):
         self.assertTrue(bool(torch.any(output == 0.0)))
         self.assertTrue(bool(torch.any(output == 1.0)))
 
+    def test_clip_train_image_transform_pads_and_random_crops_to_target_size(self):
+        transform = CLIPTrainImageTransform(
+            FakeImageProcessor(),
+            flip_prob=0.0,
+            color_jitter=(0.0, 0.0, 0.0, 0.0),
+            erase_prob=0.0,
+            crop_padding=10,
+        )
+        image = Image.new("RGB", (64, 128), (255, 255, 255))
+
+        torch.manual_seed(0)
+        output = transform(image)
+
+        self.assertEqual(tuple(output.shape), (3, 256, 128))
+        # The pad-then-crop canvas is zero-filled: a random crop over the
+        # padded image carries some black border into the white image.
+        self.assertTrue(bool(torch.any(output == 0.0)))
+
+    def test_clip_train_image_transform_zero_crop_padding_matches_eval_resize(self):
+        transform = CLIPTrainImageTransform(
+            FakeImageProcessor(),
+            flip_prob=0.0,
+            color_jitter=(0.0, 0.0, 0.0, 0.0),
+            erase_prob=0.0,
+            crop_padding=0,
+        )
+        baseline = CLIPImageTransform(FakeImageProcessor())
+        image = Image.new("RGB", (64, 128), "green")
+        image.paste(Image.new("RGB", (64, 32), "red"), (0, 0))
+
+        self.assertTrue(torch.equal(transform(image), baseline(image)))
+
     def test_transformers_clip_image_encoder_calls_get_image_features(self):
         clip = FakeCLIP(projection_dim=2)
         encoder = TransformersCLIPImageEncoder(clip)
