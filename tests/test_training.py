@@ -409,6 +409,25 @@ class Stage2ForwardLayoutTest(unittest.TestCase):
 
         self.assertEqual(set(outputs), {"visual_raw", "bn", "visual", "retrieval"})
 
+    def test_encode_retrieval_validates_mode_before_running_the_image_tower(self):
+        class CountingEncoder(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.calls = 0
+
+            def forward(self, images, camera_ids=None):
+                self.calls += 1
+                return images
+
+        encoder = CountingEncoder()
+        model = _training_model(beta=0.0)
+        model.image_encoder = encoder
+
+        with self.assertRaises(ValueError):
+            model.encode_retrieval(torch.eye(2), torch.tensor([0, 1]), retrieval_mode="bogus")
+
+        self.assertEqual(encoder.calls, 0)
+
     def test_forward_stage2_beta_zero_retrieval_equals_l2n_bn(self):
         head = torch.nn.Linear(2, 2, bias=False)
         with torch.no_grad():

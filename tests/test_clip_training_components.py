@@ -99,6 +99,18 @@ class CLIPTrainingComponentsTest(unittest.TestCase):
 
         self.assertTrue(torch.equal(transform(image), baseline(image)))
 
+    def test_text_encoder_rejects_sequence_longer_than_position_embeddings(self):
+        # tiny config has max_position_embeddings=32; SOT + slots + EOS must fit.
+        clip = _tiny_clip_model()
+
+        with self.assertRaisesRegex(ValueError, "position"):
+            TransformersCLIPTextEncoder(
+                clip,
+                context_length=31,
+                sot_token_id=997,
+                eos_token_id=998,
+            )
+
     def test_transformers_clip_image_encoder_calls_get_image_features(self):
         clip = FakeCLIP(projection_dim=2)
         encoder = TransformersCLIPImageEncoder(clip)

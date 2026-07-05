@@ -50,8 +50,8 @@ class T2CClipModel(torch.nn.Module):
         retrieval_mode: str = FUSED_RETRIEVAL,
     ) -> torch.Tensor:
         """Inference / validation retrieval feature."""
-        bn_features = self.feature_head(self.encode_visual_raw(images, camera_ids))
         mode = require_retrieval_mode(retrieval_mode)
+        bn_features = self.feature_head(self.encode_visual_raw(images, camera_ids))
         if mode == IMAGE_ONLY_RETRIEVAL:
             return l2_normalize(bn_features)
         text = self.encode_inference_text(camera_ids)
@@ -111,6 +111,9 @@ class T2CClipModel(torch.nn.Module):
         image-to-text loss classifies ``visual`` against the precomputed
         identity anchor matrix instead. The parameter is kept so both stage
         forwards share one signature.
+
+        ``bn`` is the feature-head output; with the default ``linear`` head
+        (Identity) it equals ``visual_raw`` bitwise and no batch norm ran.
         """
         _ = person_ids
         visual_raw = self.encode_visual_raw(images, camera_ids)

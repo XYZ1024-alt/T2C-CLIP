@@ -86,7 +86,7 @@ from t2c_clip.training import (
     stage1_alignment_loss_from_visual,
     stage2_loss_breakdown,
 )
-from t2c_clip.transforms import CLIPImageTransform, CLIPTrainImageTransform
+from t2c_clip.transforms import CLIPImageTransform, CLIPTrainImageTransform, DEFAULT_IMAGE_SIZE
 
 DEFAULT_RANKS = (1, 5, 10)
 SUPPORTED_DATASETS = ("market1501", "msmt17")
@@ -117,7 +117,8 @@ class JobDataConfig:
     root: Path
 
 
-DEFAULT_IMAGE_ENCODER_LR = 5e-5
+# CLIP-ReID ViT recipe: ~5e-6 x (batch/64) at the default batch size of 128.
+DEFAULT_IMAGE_ENCODER_LR = 1e-5
 
 
 @dataclass(frozen=True)
@@ -513,7 +514,7 @@ def _job_config_from_args(args: Any) -> CLIPReIDJobConfig:
         triplet_margin=float(args.triplet_margin),
         triplet_metric=str(getattr(args, "triplet_metric", "euclidean")),
         tfc_weight=float(args.tfc_weight),
-        clip_weight=float(getattr(args, "clip_weight", 0.1)),
+        clip_weight=float(getattr(args, "clip_weight", 1.0)),
         id_logit_scale=float(getattr(args, "id_logit_scale", 1.0)),
         label_smoothing=float(getattr(args, "label_smoothing", 0.0)),
         stage1_epochs=int(getattr(args, "stage1_epochs", 0)),
@@ -648,28 +649,42 @@ BACKBONE_PARAMETER_PREFIXES = (
     "retrieval_model.image_encoder.clip_model.vision_model.",
     "retrieval_model.image_encoder.clip_model.visual_projection.",
 )
+# CLIP-ReID-style AdamW weight decay: applied to matrix weights only. Norm
+# parameters and biases (ndim <= 1), the prompt bank, and the SIE embedding
+# train without decay.
+WEIGHT_DECAY = 1e-4
+NO_DECAY_PARAMETER_PREFIXES = (
+    "retrieval_model.prompt_bank.",
+    "retrieval_model.image_encoder.sie_embedding.",
+)
 
 
 def _build_optimizer(model: torch.nn.Module, config: CLIPReIDJobConfig) -> torch.optim.Optimizer:
-    backbone_params: list[torch.nn.Parameter] = []
-    new_params: list[torch.nn.Parameter] = []
+    grouped: dict[tuple[str, bool], list[torch.nn.Parameter]] = {}
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
             continue
-        if name.startswith(BACKBONE_PARAMETER_PREFIXES):
-            backbone_params.append(parameter)
-        else:
-            new_params.append(parameter)
-    if not backbone_params and not new_params:
+        family = "backbone" if name.startswith(BACKBONE_PARAMETER_PREFIXES) else "new"
+        no_decay = parameter.ndim <= 1 or name.startswith(NO_DECAY_PARAMETER_PREFIXES)
+        grouped.setdefault((family, no_decay), []).append(parameter)
+    if not grouped:
         raise ValueError(
             "no trainable parameters were found for the requested stage; "
             "enable at least one of the prompt_bank/classifier/text_encoder"
         )
+    family_lrs = {"backbone": config.image_encoder_lr, "new": config.lr}
     param_groups: list[dict[str, Any]] = []
-    if backbone_params:
-        param_groups.append({"params": backbone_params, "lr": config.image_encoder_lr, "name": "backbone"})
-    if new_params:
-        param_groups.append({"params": new_params, "lr": config.lr, "name": "new"})
+    for family in ("backbone", "new"):
+        for no_decay in (False, True):
+            params = grouped.get((family, no_decay))
+            if not params:
+                continue
+            param_groups.append({
+                "params": params,
+                "lr": family_lrs[family],
+                "weight_decay": 0.0 if no_decay else WEIGHT_DECAY,
+                "name": f"{family}_no_decay" if no_decay else family,
+            })
     return torch.optim.AdamW(param_groups)
 
 
@@ -760,6 +775,9 @@ def _stage_metadata(config: CLIPReIDJobConfig) -> StageMetadata:
             "num_instances": config.num_instances,
             "sie_coe": config.sie_coe,
             "stage1_feature_cache": config.stage1_feature_cache,
+            "image_size": "x".join(str(side) for side in DEFAULT_IMAGE_SIZE),
+            "prompt_template_prefix": PROMPT_TEMPLATE_PREFIX,
+            "prompt_template_suffix": PROMPT_TEMPLATE_SUFFIX,
         }
     )
 

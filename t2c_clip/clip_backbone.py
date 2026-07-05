@@ -107,6 +107,15 @@ class TransformersCLIPTextEncoder(torch.nn.Module):
         self.pad_token_id = int(pad_token_id)
         self.prefix_token_ids = tuple(int(token_id) for token_id in prefix_token_ids)
         self.suffix_token_ids = tuple(int(token_id) for token_id in suffix_token_ids)
+        seq_len = 2 + len(self.prefix_token_ids) + context_length + len(self.suffix_token_ids)
+        max_positions = int(
+            clip_model.text_model.embeddings.position_embedding.weight.shape[0]
+        )
+        if seq_len > max_positions:
+            raise ValueError(
+                f"prompt sequence length {seq_len} (SOT + template + {context_length} "
+                f"slots + EOS) exceeds the CLIP text position embeddings ({max_positions})"
+            )
         self._freeze_unfreeze(trainable_embeddings)
 
     def forward(self, prompt_embeddings: torch.Tensor) -> torch.Tensor:

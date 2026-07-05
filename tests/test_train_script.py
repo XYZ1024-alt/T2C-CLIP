@@ -180,6 +180,26 @@ class TrainScriptTest(unittest.TestCase):
         self.assertEqual(RECORDED_ARGS.triplet_metric, "euclidean")
         self.assertEqual(RECORDED_ARGS.device, "cpu")
 
+    def test_default_hyperparameters_follow_clip_reid_recipe(self):
+        global RECORDED_ARGS
+        RECORDED_ARGS = None
+        with tempfile.TemporaryDirectory() as tmp:
+            checkpoint_dir = Path(tmp) / "checkpoints"
+            main(
+                [
+                    "--job-builder", "tests.test_train_script:recording_training_job",
+                    "--epochs", "1",
+                    "--validation-interval", "1",
+                    "--checkpoint-dir", str(checkpoint_dir),
+                ],
+                progress_factory=lambda iterable, **kwargs: iterable,
+            )
+
+        # CLIP-ReID ViT recipe: image lr ~5e-6 x (batch/64) and an i2t
+        # alignment weight of 1.0.
+        self.assertEqual(RECORDED_ARGS.image_encoder_lr, 1e-5)
+        self.assertEqual(RECORDED_ARGS.clip_weight, 1.0)
+
     def test_main_logs_validation_metrics_when_mlflow_enabled(self):
         with tempfile.TemporaryDirectory() as tmp:
             tracking_db = Path(tmp) / "mlflow" / "tracking.db"
