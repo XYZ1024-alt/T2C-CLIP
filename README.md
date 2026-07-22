@@ -2,8 +2,9 @@
 
 Train2Central-CLIP foundation for Image-to-Image person ReID experiments.
 
-The implementation follows `DESIGN.md` (the consolidated design doc) and
-`docs/2026-06-27-t2c-clip-design.md` (research blueprint). The current
+The implementation follows [DESIGN.md](DESIGN.md) (the consolidated design doc) and
+[docs/2026-06-27-t2c-clip-design.md](docs/2026-06-27-t2c-clip-design.md)
+(research blueprint). The current
 codebase trains a real CLIP dual-stream model with a two-stage pipeline:
 
 - Market-1501 and MSMT17 person/camera parsing.
@@ -31,10 +32,19 @@ codebase trains a real CLIP dual-stream model with a two-stage pipeline:
 
 ## Environment
 
-Use the WSL conda environment named `reid`:
+Use Python 3.10 or newer in an environment with PyTorch, torchvision,
+Transformers, Pillow, NumPy, tqdm, and MLflow installed. The project does not
+assume a particular operating system, Conda installation, environment name, or
+clone location.
+
+All commands in this README are run from the repository root after activating
+your Python environment. Relative output paths such as `checkpoints/`,
+`mlflow/`, and `mlruns/` are therefore created under the repository root.
+
+Run the test suite with:
 
 ```bash
-wsl --cd /mnt/d/Code/T2C-CLIP /home/xyz10/miniconda3/bin/conda run -n reid python -m unittest discover -s tests -v
+python -m unittest discover -s tests -v
 ```
 
 ## Evaluate Extracted Features
@@ -51,7 +61,7 @@ The evaluator expects a `.npz` file with these arrays:
 Run:
 
 ```bash
-wsl --cd /mnt/d/Code/T2C-CLIP /home/xyz10/miniconda3/bin/conda run -n reid python -m t2c_clip.cli.evaluate features.npz --output metrics.json --ranks 1 5 10
+python -m t2c_clip.cli.evaluate path/to/features.npz --output metrics.json --ranks 1 5 10
 ```
 
 The evaluator performs standard Image-to-Image ReID scoring without rerank. Same-identity same-camera gallery samples are excluded for each query.
@@ -74,7 +84,8 @@ The loop calls real `torch.save` and lets training, validation, tqdm, and checkp
 
 ## Train Entrypoint
 
-`scripts/train.py` wires a project-specific training job into `run_training_loop`.
+[scripts/train.py](scripts/train.py) wires a project-specific training job into
+`run_training_loop`.
 The recommended real training builder is `t2c_clip.jobs.clip_reid:build_training_job`,
 which produces a `TwoStageTrainingJob` when `--stage1-epochs > 0` and a single
 Stage-2 `TrainingJob` otherwise.
@@ -89,6 +100,9 @@ Identity prompts present in Stage-1 and Stage-2 training are **never** used
 at inference; `encode_retrieval` only ever composes `global + camera`
 prompts.
 
+`--data-root` must point directly to the dataset root. Replace the
+`path/to/...` values in the commands below with paths valid on your system.
+
 Market-1501 expects the standard directories under `--data-root`:
 
 - `bounding_box_train/`
@@ -98,6 +112,7 @@ Market-1501 expects the standard directories under `--data-root`:
 MSMT17 expects the standard manifests and image folders under `--data-root`:
 
 - `list_train.txt`
+- `list_val.txt`
 - `list_query.txt`
 - `list_gallery.txt`
 - `train/`
@@ -106,10 +121,10 @@ MSMT17 expects the standard manifests and image folders under `--data-root`:
 Run Stage-1 + Stage-2 training:
 
 ```bash
-wsl --cd /mnt/d/Code/T2C-CLIP /home/xyz10/miniconda3/bin/conda run -n reid python scripts/train.py \
+python -m scripts.train \
   --job-builder t2c_clip.jobs.clip_reid:build_training_job \
   --dataset msmt17 \
-  --data-root MSMT17_V1 \
+  --data-root path/to/MSMT17_V1 \
   --clip-model-name openai/clip-vit-base-patch16 \
   --stage1-epochs 20 \
   --epochs 120 \
@@ -130,9 +145,10 @@ wsl --cd /mnt/d/Code/T2C-CLIP /home/xyz10/miniconda3/bin/conda run -n reid pytho
 ```
 
 The MSMT17 command above fine-tunes the CLIP vision encoder during Stage-2
-(see `--image-encoder-lr`). The smaller backbone learning rate
-(`5e-5` by default) keeps the pretrained features from being catastrophically
-forgotten while still letting the ReID losses tune them. The blended
+(see `--image-encoder-lr`). The smaller backbone learning rate (`1e-5` by
+default; the command above explicitly uses `5e-5`) keeps the pretrained
+features from being catastrophically forgotten while still letting the ReID
+losses tune them. The blended
 text branch ramp goes from `0` at epoch 1 (pure image feature) to the
 configured `--beta` at `--beta-warmup-epochs + 1`, so the random
 camera-conditioned text feature does not pull the retrieval feature below
@@ -147,7 +163,7 @@ on `f_eval`).
 ```bash
 python -m scripts.train \
   --job-builder t2c_clip.jobs.clip_reid:build_training_job \
-  --dataset msmt17 --data-root MSMT17_V1 \
+  --dataset msmt17 --data-root path/to/MSMT17_V1 \
   --clip-model-name openai/clip-vit-base-patch16 \
   --seed 42 \
   --stage1-epochs 120 --epochs 60 --validation-interval 5 \
@@ -180,7 +196,7 @@ Useful training arguments:
 - `--dataset market1501|msmt17`
 - `--data-root PATH`
 - `--clip-model-name openai/clip-vit-base-patch16`
-- `--clip-checkpoint /path/to/clip_state.pth` (optional local CLIP/ReID
+- `--clip-checkpoint path/to/clip_state.pth` (optional local CLIP/ReID
   checkpoint; missing, unexpected, or incomplete keys fail at startup)
 - `--stage1-epochs N` (Stage-1 prompt alignment epochs; `0` skips Stage-1)
 - `--epochs N` (Stage-2 ReID training epochs)
@@ -207,7 +223,6 @@ Useful training arguments:
 - `--tfc-momentum 0.5`
 - `--triplet-margin 0.3`
 - `--tfc-weight 1.0`
-- `--clip-weight 0.1`
 - `--id-logit-scale 1.0` (legacy knob from when ID logits were cosine
   similarities on unit-norm features; the BNNeck logits are free-scale, so
   leave it at the 1.0 no-op default)
@@ -241,18 +256,18 @@ Useful training arguments:
 - `--sanity-gate-factor 1.5`
 
 Training uses identity-balanced batches for batch-hard triplet loss. Each
-train batch samples two images per identity, so `--batch-size 64` means
-`32 identities x 2 images`. If the training split cannot provide enough
-identities with positive pairs for the configured batch size, startup
-fails with an explicit error.
+train batch samples `--num-instances` images per identity (default: `2`), so
+the defaults mean `--batch-size 64` is `32 identities x 2 images`. If the
+training split cannot provide enough identities with the requested number of
+images for the configured batch size, startup fails with an explicit error.
 
 Add `--enable-mlflow` to initialize the SQLite-backed MLflow store before training:
 
 ```bash
-wsl --cd /mnt/d/Code/T2C-CLIP /home/xyz10/miniconda3/bin/conda run -n reid python scripts/train.py \
+python -m scripts.train \
   --job-builder t2c_clip.jobs.clip_reid:build_training_job \
   --dataset msmt17 \
-  --data-root MSMT17_V1 \
+  --data-root path/to/MSMT17_V1 \
   --epochs 120 \
   --validation-interval 5 \
   --checkpoint-dir checkpoints \
@@ -286,13 +301,13 @@ Run params recorded with `--enable-mlflow`:
 Initialize the local SQLite-backed MLflow store:
 
 ```bash
-wsl --cd /mnt/d/Code/T2C-CLIP /home/xyz10/miniconda3/bin/conda run -n reid python -m t2c_clip.cli.mlflow --tracking-db mlflow/t2c_clip.db --artifact-root mlruns --experiment-name T2C-CLIP
+python -m t2c_clip.cli.mlflow --tracking-db mlflow/t2c_clip.db --artifact-root mlruns --experiment-name T2C-CLIP
 ```
 
 Start the MLflow UI on port 6006:
 
 ```bash
-wsl --cd /mnt/d/Code/T2C-CLIP /home/xyz10/miniconda3/bin/conda run -n reid mlflow ui --backend-store-uri sqlite:///mlflow/t2c_clip.db --default-artifact-root mlruns --host 127.0.0.1 --port 6006
+mlflow ui --backend-store-uri sqlite:///mlflow/t2c_clip.db --default-artifact-root mlruns --host 127.0.0.1 --port 6006
 ```
 
 The SQLite database and artifact directory are local runtime outputs and are ignored by git.
@@ -317,10 +332,10 @@ Before running 120-epoch Stage-2 training, run a short sanity check on
 MSMT17 to validate the Stage-1 + Stage-2 pipeline:
 
 ```bash
-wsl --cd /mnt/d/Code/T2C-CLIP /home/xyz10/miniconda3/bin/conda run -n reid python scripts/train.py \
+python -m scripts.train \
   --job-builder t2c_clip.jobs.clip_reid:build_training_job \
   --dataset msmt17 \
-  --data-root MSMT17_V1 \
+  --data-root path/to/MSMT17_V1 \
   --clip-model-name openai/clip-vit-base-patch16 \
   --stage1-epochs 2 \
   --epochs 5 \
@@ -347,10 +362,12 @@ Sanity gate:
 2. Stage-1 `clip_loss` clearly below `ln(batch_size)`.
 3. Stage-2 `reid_loss` clearly below `ln(num_train_ids)`.
 4. Stage-2 mAP after 5/10 epochs must not stay pinned to the random floor.
-5. **Inference path never uses identity prompts** — verified by unit tests
-   (`test_features_prompts`, `test_evaluation_model`,
-   `test_two_stage_training`) and by the `encode_retrieval` implementation
-   in `t2c_clip/model.py`.
+5. **Inference path never uses identity prompts** - verified by unit tests
+   ([tests/test_features_prompts.py](tests/test_features_prompts.py),
+   [tests/test_evaluation_model.py](tests/test_evaluation_model.py), and
+   [tests/test_two_stage_training.py](tests/test_two_stage_training.py)) and by
+   the `encode_retrieval` implementation in
+   [t2c_clip/model.py](t2c_clip/model.py).
 
 If Stage-2 `reid_loss` stays near `ln(num_train_ids)` while backbone gradients
 are non-zero, normalized retrieval logits are likely too small for the ID
