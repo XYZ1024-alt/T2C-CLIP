@@ -1,0 +1,16 @@
+[project]
+name = "t2c-clip"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "torch>=2.13.0",
+    "torchvision>=0.28.0",
+    "tqdm>=4.66.5",
+    "transformers>=5.14.1",
+    "wandb>=0.28.1",
+]
+
+[[tool.uv.index]]
+url = "https://mirrors.nju.edu.cn/pytorch/whl/cu132"
