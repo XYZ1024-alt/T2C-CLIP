@@ -13,6 +13,4 @@ checkpoints/
 runs/
 output/
 tmp/
-mlflow/*.db
-mlflow/*.db-*
-mlruns/
+wandb/

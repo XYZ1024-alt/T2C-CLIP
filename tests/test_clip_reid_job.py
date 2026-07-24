@@ -97,6 +97,8 @@ class CLIPReIDJobTest(unittest.TestCase):
         self.assertIn("triplet_loss", train_metrics)
         self.assertIn("tfc_loss", train_metrics)
         self.assertIn("lr", train_metrics)
+        self.assertIsNotNone(job.stage_metadata)
+        self.assertEqual(job.stage_metadata.get("dataset"), "market1501")
         self.assertGreaterEqual(metrics.map, 0.0)
         self.assertIn(1, metrics.cmc)
 

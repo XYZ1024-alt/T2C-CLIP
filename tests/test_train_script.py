@@ -4,13 +4,13 @@ import copy
 import io
 import tempfile
 import unittest
+from unittest import mock
 
-from mlflow.tracking import MlflowClient
 import torch
 
-from scripts.train import TrainingJob, main
+from scripts.train import StageMetadata, TrainingJob, main
 from t2c_clip.evaluation import ReIDMetrics
-from t2c_clip.mlflow import sqlite_tracking_uri
+from t2c_clip.wandb import WandbConfig, WandbTracker
 
 RECORDED_ARGS = None
 RECORDED_RNG_STATE = None
@@ -44,7 +44,7 @@ class TrainScriptTest(unittest.TestCase):
             # Run 2 epochs to produce a last.pth
             main(
                 [
-                    "--job-builder", "tests.test_train_script:build_training_job",
+                    "--job-builder", f"{__name__}:build_training_job",
                     "--epochs", "2",
                     "--validation-interval", "1",
                     "--checkpoint-dir", str(checkpoint_dir),
@@ -54,7 +54,7 @@ class TrainScriptTest(unittest.TestCase):
 
             exit_code = main(
                 [
-                    "--job-builder", "tests.test_train_script:recording_epoch_builder",
+                    "--job-builder", f"{__name__}:recording_epoch_builder",
                     "--epochs", "4",
                     "--validation-interval", "1",
                     "--checkpoint-dir", str(checkpoint_dir),
@@ -74,7 +74,7 @@ class TrainScriptTest(unittest.TestCase):
             checkpoint_dir = Path(tmp) / "checkpoints"
             main(
                 [
-                    "--job-builder", "tests.test_train_script:build_training_job",
+                    "--job-builder", f"{__name__}:build_training_job",
                     "--epochs", "2",
                     "--validation-interval", "1",
                     "--checkpoint-dir", str(checkpoint_dir),
@@ -85,7 +85,7 @@ class TrainScriptTest(unittest.TestCase):
 
             main(
                 [
-                    "--job-builder", "tests.test_train_script:recording_epoch_builder",
+                    "--job-builder", f"{__name__}:recording_epoch_builder",
                     "--epochs", "3",
                     "--validation-interval", "1",
                     "--checkpoint-dir", str(checkpoint_dir),
@@ -106,7 +106,7 @@ class TrainScriptTest(unittest.TestCase):
             # declining mAP: epoch 1 scores 0.9 and stays the all-time best.
             main(
                 [
-                    "--job-builder", "tests.test_train_script:declining_map_builder",
+                    "--job-builder", f"{__name__}:declining_map_builder",
                     "--epochs", "2",
                     "--validation-interval", "1",
                     "--checkpoint-dir", str(checkpoint_dir),
@@ -116,7 +116,7 @@ class TrainScriptTest(unittest.TestCase):
 
             main(
                 [
-                    "--job-builder", "tests.test_train_script:declining_map_builder",
+                    "--job-builder", f"{__name__}:declining_map_builder",
                     "--epochs", "3",
                     "--validation-interval", "1",
                     "--checkpoint-dir", str(checkpoint_dir),
@@ -142,7 +142,7 @@ class TrainScriptTest(unittest.TestCase):
             exit_code = main(
                 [
                     "--job-builder",
-                    "tests.test_train_script:build_training_job",
+                    f"{__name__}:build_training_job",
                     "--epochs",
                     "2",
                     "--validation-interval",
@@ -187,7 +187,7 @@ class TrainScriptTest(unittest.TestCase):
             checkpoint_dir = Path(tmp) / "checkpoints"
             main(
                 [
-                    "--job-builder", "tests.test_train_script:recording_training_job",
+                    "--job-builder", f"{__name__}:recording_training_job",
                     "--epochs", "1",
                     "--validation-interval", "1",
                     "--checkpoint-dir", str(checkpoint_dir),
@@ -200,43 +200,103 @@ class TrainScriptTest(unittest.TestCase):
         self.assertEqual(RECORDED_ARGS.image_encoder_lr, 1e-5)
         self.assertEqual(RECORDED_ARGS.clip_weight, 1.0)
 
-    def test_main_logs_validation_metrics_when_mlflow_enabled(self):
+    def test_main_logs_validation_metrics_when_wandb_enabled(self):
+        run = FakeWandbRun()
+        captured: list[tuple[WandbConfig, str]] = []
+
+        @contextlib.contextmanager
+        def fake_start_wandb_run(config: WandbConfig, run_name: str):
+            captured.append((config, run_name))
+            yield WandbTracker(run)
+
         with tempfile.TemporaryDirectory() as tmp:
-            tracking_db = Path(tmp) / "mlflow" / "tracking.db"
-            artifact_root = Path(tmp) / "mlruns"
+            wandb_dir = Path(tmp) / "wandb-data"
             checkpoint_dir = Path(tmp) / "checkpoints"
-            exit_code = main(
-                [
-                    "--job-builder",
-                    f"{__name__}:build_training_job",
-                    "--epochs",
-                    "1",
-                    "--validation-interval",
-                    "1",
-                    "--checkpoint-dir",
-                    str(checkpoint_dir),
-                    "--enable-mlflow",
-                    "--tracking-db",
-                    str(tracking_db),
-                    "--artifact-root",
-                    str(artifact_root),
-                    "--experiment-name",
-                    "T2C-CLIP-TrainScript-Test",
-                    "--run-name",
+            with mock.patch("scripts.train.start_wandb_run", new=fake_start_wandb_run):
+                exit_code = main(
+                    [
+                        "--job-builder",
+                        f"{__name__}:build_training_job",
+                        "--epochs",
+                        "1",
+                        "--validation-interval",
+                        "1",
+                        "--checkpoint-dir",
+                        str(checkpoint_dir),
+                        "--enable-wandb",
+                        "--wandb-project",
+                        "T2C-CLIP-TrainScript-Test",
+                        "--wandb-entity",
+                        "test-team",
+                        "--wandb-mode",
+                        "offline",
+                        "--wandb-dir",
+                        str(wandb_dir),
+                        "--run-name",
+                        "train-script-test",
+                    ],
+                    progress_factory=lambda iterable, **kwargs: iterable,
+                )
+
+        step_history = [payload for payload in run.logged if "stage2_train_step" in payload]
+        epoch_history = [payload for payload in run.logged if "stage2_epoch" in payload]
+        validation_history = [payload for payload in run.logged if "validation_epoch" in payload]
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            captured,
+            [
+                (
+                    WandbConfig(
+                        project="T2C-CLIP-TrainScript-Test",
+                        entity="test-team",
+                        mode="offline",
+                        directory=wandb_dir,
+                    ),
                     "train-script-test",
-                ],
-                progress_factory=lambda iterable, **kwargs: iterable,
-            )
-            runs = _runs_for_experiment(tracking_db, "T2C-CLIP-TrainScript-Test")
-            step_history = _metric_history(tracking_db, runs[0].info.run_id, "stage2_train_step_loss")
+                )
+            ],
+        )
+        self.assertEqual([payload["stage2_train_step"] for payload in step_history], [1, 2])
+        self.assertEqual([payload["stage2_train_step_loss"] for payload in step_history], [1.1, 1.2])
+        self.assertEqual(epoch_history[0]["stage2_train_loss"], 1.0)
+        self.assertEqual(epoch_history[0]["stage2_lr"], 0.1)
+        self.assertEqual(validation_history[0]["mAP"], 0.1)
+        self.assertEqual(validation_history[0]["rank_1"], 0.1)
+        self.assertEqual(run.config["dataset"], "fixture")
+
+    def test_tracking_disabled_does_not_load_wandb(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch("t2c_clip.wandb._load_wandb") as load_wandb:
+                exit_code = main(
+                    [
+                        "--job-builder",
+                        f"{__name__}:build_training_job",
+                        "--epochs",
+                        "1",
+                        "--validation-interval",
+                        "1",
+                        "--checkpoint-dir",
+                        str(Path(tmp) / "checkpoints"),
+                    ],
+                    progress_factory=lambda iterable, **kwargs: iterable,
+                )
 
         self.assertEqual(exit_code, 0)
-        self.assertEqual(runs[0].data.metrics["stage2_train_loss"], 1.0)
-        self.assertEqual(runs[0].data.metrics["stage2_lr"], 0.1)
-        self.assertEqual([point.step for point in step_history], [1, 2])
-        self.assertEqual([point.value for point in step_history], [1.1, 1.2])
-        self.assertEqual(runs[0].data.metrics["mAP"], 0.1)
-        self.assertEqual(runs[0].data.metrics["rank_1"], 0.1)
+        load_wandb.assert_not_called()
+
+    def test_legacy_tracking_flag_is_rejected(self):
+        legacy_flag = "--enable-" + "ml" + "flow"
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as context:
+                main(
+                    [
+                        "--job-builder",
+                        f"{__name__}:build_training_job",
+                        legacy_flag,
+                    ]
+                )
+
+        self.assertNotEqual(context.exception.code, 0)
 
 
 def build_training_job(args) -> TrainingJob:
@@ -255,7 +315,13 @@ def build_training_job(args) -> TrainingJob:
     def validate(epoch: int) -> ReIDMetrics:
         return ReIDMetrics(map=epoch / 10.0, cmc={1: epoch / 10.0})
 
-    return TrainingJob(model, optimizer, train_one_epoch, validate)
+    return TrainingJob(
+        model,
+        optimizer,
+        train_one_epoch,
+        validate,
+        stage_metadata=StageMetadata({"dataset": "fixture", "unused": None}),
+    )
 
 
 def recording_training_job(args) -> TrainingJob:
@@ -316,12 +382,19 @@ def _recording_job_args(checkpoint_dir: Path) -> list[str]:
     ]
 
 
-def _runs_for_experiment(tracking_db: Path, experiment_name: str):
-    client = MlflowClient(tracking_uri=sqlite_tracking_uri(tracking_db))
-    experiment = client.get_experiment_by_name(experiment_name)
-    return client.search_runs([experiment.experiment_id])
+class FakeWandbConfig(dict):
+    def update(self, values=None, *, allow_val_change: bool = False):
+        super().update({} if values is None else values)
 
 
-def _metric_history(tracking_db: Path, run_id: str, metric_name: str):
-    client = MlflowClient(tracking_uri=sqlite_tracking_uri(tracking_db))
-    return client.get_metric_history(run_id, metric_name)
+class FakeWandbRun:
+    def __init__(self):
+        self.config = FakeWandbConfig()
+        self.logged: list[dict] = []
+        self.defined_metrics: list[tuple[str, dict]] = []
+
+    def define_metric(self, name: str, **kwargs) -> None:
+        self.defined_metrics.append((name, dict(kwargs)))
+
+    def log(self, payload) -> None:
+        self.logged.append(dict(payload))

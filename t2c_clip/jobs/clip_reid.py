@@ -416,6 +416,7 @@ def build_training_job(
         config, shared_model, loaders, data.num_train_ids,
         stage1_feature_cache=_build_stage1_feature_cache(config, data),
     )
+    metadata = _stage_metadata(config)
     stage2_job = TrainingJob(
         model=shared_model,
         optimizer=optimizer_stage2,
@@ -429,6 +430,7 @@ def build_training_job(
             beta_schedule=stage2_beta_schedule,
             report_rerank=config.report_rerank,
         )),
+        stage_metadata=metadata,
     )
     if config.stage1_epochs <= 0:
         return stage2_job
@@ -441,7 +443,7 @@ def build_training_job(
     return TwoStageTrainingJob(
         stage1=stage1_job,
         stage2=stage2_job,
-        stage_metadata=_stage_metadata(config),
+        stage_metadata=metadata,
     )
 
 
@@ -738,7 +740,7 @@ def _stage_metadata(config: CLIPReIDJobConfig) -> StageMetadata:
     Returning a ``StageMetadata`` (rather than a raw dict) keeps
     ``TwoStageTrainingJob.stage_metadata`` typing consistent and stops
     ``train.py`` from mistaking ``dict.values`` (a bound method) for a
-    mapping when it logs stage params to MLflow.
+    mapping when it records stage config in the tracking backend.
     """
     return StageMetadata(
         values={
