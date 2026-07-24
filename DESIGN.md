@@ -68,7 +68,8 @@ f_v + beta * f_t
 - `model.py`: T2C-CLIP 前向路径，区分 Stage-1、Stage-2、Inference。
 - `training.py`: loss 组合与训练阶段输入输出结构。
 - `jobs/clip_reid.py`: Market-1501/MSMT17 数据加载、模型构建、训练回调、验证回调。
-- `loops.py`: epoch/batch 进度、checkpoint、验证调度、MLflow 回调。
+- `loops.py`: backend-agnostic epoch/batch 进度、checkpoint、验证调度与 logger 回调。
+- `wandb.py`: Weights & Biases run 生命周期、配置和 stage-aware 指标适配。
 
 ## 5. 数据与评估协议
 
@@ -357,7 +358,7 @@ TFC 只用于训练，不参与推理和验证。
 `scripts/train.py` 应支持：
 
 ```bash
-python scripts/train.py \
+python -m scripts.train \
   --job-builder t2c_clip.jobs.clip_reid:build_training_job \
   --dataset msmt17 \
   --data-root MSMT17_V1 \
@@ -374,10 +375,9 @@ python scripts/train.py \
   --clip-weight 0.1 \
   --tfc-weight 1.0 \
   --freeze-image-encoder-stage1 \
-  --enable-mlflow \
-  --tracking-db mlflow/t2c_clip.db \
-  --artifact-root mlruns \
-  --experiment-name T2C-CLIP \
+  --enable-wandb \
+  --wandb-project T2C-CLIP \
+  --wandb-mode online \
   --run-name msmt17-stage1-stage2
 ```
 
@@ -390,6 +390,14 @@ python scripts/train.py \
 - `--tfc-weight`: Stage-2 中 TFC 损失权重。
 - `--beta`: 图文特征融合系数。
 - `--freeze-image-encoder-stage1`: Stage-1 冻结图像编码器。
+- `--enable-wandb`: 启用实验追踪；关闭时不导入 wandb。
+- `--wandb-project` / `--wandb-entity`: 选择线上项目与可选团队。
+- `--wandb-mode`: 默认 `online`，也可显式设为 `offline` 后运行
+  `wandb sync wandb/offline-run-*`。
+- `--wandb-dir`: 可选的本地 wandb 元数据根目录。
+
+在线认证或初始化失败必须终止训练，不得静默切换到离线模式。checkpoint
+继续只保存在本地，不通过 wandb artifact 上传。
 
 ## 11. 进度条与日志
 
@@ -408,7 +416,7 @@ stage2 epoch 5/120: loss=... reid_loss=... triplet_loss=... clip_loss=... tfc_lo
 stage2 epoch=5 mAP=... rank1=... rank5=... rank10=... best_mAP=... best=True
 ```
 
-### 11.2 MLflow 指标
+### 11.2 Weights & Biases 指标
 
 Stage-1 batch step：
 
@@ -459,7 +467,20 @@ best_mAP
 is_best
 ```
 
-MLflow params/tags 应记录：
+wandb 为不同日志频率记录独立步进轴：
+
+```text
+stage1_train_step
+stage1_epoch
+stage2_train_step
+stage2_epoch
+validation_epoch
+```
+
+各业务指标通过 `define_metric` 绑定到对应轴，写入时不设置 wandb
+全局 `step`，避免两阶段计数重置导致指标被丢弃。
+
+wandb config 应记录：
 
 ```text
 dataset
@@ -569,9 +590,9 @@ TFC 消融：
 3. Stage-1 只训练图文 prompt alignment，不计算 ReID/TFC。
 4. Stage-2 计算 ReID、triplet、weighted CLIP alignment、weighted TFC。
 5. 验证路径不使用 identity prompt。
-6. MLflow 同时记录 stage-aware batch step、epoch 平均和验证指标。
+6. wandb 同时记录 stage-aware batch step、epoch 平均和验证指标。
 7. `best.pth` 和 `last.pth` 语义稳定。
-8. 测试覆盖 text encoder path、Stage-1、Stage-2、inference prompt、MLflow 指标、checkpoint。
+8. 测试覆盖 text encoder path、Stage-1、Stage-2、inference prompt、wandb 指标、checkpoint。
 
 ## 16. 推荐实施顺序
 
@@ -580,27 +601,23 @@ TFC 消融：
 3. 改 `T2CClipModel`，增加 `forward_stage1`、`forward_stage2`、`encode_retrieval`。
 4. 改 loss 输入结构，加入 `clip_weight`。
 5. 改真实 training job，支持 Stage-1 + Stage-2。
-6. 改训练入口参数和 MLflow stage-aware logging。
+6. 改训练入口参数和 wandb stage-aware logging。
 7. 补 image-only baseline 评估命令，作为 sanity check。
 8. 更新 README 训练流程。
 9. 跑短程 sanity check，再跑完整训练。
 
 ## 17. 预期训练流程
 
-启动 MLflow：
+登录 Weights & Biases（也可通过 `WANDB_API_KEY` 配置服务器环境）：
 
 ```bash
-mlflow ui \
-  --backend-store-uri sqlite:///mlflow/t2c_clip.db \
-  --default-artifact-root mlruns \
-  --host 127.0.0.1 \
-  --port 6006
+wandb login
 ```
 
 训练：
 
 ```bash
-python scripts/train.py \
+python -m scripts.train \
   --job-builder t2c_clip.jobs.clip_reid:build_training_job \
   --dataset msmt17 \
   --data-root MSMT17_V1 \
@@ -617,17 +634,16 @@ python scripts/train.py \
   --clip-weight 0.1 \
   --tfc-weight 1.0 \
   --freeze-image-encoder-stage1 \
-  --enable-mlflow \
-  --tracking-db mlflow/t2c_clip.db \
-  --artifact-root mlruns \
-  --experiment-name T2C-CLIP \
+  --enable-wandb \
+  --wandb-project T2C-CLIP \
+  --wandb-mode online \
   --run-name msmt17-full-t2c
 ```
 
 短程调试建议先跑：
 
 ```bash
-python scripts/train.py \
+python -m scripts.train \
   --job-builder t2c_clip.jobs.clip_reid:build_training_job \
   --dataset msmt17 \
   --data-root MSMT17_V1 \
@@ -644,10 +660,9 @@ python scripts/train.py \
   --clip-weight 0.1 \
   --tfc-weight 1.0 \
   --freeze-image-encoder-stage1 \
-  --enable-mlflow \
-  --tracking-db mlflow/t2c_clip.db \
-  --artifact-root mlruns \
-  --experiment-name T2C-CLIP \
+  --enable-wandb \
+  --wandb-project T2C-CLIP \
+  --wandb-mode online \
   --run-name sanity-msmt17
 ```
 

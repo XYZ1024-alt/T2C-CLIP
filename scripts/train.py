@@ -4,7 +4,7 @@ Supports two-stage training (Stage-1 prompt alignment then Stage-2 ReID
 training) when the job builder returns a :class:`TwoStageTrainingJob`.
 
 For single-stage job builders (e.g. unit test fixtures), falls back to the
-legacy single-loop path with stage-aware MLflow logging treated as the
+legacy single-loop path with stage-aware wandb logging treated as the
 Stage-2 metrics.
 """
 
@@ -30,12 +30,13 @@ from t2c_clip.loops import (
     TrainingLoopConfig,
     run_training_loop,
 )
-from t2c_clip.mlflow import (
-    MLflowSQLiteConfig,
-    log_reid_metrics_to_mlflow,
-    log_stage_params_to_mlflow,
-    make_stage_metric_loggers,
-    start_mlflow_sqlite_run,
+from t2c_clip.wandb import (
+    DEFAULT_WANDB_MODE,
+    DEFAULT_WANDB_PROJECT,
+    WANDB_MODES,
+    WandbConfig,
+    WandbTracker,
+    start_wandb_run,
 )
 from t2c_clip.retrieval import SUPPORTED_RETRIEVAL_MODES
 
@@ -43,9 +44,6 @@ DEFAULT_TOTAL_EPOCHS = 120
 DEFAULT_VALIDATION_INTERVAL = 5
 DEFAULT_STAGE1_EPOCHS = 0
 DEFAULT_CHECKPOINT_DIR = Path("checkpoints")
-DEFAULT_TRACKING_DB = Path("mlflow") / "t2c_clip.db"
-DEFAULT_ARTIFACT_ROOT = Path("mlruns")
-DEFAULT_EXPERIMENT_NAME = "T2C-CLIP"
 DEFAULT_RUN_NAME = "train"
 DEFAULT_CLIP_MODEL_NAME = "openai/clip-vit-base-patch16"
 DEFAULT_BATCH_SIZE = 64
@@ -85,6 +83,7 @@ class TrainingJob:
     optimizer: torch.optim.Optimizer | None
     train_one_epoch: TrainOneEpoch
     validate: ValidateEpoch
+    stage_metadata: StageMetadata | Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -106,7 +105,7 @@ def main(argv: Sequence[str] | None = None, progress_factory: ProgressFactory | 
     args = _build_parser().parse_args(argv)
     args.stage2_first_epoch = args.stage1_epochs + 1
     _seed_random_generators(args.seed)
-    with _mlflow_context_if_requested(args):
+    with _wandb_context_if_requested(args) as tracker:
         job = _load_job_builder(args.job_builder)(args)
         resume_state = _load_resume_state(args.resume)
         # Use a structural check rather than ``isinstance(job, TwoStageTrainingJob)``.
@@ -117,9 +116,9 @@ def main(argv: Sequence[str] | None = None, progress_factory: ProgressFactory | 
         # False and the two-stage job would be wrongly dispatched to the single
         # loop. Duck-typing on the public stage attributes sidesteps that.
         if _is_two_stage_job(job):
-            _run_two_stage_loop(job, args, progress_factory, resume_state)
+            _run_two_stage_loop(job, args, progress_factory, resume_state, tracker)
         else:
-            _run_single_loop(job, args, progress_factory, resume_state)
+            _run_single_loop(job, args, progress_factory, resume_state, tracker)
     return 0
 
 
@@ -160,7 +159,7 @@ def _stage_metadata_values(metadata: Any) -> dict[str, Any]:
     Job builders historically returned either a ``StageMetadata`` (with a
     ``.values`` dict attribute) or a raw ``dict`` (whose ``.values`` is the
     ``dict.values`` method, not the values themselves). Normalize both shapes
-    so the MLflow logger always receives a mapping and never a bound method.
+    so the tracking adapter always receives a mapping and never a bound method.
     """
     if isinstance(metadata, Mapping):
         return dict(metadata)
@@ -182,10 +181,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint-dir", type=Path, default=DEFAULT_CHECKPOINT_DIR)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--seed", type=int)
-    parser.add_argument("--enable-mlflow", action="store_true")
-    parser.add_argument("--tracking-db", type=Path, default=DEFAULT_TRACKING_DB)
-    parser.add_argument("--artifact-root", type=Path, default=DEFAULT_ARTIFACT_ROOT)
-    parser.add_argument("--experiment-name", default=DEFAULT_EXPERIMENT_NAME)
+    parser.add_argument("--enable-wandb", action="store_true")
+    parser.add_argument("--wandb-project", default=DEFAULT_WANDB_PROJECT)
+    parser.add_argument("--wandb-entity")
+    parser.add_argument("--wandb-mode", choices=WANDB_MODES, default=DEFAULT_WANDB_MODE)
+    parser.add_argument("--wandb-dir", type=Path)
     parser.add_argument("--run-name", default=DEFAULT_RUN_NAME)
     _add_project_training_args(parser)
     return parser
@@ -248,11 +248,16 @@ def _add_project_training_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--sanity-gate-factor", type=float, default=DEFAULT_SANITY_GATE_FACTOR)
 
 
-def _mlflow_context_if_requested(args: argparse.Namespace):
-    if not args.enable_mlflow:
-        return nullcontext()
-    config = MLflowSQLiteConfig(args.tracking_db, args.artifact_root, args.experiment_name)
-    return start_mlflow_sqlite_run(config, run_name=args.run_name)
+def _wandb_context_if_requested(args: argparse.Namespace):
+    if not args.enable_wandb:
+        return nullcontext(None)
+    config = WandbConfig(
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        mode=args.wandb_mode,
+        directory=args.wandb_dir,
+    )
+    return start_wandb_run(config, run_name=args.run_name)
 
 
 def _run_two_stage_loop(
@@ -260,6 +265,7 @@ def _run_two_stage_loop(
     args: argparse.Namespace,
     progress_factory: ProgressFactory | None,
     resume_state: dict[str, Any] | None = None,
+    tracker: WandbTracker | None = None,
 ) -> None:
     completed_stage2_epochs = 0
     if resume_state is not None:
@@ -268,10 +274,10 @@ def _run_two_stage_loop(
             raise ValueError(f"only stage2 checkpoints can be resumed, got stage: {resume_stage!r}")
         _restore_job_state(job.stage2, resume_state)
         completed_stage2_epochs = int(resume_state["epoch"]) - args.stage1_epochs
-    if args.enable_mlflow and job.stage_metadata is not None:
-        log_stage_params_to_mlflow(_stage_metadata_values(job.stage_metadata))
-    stage1_loggers = _stage_metric_loggers_for("stage1", args)
-    stage2_loggers = _stage_metric_loggers_for("stage2", args)
+    if tracker is not None and job.stage_metadata is not None:
+        tracker.log_stage_config(_stage_metadata_values(job.stage_metadata))
+    stage1_loggers = _stage_metric_loggers_for("stage1", tracker)
+    stage2_loggers = _stage_metric_loggers_for("stage2", tracker)
     stage1_config = TrainingLoopConfig(
         total_epochs=args.stage1_epochs,
         validation_interval=STAGE1_DISABLE_VALIDATION_INTERVAL,
@@ -313,7 +319,7 @@ def _run_two_stage_loop(
         train_one_epoch=job.stage2.train_one_epoch,
         validate=job.stage2.validate,
         progress_factory=_progress(progress_factory),
-        metric_logger=_metric_logger_if_requested(args),
+        metric_logger=_metric_logger_if_requested(tracker),
         train_metric_logger=stage2_loggers[0],
         train_step_metric_logger=stage2_loggers[1],
         initial_best_map=_resume_best_map(resume_state),
@@ -325,12 +331,15 @@ def _run_single_loop(
     args: argparse.Namespace,
     progress_factory: ProgressFactory | None,
     resume_state: dict[str, Any] | None = None,
+    tracker: WandbTracker | None = None,
 ) -> None:
     completed_epochs = 0
     if resume_state is not None:
         _restore_job_state(job, resume_state)
         completed_epochs = int(resume_state["epoch"])
-    loggers = _stage_metric_loggers_for("stage2", args)
+    if tracker is not None and job.stage_metadata is not None:
+        tracker.log_stage_config(_stage_metadata_values(job.stage_metadata))
+    loggers = _stage_metric_loggers_for("stage2", tracker)
     config = TrainingLoopConfig(
         total_epochs=args.epochs - completed_epochs,
         validation_interval=args.validation_interval,
@@ -348,7 +357,7 @@ def _run_single_loop(
         train_one_epoch=job.train_one_epoch,
         validate=job.validate,
         progress_factory=_progress(progress_factory),
-        metric_logger=_metric_logger_if_requested(args),
+        metric_logger=_metric_logger_if_requested(tracker),
         train_metric_logger=loggers[0],
         train_step_metric_logger=loggers[1],
         initial_best_map=_resume_best_map(resume_state),
@@ -366,16 +375,19 @@ def _default_progress_factory(iterable: Iterable[int], **kwargs) -> Iterable[int
     return tqdm(iterable, **kwargs)
 
 
-def _stage_metric_loggers_for(stage: str, args: argparse.Namespace) -> tuple[TrainMetricLogger | None, TrainStepMetricLogger | None]:
-    if not args.enable_mlflow:
+def _stage_metric_loggers_for(
+    stage: str,
+    tracker: WandbTracker | None,
+) -> tuple[TrainMetricLogger | None, TrainStepMetricLogger | None]:
+    if tracker is None:
         return None, None
-    return make_stage_metric_loggers(stage)
+    return tracker.make_stage_metric_loggers(stage)
 
 
-def _metric_logger_if_requested(args: argparse.Namespace) -> MetricLogger | None:
-    if not args.enable_mlflow:
+def _metric_logger_if_requested(tracker: WandbTracker | None) -> MetricLogger | None:
+    if tracker is None:
         return None
-    return log_reid_metrics_to_mlflow
+    return tracker.log_reid_metrics
 
 
 def _load_job_builder(spec: str) -> JobBuilder:

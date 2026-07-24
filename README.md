@@ -25,7 +25,7 @@ codebase trains a real CLIP dual-stream model with a two-stage pipeline:
 - tqdm-based training loop scheduling with configurable mAP validation
   intervals and stage-aware checkpoint naming.
 - `best.pth`, `last.pth` (Stage-2) plus `stage1_last.pth` (Stage-1).
-- MLflow tracking with stage-aware batch-step / epoch / validation metrics.
+- Weights & Biases tracking with stage-aware batch-step / epoch / validation metrics.
 - No-rerank cosine ReID evaluation.
 - Transformers CLIP-backed Market-1501/MSMT17 training job builder.
 - `.npz` no-rerank evaluation CLI.
@@ -33,13 +33,13 @@ codebase trains a real CLIP dual-stream model with a two-stage pipeline:
 ## Environment
 
 Use Python 3.10 or newer in an environment with PyTorch, torchvision,
-Transformers, Pillow, NumPy, tqdm, and MLflow installed. The project does not
-assume a particular operating system, Conda installation, environment name, or
-clone location.
+Transformers, Pillow, NumPy, and tqdm installed. Install `wandb` when experiment
+tracking is enabled. The project does not assume a particular operating system,
+Conda installation, environment name, or clone location.
 
 All commands in this README are run from the repository root after activating
-your Python environment. Relative output paths such as `checkpoints/`,
-`mlflow/`, and `mlruns/` are therefore created under the repository root.
+your Python environment. Relative output paths such as `checkpoints/` and
+`wandb/` are therefore created under the repository root.
 
 Run the test suite with:
 
@@ -176,7 +176,8 @@ python -m scripts.train \
   --freeze-prompt-bank-stage2 \
   --sie-coe 3.0 \
   --checkpoint-dir checkpoints_m1_clipreid_sie \
-  --enable-mlflow --run-name msmt17-m1-clipreid-align-sie
+  --enable-wandb --wandb-project T2C-CLIP \
+  --run-name msmt17-m1-clipreid-align-sie
 ```
 
 Gate: mAP >= 0.55. If it lands below 0.50, inspect `stage1_clip_loss`
@@ -261,9 +262,12 @@ the defaults mean `--batch-size 64` is `32 identities x 2 images`. If the
 training split cannot provide enough identities with the requested number of
 images for the configured batch size, startup fails with an explicit error.
 
-Add `--enable-mlflow` to initialize the SQLite-backed MLflow store before training:
+Add `--enable-wandb` to track the run with Weights & Biases. Online mode is
+the default and requires `wandb login` or a `WANDB_API_KEY` before training:
 
 ```bash
+wandb login
+
 python -m scripts.train \
   --job-builder t2c_clip.jobs.clip_reid:build_training_job \
   --dataset msmt17 \
@@ -271,14 +275,13 @@ python -m scripts.train \
   --epochs 120 \
   --validation-interval 5 \
   --checkpoint-dir checkpoints \
-  --enable-mlflow \
-  --tracking-db mlflow/t2c_clip.db \
-  --artifact-root mlruns \
-  --experiment-name T2C-CLIP \
+  --enable-wandb \
+  --wandb-project T2C-CLIP \
+  --wandb-mode online \
   --run-name msmt17-stage2
 ```
 
-When MLflow is enabled, training logs stage-aware metrics:
+When wandb is enabled, training logs stage-aware metrics:
 
 - Stage-1 batch step: `stage1_train_step_loss`, `stage1_train_step_clip_loss`, `stage1_train_step_lr`
 - Stage-1 epoch average: `stage1_train_loss`, `stage1_train_clip_loss`, `stage1_lr`
@@ -289,28 +292,43 @@ When MLflow is enabled, training logs stage-aware metrics:
   `stage2_train_triplet_loss`, `stage2_train_clip_loss`, `stage2_train_tfc_loss`, `stage2_lr`
 - Validation (Stage-2 only): `mAP`, `best_mAP`, `rank_1`, `rank_5`, `rank_10`, `is_best`
 
-Run params recorded with `--enable-mlflow`:
+The custom axes `stage1_train_step`, `stage1_epoch`, `stage2_train_step`,
+`stage2_epoch`, and `validation_epoch` keep batch, epoch, and validation charts
+independent without relying on wandb's global step.
+
+Run config recorded with `--enable-wandb` includes all non-null stage metadata,
+such as:
 
 - `dataset`, `clip_model_name`, `stage1_epochs`, `stage2_epochs`,
   `validation_interval`, `batch_size`, `lr`, `beta`, `clip_weight`,
   `id_logit_scale`, `tfc_weight`, `freeze_image_encoder_stage1`,
   `freeze_image_encoder_stage2`, `freeze_text_encoder`, `retrieval_mode`.
 
-## MLflow SQLite Tracking
+## Weights & Biases Tracking
 
-Initialize the local SQLite-backed MLflow store:
+Online runs appear in the configured wandb project. Set `--wandb-entity` when
+the project belongs to a team; otherwise wandb uses the authenticated account or
+`WANDB_ENTITY`.
 
-```bash
-python -m t2c_clip.cli.mlflow --tracking-db mlflow/t2c_clip.db --artifact-root mlruns --experiment-name T2C-CLIP
-```
-
-Start the MLflow UI on port 6006:
+For machines that should not contact the wandb service, use offline mode:
 
 ```bash
-mlflow ui --backend-store-uri sqlite:///mlflow/t2c_clip.db --default-artifact-root mlruns --host 127.0.0.1 --port 6006
+python -m scripts.train \
+  --job-builder t2c_clip.jobs.clip_reid:build_training_job \
+  --dataset msmt17 \
+  --data-root path/to/MSMT17_V1 \
+  --epochs 120 \
+  --enable-wandb \
+  --wandb-project T2C-CLIP \
+  --wandb-mode offline \
+  --wandb-dir . \
+  --run-name msmt17-offline
+
+wandb sync wandb/offline-run-*
 ```
 
-The SQLite database and artifact directory are local runtime outputs and are ignored by git.
+wandb metadata is ignored by git. Model checkpoints remain local under the
+configured checkpoint directory and are not uploaded as wandb artifacts.
 
 ## CLIP Encoder Boundary
 
@@ -349,10 +367,9 @@ python -m scripts.train \
   --clip-weight 0.1 \
   --tfc-weight 1.0 \
   --freeze-image-encoder-stage1 \
-  --enable-mlflow \
-  --tracking-db mlflow/t2c_clip.db \
-  --artifact-root mlruns \
-  --experiment-name T2C-CLIP \
+  --enable-wandb \
+  --wandb-project T2C-CLIP \
+  --wandb-mode online \
   --run-name sanity-msmt17
 ```
 

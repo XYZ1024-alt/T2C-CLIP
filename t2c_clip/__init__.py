@@ -13,14 +13,7 @@ from t2c_clip.loops import (
     should_validate_epoch,
 )
 from t2c_clip.model import T2CClipModel
-from t2c_clip.mlflow import (
-    DEFAULT_MLFLOW_UI_PORT,
-    MLflowInitialization,
-    MLflowSQLiteConfig,
-    initialize_mlflow_sqlite,
-    mlflow_ui_command,
-    sqlite_tracking_uri,
-)
+from t2c_clip.wandb import WandbConfig, WandbTracker, start_wandb_run
 from t2c_clip.prompts import PromptBank, PromptConfig
 from t2c_clip.tfc import TFCCenterBank
 from t2c_clip.training import (
@@ -34,13 +27,10 @@ from t2c_clip.training import (
 )
 
 __all__ = [
-    "PromptBank",
-    "PromptConfig",
-    "DEFAULT_MLFLOW_UI_PORT",
     "DEFAULT_VALIDATION_INTERVAL",
     "EpochResult",
-    "MLflowInitialization",
-    "MLflowSQLiteConfig",
+    "PromptBank",
+    "PromptConfig",
     "ReIDMetrics",
     "ReIDSample",
     "Stage1LossConfig",
@@ -49,19 +39,19 @@ __all__ = [
     "Stage2LossInputs",
     "T2CClipModel",
     "TFCCenterBank",
+    "TrainingBatch",
     "TrainingLoopConfig",
     "TrainingLoopResult",
-    "TrainingBatch",
+    "WandbConfig",
+    "WandbTracker",
     "batch_hard_triplet_loss",
     "bidirectional_contrastive_loss",
     "evaluate_reid",
     "fuse_features",
-    "initialize_mlflow_sqlite",
     "l2_normalize",
-    "mlflow_ui_command",
     "run_training_loop",
     "should_validate_epoch",
-    "sqlite_tracking_uri",
     "stage1_alignment_loss",
     "stage2_loss_breakdown",
+    "start_wandb_run",
 ]

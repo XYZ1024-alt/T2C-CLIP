@@ -3,56 +3,54 @@ import contextlib
 import io
 import tempfile
 import unittest
+from unittest import mock
 
-from mlflow.tracking import MlflowClient
 import torch
 
-from scripts.train import TrainingJob, TwoStageTrainingJob, main
+from scripts.train import StageMetadata, TrainingJob, TwoStageTrainingJob, main
 from t2c_clip.evaluation import ReIDMetrics
-from t2c_clip.mlflow import sqlite_tracking_uri
+from t2c_clip.wandb import WandbConfig, WandbTracker
 
 RECORDED_STAGE_EPOCHS: dict[str, list[int]] = {"stage1": [], "stage2": []}
 
 
 class TwoStageTrainingScriptTest(unittest.TestCase):
     def test_main_runs_stage1_then_stage2_and_logs_stage_metrics(self):
+        run = FakeWandbRun()
+
+        @contextlib.contextmanager
+        def fake_start_wandb_run(config: WandbConfig, run_name: str):
+            self.assertEqual(config.project, "T2C-CLIP-TwoStage-Script-Test")
+            self.assertEqual(config.mode, "offline")
+            self.assertEqual(run_name, "two-stage-test")
+            yield WandbTracker(run)
+
         with tempfile.TemporaryDirectory() as tmp:
-            tracking_db = Path(tmp) / "mlflow" / "tracking.db"
-            artifact_root = Path(tmp) / "mlruns"
             checkpoint_dir = Path(tmp) / "checkpoints"
-            exit_code = main(
-                [
-                    "--job-builder",
-                    f"{__name__}:build_two_stage_training_job",
-                    "--stage1-epochs",
-                    "2",
-                    "--epochs",
-                    "1",
-                    "--validation-interval",
-                    "1",
-                    "--checkpoint-dir",
-                    str(checkpoint_dir),
-                    "--enable-mlflow",
-                    "--tracking-db",
-                    str(tracking_db),
-                    "--artifact-root",
-                    str(artifact_root),
-                    "--experiment-name",
-                    "T2C-CLIP-TwoStage-Script-Test",
-                    "--run-name",
-                    "two-stage-test",
-                ],
-                progress_factory=lambda iterable, **kwargs: iterable,
-            )
-            runs = _runs_for_experiment(tracking_db, "T2C-CLIP-TwoStage-Script-Test")
-            self.assertEqual(exit_code, 0)
-            self.assertTrue(runs)
-            stage1_epochs = runs[0].data.metrics.get("stage1_train_loss")
-            stage2_losses = runs[0].data.metrics.get("stage2_train_loss")
-            validation_map = runs[0].data.metrics.get("mAP")
-            self.assertIsNotNone(stage1_epochs, "stage1_train_loss must be logged")
-            self.assertIsNotNone(stage2_losses, "stage2_train_loss must be logged")
-            self.assertIsNotNone(validation_map, "mAP must be logged for validation")
+            with mock.patch("scripts.train.start_wandb_run", new=fake_start_wandb_run):
+                exit_code = main(
+                    [
+                        "--job-builder",
+                        f"{__name__}:build_two_stage_training_job",
+                        "--stage1-epochs",
+                        "2",
+                        "--epochs",
+                        "1",
+                        "--validation-interval",
+                        "1",
+                        "--checkpoint-dir",
+                        str(checkpoint_dir),
+                        "--enable-wandb",
+                        "--wandb-project",
+                        "T2C-CLIP-TwoStage-Script-Test",
+                        "--wandb-mode",
+                        "offline",
+                        "--run-name",
+                        "two-stage-test",
+                    ],
+                    progress_factory=lambda iterable, **kwargs: iterable,
+                )
+
             stage1_last_path = checkpoint_dir / "stage1_last.pth"
             best_path = checkpoint_dir / "best.pth"
             last_path = checkpoint_dir / "last.pth"
@@ -65,6 +63,15 @@ class TwoStageTrainingScriptTest(unittest.TestCase):
             self.assertEqual(last_payload["stage"], "stage2")
             stage1_payload = _load_checkpoint(stage1_last_path)
             self.assertEqual(stage1_payload["stage"], "stage1")
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(run.config["dataset"], "fixture")
+        stage1_epochs = [payload for payload in run.logged if "stage1_epoch" in payload]
+        stage2_epochs = [payload for payload in run.logged if "stage2_epoch" in payload]
+        validation = [payload for payload in run.logged if "validation_epoch" in payload]
+        self.assertEqual([payload["stage1_train_loss"] for payload in stage1_epochs], [1.0, 2.0])
+        self.assertEqual([payload["stage2_train_loss"] for payload in stage2_epochs], [3.0])
+        self.assertEqual(validation[0]["mAP"], 0.5)
 
     def test_resume_skips_stage1_and_completed_stage2_epochs(self):
         RECORDED_STAGE_EPOCHS["stage1"].clear()
@@ -136,7 +143,7 @@ def build_two_stage_training_job(args) -> TwoStageTrainingJob:
             train_one_epoch=make_train_one_epoch("stage2"),
             validate=stage2_validate,
         ),
-        stage_metadata=None,
+        stage_metadata=StageMetadata({"dataset": "fixture", "unused": None}),
     )
 
 
@@ -167,10 +174,22 @@ def recording_two_stage_builder(args) -> TwoStageTrainingJob:
     )
 
 
-def _runs_for_experiment(tracking_db: Path, experiment_name: str):
-    client = MlflowClient(tracking_uri=sqlite_tracking_uri(tracking_db))
-    experiment = client.get_experiment_by_name(experiment_name)
-    return client.search_runs([experiment.experiment_id])
+class FakeWandbConfig(dict):
+    def update(self, values=None, *, allow_val_change: bool = False):
+        super().update({} if values is None else values)
+
+
+class FakeWandbRun:
+    def __init__(self):
+        self.config = FakeWandbConfig()
+        self.logged: list[dict] = []
+        self.defined_metrics: list[tuple[str, dict]] = []
+
+    def define_metric(self, name: str, **kwargs) -> None:
+        self.defined_metrics.append((name, dict(kwargs)))
+
+    def log(self, payload) -> None:
+        self.logged.append(dict(payload))
 
 
 def _load_checkpoint(path: Path) -> dict:
