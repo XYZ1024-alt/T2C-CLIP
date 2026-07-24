@@ -32,19 +32,23 @@ codebase trains a real CLIP dual-stream model with a two-stage pipeline:
 
 ## Environment
 
-Use Python 3.10 or newer in an environment with PyTorch, torchvision,
-Transformers, Pillow, NumPy, and tqdm installed. Install `wandb` when experiment
-tracking is enabled. The project does not assume a particular operating system,
-Conda installation, environment name, or clone location.
+This project uses [uv](https://docs.astral.sh/uv/) with Python 3.14. After
+installing uv, create the project environment and install the locked
+dependencies from the repository root:
 
-All commands in this README are run from the repository root after activating
-your Python environment. Relative output paths such as `checkpoints/` and
-`wandb/` are therefore created under the repository root.
+```bash
+uv sync
+```
+
+`uv sync` manages the local `.venv` from `pyproject.toml` and `uv.lock`; manual
+environment activation is not required. Run project commands through
+`uv run`. Relative output paths such as `checkpoints/` and `wandb/` are
+created under the repository root.
 
 Run the test suite with:
 
 ```bash
-python -m unittest discover -s tests -v
+uv run python -m unittest discover -s tests -v
 ```
 
 ## Evaluate Extracted Features
@@ -61,7 +65,7 @@ The evaluator expects a `.npz` file with these arrays:
 Run:
 
 ```bash
-python -m t2c_clip.cli.evaluate path/to/features.npz --output metrics.json --ranks 1 5 10
+uv run python -m t2c_clip.cli.evaluate path/to/features.npz --output metrics.json --ranks 1 5 10
 ```
 
 The evaluator performs standard Image-to-Image ReID scoring without rerank. Same-identity same-camera gallery samples are excluded for each query.
@@ -121,7 +125,7 @@ MSMT17 expects the standard manifests and image folders under `--data-root`:
 Run Stage-1 + Stage-2 training:
 
 ```bash
-python -m scripts.train \
+uv run python -m scripts.train \
   --job-builder t2c_clip.jobs.clip_reid:build_training_job \
   --dataset msmt17 \
   --data-root path/to/MSMT17_V1 \
@@ -161,7 +165,7 @@ on `f_eval`).
 **M1 — CLIP-ReID alignment + SIE (innovations off, framework check):**
 
 ```bash
-python -m scripts.train \
+uv run python -m scripts.train \
   --job-builder t2c_clip.jobs.clip_reid:build_training_job \
   --dataset msmt17 --data-root path/to/MSMT17_V1 \
   --clip-model-name openai/clip-vit-base-patch16 \
@@ -266,9 +270,9 @@ Add `--enable-wandb` to track the run with Weights & Biases. Online mode is
 the default and requires `wandb login` or a `WANDB_API_KEY` before training:
 
 ```bash
-wandb login
+uv run wandb login
 
-python -m scripts.train \
+uv run python -m scripts.train \
   --job-builder t2c_clip.jobs.clip_reid:build_training_job \
   --dataset msmt17 \
   --data-root path/to/MSMT17_V1 \
@@ -313,7 +317,7 @@ the project belongs to a team; otherwise wandb uses the authenticated account or
 For machines that should not contact the wandb service, use offline mode:
 
 ```bash
-python -m scripts.train \
+uv run python -m scripts.train \
   --job-builder t2c_clip.jobs.clip_reid:build_training_job \
   --dataset msmt17 \
   --data-root path/to/MSMT17_V1 \
@@ -324,7 +328,7 @@ python -m scripts.train \
   --wandb-dir . \
   --run-name msmt17-offline
 
-wandb sync wandb/offline-run-*
+uv run wandb sync wandb/offline-run-*
 ```
 
 wandb metadata is ignored by git. Model checkpoints remain local under the
@@ -350,7 +354,7 @@ Before running 120-epoch Stage-2 training, run a short sanity check on
 MSMT17 to validate the Stage-1 + Stage-2 pipeline:
 
 ```bash
-python -m scripts.train \
+uv run python -m scripts.train \
   --job-builder t2c_clip.jobs.clip_reid:build_training_job \
   --dataset msmt17 \
   --data-root path/to/MSMT17_V1 \
