@@ -2,10 +2,10 @@
 
 Train2Central-CLIP foundation for Image-to-Image person ReID experiments.
 
-The implementation follows [DESIGN.md](DESIGN.md) (the consolidated design doc) and
-[docs/2026-06-27-t2c-clip-design.md](docs/2026-06-27-t2c-clip-design.md)
-(research blueprint). The current
-codebase trains a real CLIP dual-stream model with a two-stage pipeline:
+The current architecture and implementation contract are defined in
+[DESIGN.md](DESIGN.md). Experiment tables, ablation plans, and analysis goals
+are maintained separately in the [research blueprint](docs/research-blueprint.md).
+The current codebase trains a real CLIP dual-stream model with a two-stage pipeline:
 
 - Market-1501 and MSMT17 person/camera parsing.
 - Global, camera, and training-ID learnable prompt composition that lives
@@ -267,7 +267,7 @@ training split cannot provide enough identities with the requested number of
 images for the configured batch size, startup fails with an explicit error.
 
 Add `--enable-wandb` to track the run with Weights & Biases. Online mode is
-the default and requires `wandb login` or a `WANDB_API_KEY` before training:
+the default and requires `uv run wandb login` or a `WANDB_API_KEY` before training:
 
 ```bash
 uv run wandb login

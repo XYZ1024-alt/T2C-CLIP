@@ -1,5 +1,7 @@
 # Train2Central-CLIP（T2C-CLIP）研究与实验蓝图
 
+> 本文档只维护研究假设、实验表、消融方案与机制分析。当前架构、模块边界和实现验收标准以 [DESIGN.md](../DESIGN.md) 为准；可执行命令以 [README.md](../README.md) 为准。
+
 ## 1. 项目定位
 
 Train2Central-CLIP（T2C-CLIP）面向监控场景下的 Image-to-Image 行人重识别。检索输入始终是 query 图像和 gallery 图像，不使用自然语言 caption，不进行 Text-to-Image 检索评测，也不使用 CUHK-PEDES 等 Text-ReID 数据集。
@@ -255,18 +257,14 @@ Market-1501 作为辅数据集，按标准 Image-to-Image ReID 协议评测，�
 
 这些分析用于解释机制，但不能替代标准 mAP 与 Rank-1 评测。
 
-## 10. 后续实现边界
+## 10. 文档边界
 
-本文档是研究与实验蓝图，不是代码实现计划。后续工程计划应单独定义：
+本文档不是当前代码的实现规范，也不维护工程任务清单。以下内容由其他文档负责：
 
-- MSMT17 与 Market-1501 的文件名 camera ID 解析器。
-- CLIP ViT 图像/文本编码器加载与 fine-tuning 策略。
-- global、camera、training identity prompt 参数模块。
-- Stage-1 与 Stage-2 训练入口。
-- TFC EMA center 更新模块。
-- 无 rerank cosine 检索评测脚本。
+- 模型路径、模块边界、训练参数和实现验收标准：[DESIGN.md](../DESIGN.md)。
+- 环境安装、训练、评估和实验追踪命令：[README.md](../README.md)。
 
-实现时必须让失败清晰暴露，不添加静默 fallback、假成功路径、mock 指标或隐藏上限来制造可运行假象。
+本文档只保留研究范围、结果表结构、消融方案和机制分析。实验演进仍必须让失败清晰暴露，不添加静默 fallback、假成功路径、mock 指标或隐藏上限来制造可运行假象。
 
 ## 11. 最终设计决策
 

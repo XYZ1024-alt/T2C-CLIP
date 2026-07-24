@@ -358,7 +358,7 @@ TFC 只用于训练，不参与推理和验证。
 `scripts/train.py` 应支持：
 
 ```bash
-python -m scripts.train \
+uv run python -m scripts.train \
   --job-builder t2c_clip.jobs.clip_reid:build_training_job \
   --dataset msmt17 \
   --data-root MSMT17_V1 \
@@ -393,7 +393,7 @@ python -m scripts.train \
 - `--enable-wandb`: 启用实验追踪；关闭时不导入 wandb。
 - `--wandb-project` / `--wandb-entity`: 选择线上项目与可选团队。
 - `--wandb-mode`: 默认 `online`，也可显式设为 `offline` 后运行
-  `wandb sync wandb/offline-run-*`。
+  `uv run wandb sync wandb/offline-run-*`。
 - `--wandb-dir`: 可选的本地 wandb 元数据根目录。
 
 在线认证或初始化失败必须终止训练，不得静默切换到离线模式。checkpoint
@@ -608,16 +608,22 @@ TFC 消融：
 
 ## 17. 预期训练流程
 
+先从仓库根目录同步锁定环境：
+
+```bash
+uv sync
+```
+
 登录 Weights & Biases（也可通过 `WANDB_API_KEY` 配置服务器环境）：
 
 ```bash
-wandb login
+uv run wandb login
 ```
 
 训练：
 
 ```bash
-python -m scripts.train \
+uv run python -m scripts.train \
   --job-builder t2c_clip.jobs.clip_reid:build_training_job \
   --dataset msmt17 \
   --data-root MSMT17_V1 \
@@ -643,7 +649,7 @@ python -m scripts.train \
 短程调试建议先跑：
 
 ```bash
-python -m scripts.train \
+uv run python -m scripts.train \
   --job-builder t2c_clip.jobs.clip_reid:build_training_job \
   --dataset msmt17 \
   --data-root MSMT17_V1 \
