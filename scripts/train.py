@@ -51,9 +51,12 @@ from t2c_reid.transforms import DEFAULT_IMAGE_SIZE
 
 DEFAULT_TOTAL_EPOCHS = 120
 DEFAULT_VALIDATION_INTERVAL = 5
-DEFAULT_STAGE1_EPOCHS = 0
-DEFAULT_CHECKPOINT_DIR = Path("checkpoints")
-DEFAULT_RUN_NAME = "train"
+DEFAULT_STAGE1_EPOCHS = 20
+DEFAULT_JOB_BUILDER = "t2c_reid.jobs.siglip2_reid:build_training_job"
+DEFAULT_DATASET = "msmt17"
+DEFAULT_DATA_ROOT = Path("data/MSMT17_V1")
+DEFAULT_CHECKPOINT_DIR = Path("checkpoints/msmt17-siglip2-tfc")
+DEFAULT_RUN_NAME = "msmt17-siglip2-camera-tfc"
 DEFAULT_SIGLIP2_MODEL_NAME = SIGLIP2_MODEL_ID
 DEFAULT_BATCH_SIZE = 8
 DEFAULT_EVAL_BATCH_SIZE = 16
@@ -235,8 +238,8 @@ def _stage_metadata_values(metadata: Any) -> dict[str, Any]:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run a T2C-ReID training job.")
-    parser.add_argument("--job-builder", required=True)
+    parser = argparse.ArgumentParser(description="Train T2C-ReID with the default SigLIP 2 recipe.")
+    parser.add_argument("--job-builder", default=DEFAULT_JOB_BUILDER)
     parser.add_argument("--epochs", type=int, default=DEFAULT_TOTAL_EPOCHS)
     parser.add_argument("--validation-interval", type=int, default=DEFAULT_VALIDATION_INTERVAL)
     parser.add_argument("--checkpoint-dir", type=Path, default=DEFAULT_CHECKPOINT_DIR)
@@ -253,8 +256,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _add_project_training_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--dataset", choices=SUPPORTED_DATASETS)
-    parser.add_argument("--data-root", type=Path)
+    parser.add_argument("--dataset", choices=SUPPORTED_DATASETS, default=DEFAULT_DATASET)
+    parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)
     parser.add_argument(
         "--siglip2-model-name",
         choices=(DEFAULT_SIGLIP2_MODEL_NAME,),

@@ -8,7 +8,13 @@ from unittest import mock
 
 import torch
 
-from scripts.train import StageMetadata, TrainingJob, _validate_checkpoint_metadata, main
+from scripts.train import (
+    StageMetadata,
+    TrainingJob,
+    _build_parser,
+    _validate_checkpoint_metadata,
+    main,
+)
 from t2c_reid.evaluation import ReIDMetrics
 from t2c_reid.wandb import WandbConfig, WandbTracker
 
@@ -211,12 +217,22 @@ class TrainScriptTest(unittest.TestCase):
         self.assertEqual(best["epoch"], 1)
         self.assertEqual(best["metrics"]["mAP"], 0.9)
 
-    def test_main_requires_job_builder(self):
-        with contextlib.redirect_stderr(io.StringIO()):
-            with self.assertRaises(SystemExit) as context:
-                main([])
+    def test_parser_defaults_to_the_project_training_recipe(self):
+        args = _build_parser().parse_args([])
 
-        self.assertNotEqual(context.exception.code, 0)
+        self.assertEqual(
+            args.job_builder,
+            "t2c_reid.jobs.siglip2_reid:build_training_job",
+        )
+        self.assertEqual(args.dataset, "msmt17")
+        self.assertEqual(args.data_root, Path("data/MSMT17_V1"))
+        self.assertEqual(args.stage1_epochs, 20)
+        self.assertEqual(args.epochs, 120)
+        self.assertEqual(
+            args.checkpoint_dir,
+            Path("checkpoints/msmt17-siglip2-tfc"),
+        )
+        self.assertEqual(args.run_name, "msmt17-siglip2-camera-tfc")
 
     def test_main_runs_builder_training_job_and_saves_checkpoints(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -291,6 +307,9 @@ class TrainScriptTest(unittest.TestCase):
             )
 
         self.assertEqual(RECORDED_ARGS.image_encoder_lr, 5e-6)
+        self.assertEqual(RECORDED_ARGS.stage1_epochs, 20)
+        self.assertEqual(RECORDED_ARGS.dataset, "msmt17")
+        self.assertEqual(RECORDED_ARGS.data_root, Path("data/MSMT17_V1"))
         self.assertEqual(RECORDED_ARGS.alignment_weight, 1.0)
         self.assertEqual(RECORDED_ARGS.tfc_tail_momentum, 0.9)
         self.assertEqual(RECORDED_ARGS.tfc_class_balance_beta, 0.9999)

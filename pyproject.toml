@@ -13,6 +13,9 @@ dependencies = [
     "wandb>=0.28.1",
 ]
 
+[project.scripts]
+train = "scripts.train:main"
+
 [build-system]
 requires = ["maturin>=1.14,<2"]
 build-backend = "maturin"

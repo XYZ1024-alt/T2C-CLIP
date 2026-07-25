@@ -489,7 +489,7 @@ fingerprint 和全部 TFC 配置纳入 resume 兼容性校验。schema 2 Stage-2
     rerank 与稠密 reference 距离/指标误差不超过 `1e-6`。
 15. 原生 eval resize 的 shape/dtype/contiguous 契约一致，fixture 最大误差不超过一个
     8-bit 量化步长对应的归一化值；固定 seed 的 Rust 增强可重放。
-16. `python -m scripts.train --help` 只显示 SigLIP 2 与 Rust backend 公共参数，不显示旧
+16. `uv run train --help` 只显示 SigLIP 2 与 Rust backend 公共参数，不显示旧
     `--clip-*` 参数。
 
 ## 13. 明确不做

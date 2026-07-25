@@ -104,7 +104,7 @@ Run all Python tooling through `uv`; do not use pip or conda for this project.
 | Full test suite | `uv run python -m unittest discover -s tests` |
 | One test module | `uv run python -m unittest tests.test_siglip2_training_components` |
 | Syntax/import compile check | `uv run python -m compileall -q t2c_reid scripts tests` |
-| Training CLI help | `uv run python -m scripts.train --help` |
+| Training CLI help | `uv run train --help` |
 | Evaluation CLI help | `uv run python -m t2c_reid.cli.evaluate --help` |
 | Native benchmark | `uv run python -m t2c_reid.cli.benchmark_native --help` |
 | Check diff hygiene | `git diff --check` |
@@ -115,21 +115,14 @@ the full unittest suite, compileall, CLI help, and `git diff --check`.
 ### Training
 
 ```bash
-uv run python -m scripts.train \
-  --job-builder t2c_reid.jobs.siglip2_reid:build_training_job \
-  --dataset msmt17 \
-  --data-root path/to/MSMT17_V1 \
-  --stage1-epochs 20 \
-  --epochs 120 \
-  --validation-interval 5 \
-  --checkpoint-dir checkpoints/siglip2-so400m
+uv run train
 ```
 
-Important defaults target a 24GB single GPU: train micro-batch 8, gradient
+Important defaults target a 24GB single GPU: MSMT17 at `data/MSMT17_V1`,
+Stage-1 20 epochs, Stage-2 120 epochs, train micro-batch 8, gradient
 accumulation 4, effective optimizer batch 32, eval batch 16, precision `auto`,
 gradient checkpointing enabled, image size `392 x 196`, and image encoder LR
-`5e-6`. `--stage1-epochs` defaults to 0, so set it explicitly to run both
-stages.
+`5e-6`. Override only the parameters needed for an experiment.
 
 `precision=auto` resolves to BF16 on capable CUDA devices, FP16 + GradScaler on
 other CUDA devices, and FP32 on CPU. Gradient accumulation does not enlarge the

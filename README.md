@@ -92,37 +92,29 @@ training split combines `list_train.txt` and `list_val.txt`.
 
 ## Training
 
-A 24GB single-GPU starting point is:
+With MSMT17 placed at `data/MSMT17_V1`, start the complete default recipe with:
 
 ```bash
-uv run python -m scripts.train \
-  --job-builder t2c_reid.jobs.siglip2_reid:build_training_job \
-  --dataset msmt17 \
-  --data-root path/to/MSMT17_V1 \
-  --siglip2-model-name google/siglip2-so400m-patch14-384 \
-  --stage1-epochs 20 \
-  --epochs 120 \
-  --validation-interval 5 \
-  --checkpoint-dir checkpoints/siglip2-so400m \
-  --batch-size 8 \
-  --gradient-accumulation-steps 4 \
-  --eval-batch-size 16 \
-  --precision auto \
-  --gradient-checkpointing \
-  --num-instances 2 \
-  --num-workers 4 \
-  --lr 1e-4 \
-  --image-encoder-lr 5e-6 \
-  --beta 0.1 \
-  --alignment-weight 1.0 \
-  --tfc-weight 1.0 \
-  --freeze-image-encoder-stage1 \
-  --no-freeze-image-encoder-stage2 \
-  --freeze-text-encoder
+uv run train
 ```
 
-The defaults already select the model, `392x196` input, batch `8`, accumulation
-`4`, eval batch `16`, automatic precision, and gradient checkpointing.
+The default run uses Stage-1 for 20 epochs, Stage-2 for 120 epochs, validates
+every 5 Stage-2 epochs, and writes to `checkpoints/msmt17-siglip2-tfc`.
+Only specify values that differ from the baseline recipe. For example:
+
+```bash
+uv run train \
+  --data-root D:/datasets/MSMT17_V1 \
+  --tfc-weight 0.5 \
+  --alignment-weight 0.25 \
+  --run-name msmt17-tfc-weight-sweep
+```
+
+The defaults select MSMT17 at `data/MSMT17_V1`, the fixed model, `392x196`
+input, Stage-1 `20`, Stage-2 `120`, batch `8`, accumulation `4`, eval batch
+`16`, automatic precision, and gradient checkpointing. `--job-builder` remains
+available for test fixtures or external jobs but is not required for normal
+T2C-ReID training.
 
 ### Stage 1
 
@@ -220,6 +212,17 @@ falling back. FP16 scaler state is saved and restored with the checkpoint.
 
 ## Main CLI Options
 
+Run and data defaults:
+
+- `uv run train`
+- `--dataset msmt17`
+- `--data-root data/MSMT17_V1`
+- `--stage1-epochs 20`
+- `--epochs 120` (Stage-2 epochs)
+- `--validation-interval 5`
+- `--checkpoint-dir checkpoints/msmt17-siglip2-tfc`
+- `--job-builder t2c_reid.jobs.siglip2_reid:build_training_job`
+
 Backbone and input:
 
 - `--siglip2-model-name google/siglip2-so400m-patch14-384` (the only accepted value)
@@ -297,13 +300,8 @@ New checkpoints use schema version 3 and include:
 Resume a Stage-2 run with the same architecture and precision:
 
 ```bash
-uv run python -m scripts.train \
-  --job-builder t2c_reid.jobs.siglip2_reid:build_training_job \
-  --dataset msmt17 \
-  --data-root path/to/MSMT17_V1 \
-  --stage1-epochs 20 \
-  --epochs 120 \
-  --resume checkpoints/siglip2-so400m/last.pth
+uv run train \
+  --resume checkpoints/msmt17-siglip2-tfc/last.pth
 ```
 
 This migration intentionally rejects schema 2 Stage-2 checkpoints, OpenAI CLIP
@@ -317,13 +315,10 @@ Enable online tracking:
 
 ```bash
 uv run wandb login
-uv run python -m scripts.train \
-  --job-builder t2c_reid.jobs.siglip2_reid:build_training_job \
-  --dataset msmt17 \
-  --data-root path/to/MSMT17_V1 \
+uv run train \
   --enable-wandb \
   --wandb-project T2C-ReID \
-  --run-name msmt17-siglip2-so400m
+  --run-name msmt17-siglip2-camera-tfc
 ```
 
 Training metrics include:
@@ -415,7 +410,7 @@ Run the offline suite and inspect the CLI:
 uv run cargo test --manifest-path rust/Cargo.toml --locked
 uv run python -m unittest discover -s tests
 uv run python -m compileall -q t2c_reid scripts tests
-uv run python -m scripts.train --help
+uv run train --help
 uv run python -m t2c_reid.cli.evaluate --help
 uv run python -m t2c_reid.cli.benchmark_native --help
 ```
