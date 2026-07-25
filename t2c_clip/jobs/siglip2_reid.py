@@ -38,15 +38,28 @@ from t2c_clip.siglip2_backbone import (
 from t2c_clip.data import ReIDSample, load_market_split, load_msmt17_manifest
 from t2c_clip.datasets import (
     DEFAULT_INSTANCES_PER_IDENTITY,
+    PYTHON_DATA_BACKEND,
+    RUST_DATA_BACKEND,
     IdentityBalancedBatchSampler,
     ReIDImageBatch,
     ReIDImageDataset,
     ReIDImageDatasetConfig,
+    ReIDMetadataDataset,
+    ReIDMetadataDatasetConfig,
+    RustReIDBatchCollator,
     build_camera_id_map,
     build_person_id_map,
     collate_reid_batches,
+    require_data_backend,
 )
-from t2c_clip.evaluation import ReIDMetrics, evaluate_reid, evaluate_reid_with_rerank
+from t2c_clip.evaluation import (
+    DEFAULT_QUERY_CHUNK_SIZE,
+    RUST_EVALUATION_BACKEND,
+    ReIDMetrics,
+    evaluate_reid,
+    evaluate_reid_with_rerank,
+    require_evaluation_backend,
+)
 from t2c_clip.features import l2_normalize
 from t2c_clip.model import T2CSiglip2Model
 from t2c_clip.precision import PrecisionController, PrecisionPolicy, resolve_precision
@@ -64,7 +77,12 @@ from t2c_clip.training import (
     stage1_alignment_loss_from_visual,
     stage2_loss_breakdown,
 )
-from t2c_clip.transforms import Siglip2ImageTransform, Siglip2TrainImageTransform, DEFAULT_IMAGE_SIZE
+from t2c_clip.transforms import (
+    DEFAULT_IMAGE_SIZE,
+    ImageTransformConfig,
+    Siglip2ImageTransform,
+    Siglip2TrainImageTransform,
+)
 
 DEFAULT_RANKS = (1, 5, 10)
 SUPPORTED_DATASETS = ("market1501", "msmt17")
@@ -127,6 +145,13 @@ class Siglip2ReIDJobConfig:
     eval_batch_size: int
     gradient_accumulation_steps: int
     num_workers: int
+    data_backend: str
+    prefetch_factor: int
+    pin_memory: bool
+    persistent_workers: bool
+    rust_data_threads: int
+    evaluation_backend: str
+    evaluation_chunk_size: int
     lr: float
     image_encoder_lr: float
     device: torch.device
@@ -163,12 +188,12 @@ class Siglip2ReIDJobConfig:
 
 @dataclass(frozen=True)
 class DatasetBundle:
-    train: ReIDImageDataset
+    train: ReIDImageDataset | ReIDMetadataDataset
     # Train split re-viewed through the eval transform: the Stage-1 feature
     # cache extracts frozen image features without augmentation noise.
-    train_eval: ReIDImageDataset
-    query: ReIDImageDataset
-    gallery: ReIDImageDataset
+    train_eval: ReIDImageDataset | ReIDMetadataDataset
+    query: ReIDImageDataset | ReIDMetadataDataset
+    gallery: ReIDImageDataset | ReIDMetadataDataset
     num_train_ids: int
     num_cameras: int
 
@@ -212,7 +237,11 @@ class Stage1FeatureCache:
     (including any SIE camera injection) would produce for every later epoch.
     """
 
-    def __init__(self, dataset: ReIDImageDataset, config: Siglip2ReIDJobConfig):
+    def __init__(
+        self,
+        dataset: ReIDImageDataset | ReIDMetadataDataset,
+        config: Siglip2ReIDJobConfig,
+    ):
         self._dataset = dataset
         self._config = config
         self._visual_raw: torch.Tensor | None = None
@@ -234,10 +263,10 @@ class Stage1FeatureCache:
         camera_parts: list[torch.Tensor] = []
         with torch.no_grad(), precision.autocast():
             for batch in loader:
-                images = batch.images.to(self._config.device)
-                cameras = batch.camera_ids.to(self._config.device)
+                images = batch.images.to(self._config.device, non_blocking=True)
+                cameras = batch.camera_ids.to(self._config.device, non_blocking=True)
                 visual_parts.append(model.retrieval_model.encode_visual_raw(images, cameras))
-                person_parts.append(batch.person_ids.to(self._config.device))
+                person_parts.append(batch.person_ids.to(self._config.device, non_blocking=True))
                 camera_parts.append(cameras)
         if was_training:
             model.train()
@@ -422,7 +451,9 @@ def build_training_job(
         ),
     )
     data = load_dataset_bundle(
-        JobDataConfig(config.dataset, config.data_root), transforms
+        JobDataConfig(config.dataset, config.data_root),
+        transforms,
+        backend=config.data_backend,
     )
     shared_model = _build_training_model(
         config,
@@ -677,7 +708,13 @@ def _configure_gradient_checkpointing(model: torch.nn.Module, enabled: bool) -> 
     method()
 
 
-def load_dataset_bundle(config: JobDataConfig, transforms) -> DatasetBundle:
+def load_dataset_bundle(
+    config: JobDataConfig,
+    transforms,
+    *,
+    backend: str = PYTHON_DATA_BACKEND,
+) -> DatasetBundle:
+    backend = require_data_backend(backend)
     splits = _load_split_samples(config)
     _require_non_empty_splits(splits)
     camera_map = build_camera_id_map([*splits.train, *splits.query, *splits.gallery])
@@ -685,12 +722,39 @@ def load_dataset_bundle(config: JobDataConfig, transforms) -> DatasetBundle:
     eval_person_map = build_person_id_map([*splits.query, *splits.gallery])
     bundle = _transform_bundle(transforms)
     return DatasetBundle(
-        train=ReIDImageDataset(ReIDImageDatasetConfig(splits.train, train_person_map, camera_map, bundle.train)),
-        train_eval=ReIDImageDataset(ReIDImageDatasetConfig(splits.train, train_person_map, camera_map, bundle.eval)),
-        query=ReIDImageDataset(ReIDImageDatasetConfig(splits.query, eval_person_map, camera_map, bundle.eval)),
-        gallery=ReIDImageDataset(ReIDImageDatasetConfig(splits.gallery, eval_person_map, camera_map, bundle.eval)),
+        train=_build_image_dataset(
+            splits.train, train_person_map, camera_map, bundle.train, backend
+        ),
+        train_eval=_build_image_dataset(
+            splits.train, train_person_map, camera_map, bundle.eval, backend
+        ),
+        query=_build_image_dataset(
+            splits.query, eval_person_map, camera_map, bundle.eval, backend
+        ),
+        gallery=_build_image_dataset(
+            splits.gallery, eval_person_map, camera_map, bundle.eval, backend
+        ),
         num_train_ids=len(train_person_map),
         num_cameras=len(camera_map),
+    )
+
+
+def _build_image_dataset(
+    samples: Sequence[ReIDSample],
+    person_id_map: dict[int, int],
+    camera_id_map: dict[int, int],
+    transform: Any,
+    backend: str,
+) -> ReIDImageDataset | ReIDMetadataDataset:
+    if backend == PYTHON_DATA_BACKEND:
+        return ReIDImageDataset(
+            ReIDImageDatasetConfig(samples, person_id_map, camera_id_map, transform)
+        )
+    native_config = getattr(transform, "native_config", None)
+    if not isinstance(native_config, ImageTransformConfig):
+        raise TypeError("Rust data backend requires a transform with ImageTransformConfig")
+    return ReIDMetadataDataset(
+        ReIDMetadataDatasetConfig(samples, person_id_map, camera_id_map, native_config)
     )
 
 
@@ -723,15 +787,40 @@ def _job_config_from_args(args: Any) -> Siglip2ReIDJobConfig:
         int(getattr(args, "image_height", DEFAULT_IMAGE_SIZE[0])),
         int(getattr(args, "image_width", DEFAULT_IMAGE_SIZE[1])),
     )
+    num_workers = int(getattr(args, "num_workers", 4))
+    data_backend = require_data_backend(str(getattr(args, "data_backend", RUST_DATA_BACKEND)))
+    prefetch_factor = int(getattr(args, "prefetch_factor", 2))
+    rust_data_threads = int(getattr(args, "rust_data_threads", 1))
+    evaluation_backend = require_evaluation_backend(
+        str(getattr(args, "evaluation_backend", RUST_EVALUATION_BACKEND))
+    )
+    evaluation_chunk_size = int(
+        getattr(args, "evaluation_chunk_size", DEFAULT_QUERY_CHUNK_SIZE)
+    )
+    pin_memory_arg = getattr(args, "pin_memory", None)
+    pin_memory = device.type == "cuda" if pin_memory_arg is None else bool(pin_memory_arg)
+    persistent_workers_arg = getattr(args, "persistent_workers", None)
+    persistent_workers = (
+        num_workers > 0
+        if persistent_workers_arg is None
+        else bool(persistent_workers_arg)
+    )
     for value, name in (
         (batch_size, "--batch-size"),
         (eval_batch_size, "--eval-batch-size"),
         (gradient_accumulation_steps, "--gradient-accumulation-steps"),
+        (prefetch_factor, "--prefetch-factor"),
+        (rust_data_threads, "--rust-data-threads"),
+        (evaluation_chunk_size, "--evaluation-chunk-size"),
         (image_size[0], "--image-height"),
         (image_size[1], "--image-width"),
     ):
         if value < 1:
             raise ValueError(f"{name} must be positive")
+    if num_workers < 0:
+        raise ValueError("--num-workers must be non-negative")
+    if num_workers == 0 and persistent_workers_arg is True:
+        raise ValueError("--persistent-workers requires --num-workers to be positive")
     precision = resolve_precision(str(getattr(args, "precision", "auto")), device)
     model_name = str(getattr(args, "siglip2_model_name", SIGLIP2_MODEL_ID))
     if model_name != SIGLIP2_MODEL_ID:
@@ -747,7 +836,14 @@ def _job_config_from_args(args: Any) -> Siglip2ReIDJobConfig:
         batch_size=batch_size,
         eval_batch_size=eval_batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
-        num_workers=int(getattr(args, "num_workers", 4)),
+        num_workers=num_workers,
+        data_backend=data_backend,
+        prefetch_factor=prefetch_factor,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        rust_data_threads=rust_data_threads,
+        evaluation_backend=evaluation_backend,
+        evaluation_chunk_size=evaluation_chunk_size,
         lr=float(getattr(args, "lr", 1e-4)),
         image_encoder_lr=float(getattr(args, "image_encoder_lr", DEFAULT_IMAGE_ENCODER_LR)),
         device=device,
@@ -1017,6 +1113,13 @@ def _stage_metadata(
             "precision_resolved": config.precision.resolved,
             "gradient_checkpointing": config.gradient_checkpointing,
             "num_workers": config.num_workers,
+            "data_backend": config.data_backend,
+            "prefetch_factor": config.prefetch_factor,
+            "pin_memory": config.pin_memory,
+            "persistent_workers": config.persistent_workers,
+            "rust_data_threads": config.rust_data_threads,
+            "evaluation_backend": config.evaluation_backend,
+            "evaluation_chunk_size": config.evaluation_chunk_size,
             "lr": config.lr,
             "image_encoder_lr": config.image_encoder_lr,
             "beta": config.beta,
@@ -1236,7 +1339,10 @@ def _build_loaders(data: DatasetBundle, config: Siglip2ReIDJobConfig) -> LoaderB
     )
 
 
-def _train_loader(dataset: ReIDImageDataset, config: Siglip2ReIDJobConfig) -> DataLoader:
+def _train_loader(
+    dataset: ReIDImageDataset | ReIDMetadataDataset,
+    config: Siglip2ReIDJobConfig,
+) -> DataLoader:
     sampler = IdentityBalancedBatchSampler(
         dataset.person_ids,
         batch_size=config.batch_size,
@@ -1245,19 +1351,43 @@ def _train_loader(dataset: ReIDImageDataset, config: Siglip2ReIDJobConfig) -> Da
     return DataLoader(
         dataset,
         batch_sampler=sampler,
-        num_workers=config.num_workers,
-        collate_fn=collate_reid_batches,
+        **_data_loader_kwargs(dataset, config),
     )
 
 
-def _loader(dataset: ReIDImageDataset, config: Siglip2ReIDJobConfig, shuffle: bool) -> DataLoader:
+def _loader(
+    dataset: ReIDImageDataset | ReIDMetadataDataset,
+    config: Siglip2ReIDJobConfig,
+    shuffle: bool,
+) -> DataLoader:
     return DataLoader(
         dataset,
         batch_size=config.eval_batch_size,
         shuffle=shuffle,
-        num_workers=config.num_workers,
-        collate_fn=collate_reid_batches,
+        **_data_loader_kwargs(dataset, config),
     )
+
+
+def _data_loader_kwargs(
+    dataset: ReIDImageDataset | ReIDMetadataDataset,
+    config: Siglip2ReIDJobConfig,
+) -> dict[str, Any]:
+    if isinstance(dataset, ReIDMetadataDataset):
+        collate_fn = RustReIDBatchCollator(
+            dataset.transform_config,
+            threads=config.rust_data_threads,
+        )
+    else:
+        collate_fn = collate_reid_batches
+    options: dict[str, Any] = {
+        "num_workers": config.num_workers,
+        "collate_fn": collate_fn,
+        "pin_memory": config.pin_memory,
+        "persistent_workers": config.persistent_workers,
+    }
+    if config.num_workers > 0:
+        options["prefetch_factor"] = config.prefetch_factor
+    return options
 
 
 def _train_one_epoch(runtime: StageTrainingRuntime):
@@ -1371,6 +1501,8 @@ def _validate(runtime: ValidationRuntime):
             query_cams=query.camera_ids,
             gallery_cams=gallery.camera_ids,
             ranks=DEFAULT_RANKS,
+            backend=runtime.model_config.evaluation_backend,
+            query_chunk_size=runtime.model_config.evaluation_chunk_size,
         )
         if not runtime.report_rerank:
             return metrics
@@ -1382,6 +1514,8 @@ def _validate(runtime: ValidationRuntime):
             query_cams=query.camera_ids,
             gallery_cams=gallery.camera_ids,
             ranks=DEFAULT_RANKS,
+            backend=runtime.model_config.evaluation_backend,
+            query_chunk_size=runtime.model_config.evaluation_chunk_size,
         )
         return ReIDMetrics(
             map=metrics.map,
@@ -1418,8 +1552,8 @@ def _extract_features(
     camera_ids: list[int] = []
     with torch.no_grad(), precision.autocast():
         for batch in loader:
-            images = batch.images.to(device)
-            cameras = batch.camera_ids.to(device)
+            images = batch.images.to(device, non_blocking=True)
+            cameras = batch.camera_ids.to(device, non_blocking=True)
             features = model.encode_retrieval(images, cameras, retrieval_mode=retrieval_mode)
             feature_parts.append(features.float().cpu())
             person_ids.extend(batch.original_person_ids)
@@ -1431,9 +1565,9 @@ def _extract_features(
 
 def _training_batch(batch: ReIDImageBatch, device: torch.device) -> TrainingBatch:
     return TrainingBatch(
-        images=batch.images.to(device),
-        camera_ids=batch.camera_ids.to(device),
-        person_ids=batch.person_ids.to(device),
+        images=batch.images.to(device, non_blocking=True),
+        camera_ids=batch.camera_ids.to(device, non_blocking=True),
+        person_ids=batch.person_ids.to(device, non_blocking=True),
     )
 
 

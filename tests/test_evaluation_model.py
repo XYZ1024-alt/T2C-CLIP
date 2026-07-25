@@ -1,5 +1,6 @@
 import unittest
 
+import numpy as np
 import torch
 
 from t2c_clip.evaluation import RerankConfig, evaluate_reid, evaluate_reid_with_rerank
@@ -117,6 +118,170 @@ class EvaluationModelTest(unittest.TestCase):
 
         with self.assertRaises(TypeError):
             evaluate_reid(query, gallery, [1], [1, 2], [1], [2, 2])
+
+    def test_rust_backend_matches_python_across_chunks_and_ties(self):
+        query = torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 0.0]])
+        gallery = torch.tensor(
+            [[1.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.5, 0.5]]
+        )
+        metadata = {
+            "query_ids": [1, 2, 3],
+            "gallery_ids": [9, 1, 2, 3],
+            "query_cams": [0, 0, 0],
+            "gallery_cams": [1, 1, 1, 1],
+        }
+
+        python_metrics = evaluate_reid(
+            query, gallery, **metadata, ranks=(1, 2, 4), backend="python"
+        )
+        rust_metrics = evaluate_reid(
+            query,
+            gallery,
+            **metadata,
+            ranks=(1, 2, 4),
+            backend="rust",
+            query_chunk_size=2,
+        )
+
+        self.assertEqual(rust_metrics, python_metrics)
+
+    def test_rust_backend_accepts_non_contiguous_features(self):
+        torch.manual_seed(2)
+        query = torch.randn(4, 6)[:, ::2]
+        gallery = torch.randn(7, 6)[:, ::2]
+        metadata = {
+            "query_ids": [0, 1, 2, 3],
+            "gallery_ids": [0, 1, 2, 3, 8, 9, 10],
+            "query_cams": [0, 0, 0, 0],
+            "gallery_cams": [1, 1, 1, 1, 2, 2, 2],
+        }
+
+        python_metrics = evaluate_reid(query, gallery, **metadata, backend="python")
+        rust_metrics = evaluate_reid(
+            query, gallery, **metadata, backend="rust", query_chunk_size=3
+        )
+
+        self.assertEqual(rust_metrics, python_metrics)
+
+    def test_rust_sparse_rerank_matches_dense_reference(self):
+        torch.manual_seed(3)
+        query = torch.randn(4, 8)
+        gallery = torch.randn(7, 8)
+        metadata = {
+            "query_ids": [0, 1, 2, 3],
+            "gallery_ids": [0, 1, 2, 3, 0, 1, 9],
+            "query_cams": [0, 0, 0, 0],
+            "gallery_cams": [1, 1, 1, 1, 2, 2, 2],
+        }
+        for config in (
+            RerankConfig(k1=1, k2=1, lambda_value=0.0),
+            RerankConfig(k1=1, k2=3, lambda_value=0.0),
+            RerankConfig(k1=3, k2=2, lambda_value=0.3),
+            RerankConfig(k1=5, k2=3, lambda_value=1.0),
+        ):
+            with self.subTest(config=config):
+                dense = evaluate_reid_with_rerank(
+                    query, gallery, **metadata, ranks=(1, 5), config=config, backend="python"
+                )
+                sparse = evaluate_reid_with_rerank(
+                    query,
+                    gallery,
+                    **metadata,
+                    ranks=(1, 5),
+                    config=config,
+                    backend="rust",
+                    query_chunk_size=3,
+                )
+                self.assertAlmostEqual(sparse.map, dense.map, places=12)
+                self.assertEqual(sparse.cmc, dense.cmc)
+
+    def test_rerank_ties_use_deterministic_combined_index_order(self):
+        query = torch.ones(2, 3)
+        gallery = torch.ones(4, 3)
+        metadata = {
+            "query_ids": [0, 1],
+            "gallery_ids": [9, 0, 1, 8],
+            "query_cams": [0, 0],
+            "gallery_cams": [1, 1, 1, 1],
+        }
+        config = RerankConfig(k1=1, k2=1, lambda_value=0.3)
+
+        dense = evaluate_reid_with_rerank(
+            query, gallery, **metadata, ranks=(1, 4), config=config, backend="python"
+        )
+        sparse = evaluate_reid_with_rerank(
+            query, gallery, **metadata, ranks=(1, 4), config=config, backend="rust"
+        )
+
+        self.assertEqual(sparse, dense)
+
+    def test_sparse_rerank_regression_for_k1_one_with_query_expansion(self):
+        torch.manual_seed(2)
+        query = torch.randn(5, 11)
+        gallery = torch.randn(9, 11)
+        metadata = {
+            "query_ids": [0, 1, 2, 3, 4],
+            "gallery_ids": [0, 1, 2, 3, 4, 0, 1, 8, 9],
+            "query_cams": [0] * 5,
+            "gallery_cams": [1, 1, 1, 1, 1, 2, 2, 2, 2],
+        }
+        config = RerankConfig(k1=1, k2=3, lambda_value=0.0)
+
+        dense = evaluate_reid_with_rerank(
+            query, gallery, **metadata, ranks=(1, 3, 7), config=config, backend="python"
+        )
+        sparse = evaluate_reid_with_rerank(
+            query,
+            gallery,
+            **metadata,
+            ranks=(1, 3, 7),
+            config=config,
+            backend="rust",
+            query_chunk_size=4,
+        )
+
+        self.assertEqual(sparse, dense)
+
+    def test_native_primary_signed_zero_uses_gallery_index_tie_break(self):
+        from t2c_clip.native import native_extension
+
+        average_precision, cmc, count = native_extension.evaluate_scores(
+            np.array([[-0.0, 0.0]], dtype=np.float32),
+            np.array([1], dtype=np.int64),
+            np.array([1, 2], dtype=np.int64),
+            np.array([0], dtype=np.int64),
+            np.array([1, 1], dtype=np.int64),
+            [1],
+        )
+
+        self.assertEqual((average_precision, cmc, count), (1.0, [1], 1))
+
+    def test_native_topk_uses_index_tie_break_and_reports_row_max(self):
+        from t2c_clip.native import native_extension
+
+        distances = np.array([[0.5, 0.1, 0.1, 0.8]], dtype=np.float32)
+        indices, values, maxima = native_extension.select_topk_distances(distances, 3)
+
+        self.assertEqual(indices.tolist(), [[1, 2, 0]])
+        self.assertTrue(np.allclose(values, [[0.1, 0.1, 0.5]]))
+        self.assertTrue(np.allclose(maxima, [0.8]))
+
+    def test_evaluation_rejects_invalid_backend_chunk_and_rank(self):
+        query = torch.ones(1, 2)
+        gallery = torch.ones(1, 2)
+        metadata = {
+            "query_ids": [1],
+            "gallery_ids": [1],
+            "query_cams": [0],
+            "gallery_cams": [1],
+        }
+
+        with self.assertRaisesRegex(ValueError, "unsupported evaluation backend"):
+            evaluate_reid(query, gallery, **metadata, backend="unknown")
+        with self.assertRaisesRegex(ValueError, "query_chunk_size"):
+            evaluate_reid(query, gallery, **metadata, query_chunk_size=0)
+        with self.assertRaisesRegex(ValueError, "ranks"):
+            evaluate_reid(query, gallery, **metadata, ranks=(0,))
 
     def test_evaluate_reid_rejects_empty_query_or_gallery(self):
         with self.assertRaisesRegex(ValueError, "query_features must contain at least one row"):

@@ -20,6 +20,8 @@ Stack:
 - Transformers 5.14.1.
 - Weights & Biases 0.28.1.
 - `uv` for dependency, environment, and command execution.
+- Rust 1.85+ with maturin 1.14, PyO3/rust-numpy 0.29, Rayon, and pure-Rust
+  JPEG/PNG preprocessing. `uv sync` must build `t2c_clip._native`.
 - Standard-library `unittest`; there is no pytest, formatter, linter, or static
   type checker configured in `pyproject.toml`.
 
@@ -69,14 +71,16 @@ T2C-CLIP/
 |   |-- tfc.py                 EMA identity center bank and TFC loss
 |   |-- transforms.py          SigLIP-normalized train/eval image transforms
 |   |-- data.py                Market-1501/MSMT17 parsing
-|   |-- datasets.py            Datasets, collation, and PK batch sampler
-|   |-- evaluation.py          mAP/CMC and optional k-reciprocal reranking
+|   |-- datasets.py            Python reference dataset and Rust batch collator
+|   |-- native.py              Mandatory native ABI/version check
+|   |-- evaluation.py          Chunked Rust mAP/CMC and sparse rerank dispatch
 |   |-- retrieval.py           Fused/image-only retrieval mode constants
 |   |-- loops.py               Generic epoch loop and checkpoint writing
 |   |-- wandb.py               Stage-aware W&B adapter
 |   |-- jobs/siglip2_reid.py   End-to-end training job assembly and runtime
 |   `-- cli/evaluate.py        NPZ feature evaluation CLI
 |-- scripts/train.py           Generic single/two-stage training entrypoint
+|-- rust/                      PyO3 native image/evaluation/rerank crate
 |-- tests/                     Offline unittest suite and tiny/fake models
 |-- README.md                  Operator-facing setup and command reference
 |-- DESIGN.md                  Normative architecture and behavior contract
@@ -94,11 +98,13 @@ Run all Python tooling through `uv`; do not use pip or conda for this project.
 | Action | Command |
 |---|---|
 | Install/sync | `uv sync` |
+| Native Rust tests | `uv run cargo test --manifest-path rust/Cargo.toml --locked` |
 | Full test suite | `uv run python -m unittest discover -s tests` |
 | One test module | `uv run python -m unittest tests.test_siglip2_training_components` |
 | Syntax/import compile check | `uv run python -m compileall -q t2c_clip scripts tests` |
 | Training CLI help | `uv run python -m scripts.train --help` |
 | Evaluation CLI help | `uv run python -m t2c_clip.cli.evaluate --help` |
+| Native benchmark | `uv run python -m t2c_clip.cli.benchmark_native --help` |
 | Check diff hygiene | `git diff --check` |
 
 There is no separate application build step. The useful pre-commit checks are
@@ -162,8 +168,15 @@ Camera retrieval text and identity anchors are cached only when their prompt
 and text dependencies are frozen.
 
 Primary evaluation is no-rerank cosine retrieval with standard same-ID,
-same-camera gallery exclusion. Reranked metrics are optional extras and must
-not replace primary mAP/CMC.
+same-camera gallery exclusion. Torch computes normalized score/distance blocks;
+Rust performs deterministic ranking and metric aggregation. Exact sparse
+k-reciprocal reranking is optional and must not replace primary mAP/CMC.
+
+The default data backend is Rust. It batch-decodes JPEG/PNG, applies the shared
+augmentation configuration, and returns contiguous BCHW FP32 through NumPy to
+Torch without an element-buffer copy. The Python backend is explicit reference
+only; there is no missing-extension fallback. Rust augmentation is reproducible
+within its own version/seed contract but not bitwise identical to torchvision.
 
 ## CODING STANDARDS
 

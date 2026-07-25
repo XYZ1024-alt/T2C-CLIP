@@ -40,9 +40,10 @@ inference prompt = global + camera
 ## 3. 模块边界
 
 ```text
-PIL person crop
-  -> Siglip2TrainImageTransform / Siglip2ImageTransform
-  -> normalized BCHW tensor
+path + person/camera metadata
+  -> Rust batch decoder/augmenter (default) or torchvision reference backend
+  -> normalized contiguous BCHW float32 tensor
+  -> pinned host memory + non-blocking CUDA transfer
   -> fixed SigLIP 2 vision_model + positional interpolation
   -> f_v_raw
   -> feature head (Identity or BNNeck)
@@ -70,6 +71,9 @@ f_v_raw / f_v
 - `training.py`：两阶段 loss 组合。
 - `jobs/siglip2_reid.py`：数据、模型、冻结、优化器、precision、缓存和验证。
 - `precision.py`：precision 解析、autocast、GradScaler 和 optimizer step。
+- `datasets.py` / `transforms.py`：Python reference dataset、共享变换配置、Rust batch collator。
+- `native.py` / `rust/src/`：原生 ABI、自带 JPEG/PNG 数据管线、指标聚合和稀疏 rerank。
+- `evaluation.py`：Torch 分块矩阵计算、Python reference 和 Rust backend 调度。
 - `loops.py` / `scripts/train.py`：epoch、checkpoint、resume、W&B 回调。
 
 不存在旧 `clip_backbone.py`、`jobs/clip_reid.py` 或兼容 alias。
@@ -115,6 +119,13 @@ checkpoint 都在下载前失败。
 
 验证只做 bilinear resize、tensor 转换和 checkpoint processor mean/std normalization。
 不做 center crop，避免高瘦行人图像丢失头部和脚部。
+
+默认 `data_backend=rust` 以 batch 为边界读取 JPEG/PNG 并输出拥有底层内存的 NumPy
+`BCHW float32`，Python 通过 `torch.from_numpy` 共享该 allocation。每个 collate 从
+PyTorch worker RNG 获取一个 batch seed，再用 ChaCha 派生逐图 seed；相同版本 Rust
+backend 在固定全局 seed 下可重放，但不要求与 torchvision 的逐像素结果或随机序列
+一致。`data_backend=python` 保留为显式 reference。PK identity sampler 继续使用 Python，
+不改变 micro-batch 的 P-K 结构。
 
 ### 4.3 Transformers 固定视觉输入
 
@@ -330,6 +341,20 @@ Stage-1 cache、anchor/camera cache、训练和验证使用同一 precision cont
 标准协议排除同身份同 camera gallery。主指标始终是无 rerank mAP/CMC；rerank 只能作为
 额外报告，不能覆盖主指标。
 
+默认评估 backend 为 Rust：Torch 保留 L2 normalization 与矩阵乘法，按 query chunk
+生成完整 gallery 分数；Rust 对每个 query 执行确定性排序、同身份同 camera 过滤和
+AP/CMC 聚合。同分时使用 gallery 原始索引升序作为 tie-break。该路径不常驻完整
+`Q x G` score matrix；显式 `evaluation_backend=python` 仅用于差分和诊断。
+
+k-reciprocal rerank 的主结果地位不变。Rust production 路径分块计算精确全局距离，
+只保留所需 top-k，并以 CSR affinity 与 CSC posting list 执行 reciprocal expansion、
+query expansion 和 Jaccard minima。列归一化转置语义、`round(k1/2)` banker-rounding
+和 lambda 混合必须与 Python 稠密 reference 一致。reciprocal CSR 确定后，Torch 以第二次
+分块距离 pass 提取每条 affinity edge 的精确距离，避免 Rust 标量 dot reduction 改变
+排序。最终 rerank 距离在 `1e-6` 容差内视为并列，并按 gallery 原始索引排序；Python
+reference 与 Rust 使用同一规则。该实现将常驻内存从稠密 `O(N^2)`
+降为 `O(chunk*N + sparse affinity)`，但精确近邻计算仍为 `O(N^2 D)`。
+
 ## 10. Checkpoint 契约
 
 新 checkpoint schema version 为 2，并保存：
@@ -370,7 +395,10 @@ lr
 
 `stage*_train_step` 统计成功的 optimizer update window。step 指标为窗口内 micro-batch
 均值；epoch 指标为所有 micro-batch 的均值。metadata 必须记录 requested/resolved
-precision、micro/effective/eval batch、累积步数、gradient checkpointing 和 patch 信息。
+precision、micro/effective/eval batch、累积步数、gradient checkpointing、patch 信息、
+`data_backend`、`evaluation_backend`、worker/pin/prefetch/persistent 配置和 evaluation
+chunk size。运行后端字段只作为实验 provenance，不进入 schema 2 checkpoint 兼容性
+校验，因此现有 schema 2 Stage-2 checkpoint 仍可恢复。
 
 ## 12. 验收标准
 
@@ -389,8 +417,14 @@ precision、micro/effective/eval batch、累积步数、gradient checkpointing �
 9. accumulation 尾窗口梯度不被低估，W&B step 按 optimizer window 计数。
 10. FP16 scaler 和 SigLIP metadata 可 checkpoint/resume。
 11. 推理路径永远不访问 identity prompt。
-12. `uv run python -m unittest discover -s tests` 全部通过。
-13. `python -m scripts.train --help` 只显示 SigLIP 2 公共参数，不显示旧 `--clip-*` 参数。
+12. `uv run cargo test --manifest-path rust/Cargo.toml --locked` 和
+    `uv run python -m unittest discover -s tests` 全部通过。
+13. Rust/Python 主评估差分在相同 feature 上达到 `1e-12` 聚合一致性；小规模稀疏
+    rerank 与稠密 reference 距离/指标误差不超过 `1e-6`。
+14. 原生 eval resize 的 shape/dtype/contiguous 契约一致，fixture 最大误差不超过一个
+    8-bit 量化步长对应的归一化值；固定 seed 的 Rust 增强可重放。
+15. `python -m scripts.train --help` 只显示 SigLIP 2 与 Rust backend 公共参数，不显示旧
+    `--clip-*` 参数。
 
 ## 13. 明确不做
 
@@ -401,3 +435,5 @@ precision、micro/effective/eval batch、累积步数、gradient checkpointing �
 - 不改成 Text-to-Image ReID。
 - 不让测试身份 prompt 进入推理。
 - 不把 rerank 指标当作主结果。
+- 不加入 GPU JPEG decode、HNSW/ANN 或近似 rerank。
+- 不支持缺失原生扩展时的自动 Python fallback；Python backend 只能显式选择。

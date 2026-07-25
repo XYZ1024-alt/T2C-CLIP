@@ -122,6 +122,10 @@ class Siglip2ReIDJobTest(unittest.TestCase):
         self.assertIn("lr", train_metrics)
         self.assertIsNotNone(job.stage_metadata)
         self.assertEqual(job.stage_metadata.get("dataset"), "market1501")
+        self.assertEqual(job.stage_metadata.get("data_backend"), "rust")
+        self.assertEqual(job.stage_metadata.get("evaluation_backend"), "rust")
+        self.assertFalse(job.stage_metadata.get("pin_memory"))
+        self.assertFalse(job.stage_metadata.get("persistent_workers"))
         self.assertGreaterEqual(metrics.map, 0.0)
         self.assertIn(1, metrics.cmc)
 
@@ -584,6 +588,15 @@ class Siglip2ReIDJobTest(unittest.TestCase):
             job.train_one_epoch(1, TrainBatchReporterRecorder())
 
         self.assertEqual(siglip2.image_feature_calls, 1)
+
+    def test_persistent_workers_require_positive_worker_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            args = _training_args(root)
+            args.persistent_workers = True
+
+            with self.assertRaisesRegex(ValueError, "persistent-workers"):
+                build_training_job(args, siglip2_loader=_load_fake_siglip2)
 
     def test_default_args_freeze_image_encoder_stage2_is_false_when_attr_absent(self):
         # The job config must default Stage-2 image encoder to UNFROZEN (matching
@@ -1142,6 +1155,7 @@ class Siglip2ReIDJobTest(unittest.TestCase):
             root = _build_market_fixture(Path(tmp))
             args = _training_args(root)
             args.stage1_epochs = 1
+            args.data_backend = "python"
             with mock.patch(
                 "t2c_clip.jobs.siglip2_reid.Siglip2TrainImageTransform", PoisonTrainTransform
             ):

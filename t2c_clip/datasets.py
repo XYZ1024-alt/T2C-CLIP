@@ -9,11 +9,16 @@ import random
 from PIL import Image
 import torch
 
+from t2c_clip.native import native_extension as _native
 from t2c_clip.data import ReIDSample
+from t2c_clip.transforms import ImageTransformConfig
 
 ImageTransform = Callable[[Image.Image], torch.Tensor]
 MIN_IDENTITIES_PER_BATCH = 2
 DEFAULT_INSTANCES_PER_IDENTITY = 2
+RUST_DATA_BACKEND = "rust"
+PYTHON_DATA_BACKEND = "python"
+SUPPORTED_DATA_BACKENDS = (RUST_DATA_BACKEND, PYTHON_DATA_BACKEND)
 
 
 @dataclass(frozen=True)
@@ -34,12 +39,38 @@ class ReIDImageItem:
 
 
 @dataclass(frozen=True)
+class ReIDImageRecord:
+    image_path: str
+    person_id: int
+    camera_id: int
+    original_person_id: int
+    original_camera_id: int
+
+
+@dataclass(frozen=True)
+class ReIDMetadataDatasetConfig:
+    samples: Sequence[ReIDSample]
+    person_id_map: Mapping[int, int]
+    camera_id_map: Mapping[int, int]
+    transform: ImageTransformConfig
+
+
+@dataclass(frozen=True)
 class ReIDImageBatch:
     images: torch.Tensor
     person_ids: torch.Tensor
     camera_ids: torch.Tensor
     original_person_ids: tuple[int, ...]
     original_camera_ids: tuple[int, ...]
+
+    def pin_memory(self) -> "ReIDImageBatch":
+        return ReIDImageBatch(
+            images=self.images.pin_memory(),
+            person_ids=self.person_ids.pin_memory(),
+            camera_ids=self.camera_ids.pin_memory(),
+            original_person_ids=self.original_person_ids,
+            original_camera_ids=self.original_camera_ids,
+        )
 
 
 class ReIDImageDataset(torch.utils.data.Dataset):
@@ -69,6 +100,80 @@ class ReIDImageDataset(torch.utils.data.Dataset):
 
     def _mapped_person_id(self, sample: ReIDSample) -> int:
         return _map_value(self._config.person_id_map, sample.person_id, "person_id")
+
+
+class ReIDMetadataDataset(torch.utils.data.Dataset):
+    def __init__(self, config: ReIDMetadataDatasetConfig):
+        self._config = config
+
+    def __len__(self) -> int:
+        return len(self._config.samples)
+
+    @property
+    def person_ids(self) -> tuple[int, ...]:
+        return tuple(self._mapped_person_id(sample) for sample in self._config.samples)
+
+    @property
+    def transform_config(self) -> ImageTransformConfig:
+        return self._config.transform
+
+    def __getitem__(self, index: int) -> ReIDImageRecord:
+        sample = self._config.samples[index]
+        return ReIDImageRecord(
+            image_path=str(sample.image_path),
+            person_id=self._mapped_person_id(sample),
+            camera_id=_map_value(self._config.camera_id_map, sample.camera_id, "camera_id"),
+            original_person_id=sample.person_id,
+            original_camera_id=sample.camera_id,
+        )
+
+    def _mapped_person_id(self, sample: ReIDSample) -> int:
+        return _map_value(self._config.person_id_map, sample.person_id, "person_id")
+
+
+@dataclass(frozen=True)
+class RustReIDBatchCollator:
+    transform: ImageTransformConfig
+    threads: int = 1
+
+    def __post_init__(self) -> None:
+        if self.threads < 1:
+            raise ValueError("Rust data threads must be positive")
+
+    def __call__(self, items: Sequence[ReIDImageRecord]) -> ReIDImageBatch:
+        if not items:
+            raise ValueError("cannot collate an empty ReID batch")
+        config = self.transform
+        batch_seed = (
+            int(torch.randint(0, torch.iinfo(torch.int64).max, (), dtype=torch.int64).item())
+            if config.training
+            else 0
+        )
+        images = torch.from_numpy(
+            _native.load_image_batch(
+                [item.image_path for item in items],
+                batch_seed,
+                config.image_size[0],
+                config.image_size[1],
+                list(config.mean),
+                list(config.std),
+                config.training,
+                config.flip_prob,
+                list(config.color_jitter),
+                config.crop_padding,
+                config.erase_prob,
+                list(config.erase_scale),
+                list(config.erase_ratio),
+                self.threads,
+            )
+        )
+        return ReIDImageBatch(
+            images=images,
+            person_ids=torch.tensor([item.person_id for item in items], dtype=torch.long),
+            camera_ids=torch.tensor([item.camera_id for item in items], dtype=torch.long),
+            original_person_ids=tuple(item.original_person_id for item in items),
+            original_camera_ids=tuple(item.original_camera_id for item in items),
+        )
 
 
 class IdentityBalancedBatchSampler(torch.utils.data.Sampler[list[int]]):
@@ -117,6 +222,12 @@ def collate_reid_batches(items: Sequence[ReIDImageItem]) -> ReIDImageBatch:
         original_person_ids=tuple(item.original_person_id for item in items),
         original_camera_ids=tuple(item.original_camera_id for item in items),
     )
+
+
+def require_data_backend(backend: str) -> str:
+    if backend not in SUPPORTED_DATA_BACKENDS:
+        raise ValueError(f"unsupported data backend {backend!r}; expected one of {SUPPORTED_DATA_BACKENDS}")
+    return backend
 
 
 def _identities_per_batch(batch_size: int, instances_per_identity: int) -> int:

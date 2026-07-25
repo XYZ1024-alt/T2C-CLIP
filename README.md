@@ -44,16 +44,25 @@ the text branch. `--retrieval-mode fused` uses the inference prompt above.
 
 ## Environment
 
-The project uses `uv`:
+The project uses `uv` and builds a mandatory Rust extension with `maturin`:
 
 ```bash
 uv sync
+uv run python -c "from t2c_clip.native import NATIVE_VERSION; print(NATIVE_VERSION)"
 uv run python -m unittest discover -s tests
 ```
+
+Install stable Rust `1.85+` before `uv sync`. Windows x86_64 requires the
+MSVC Rust target and Visual Studio Build Tools; Linux x86_64 requires a C
+linker. The extension is built as the private CPython module
+`t2c_clip._native`. There is no automatic Python fallback when that module is
+missing or has an incompatible ABI.
 
 Core requirements are declared in `pyproject.toml`:
 
 - Python 3.14+
+- Rust 1.85+ and maturin 1.14+
+- NumPy 2.4+
 - PyTorch 2.13+
 - torchvision 0.28+
 - Transformers 5.14.1+
@@ -202,6 +211,14 @@ Batching and memory:
 - `--eval-batch-size 16`
 - `--num-instances 2`
 - `--gradient-accumulation-steps 4`
+- `--num-workers 4`
+- `--data-backend rust|python` (default `rust`; Python is a reference backend)
+- `--prefetch-factor 2`
+- `--pin-memory / --no-pin-memory` (defaults on for CUDA)
+- `--persistent-workers / --no-persistent-workers` (defaults on with workers)
+- `--rust-data-threads 1`
+- `--evaluation-backend rust|python` (default `rust`)
+- `--evaluation-chunk-size 256`
 - `--precision auto|fp32|bf16|fp16`
 - `--gradient-checkpointing / --no-gradient-checkpointing`
 
@@ -295,16 +312,74 @@ uv run python -m t2c_clip.cli.evaluate path/to/features.npz \
 ```
 
 The evaluator applies the standard Image-to-Image ReID protocol and excludes
-same-identity, same-camera gallery samples. Primary metrics are no-rerank;
-`--report-rerank` adds separate rerank metrics during training validation.
+same-identity, same-camera gallery samples. Rust evaluates exact cosine scores
+in query chunks and aggregates deterministic mAP/CMC without retaining the
+complete `Q x G` score matrix. Primary metrics remain no-rerank.
+
+Add exact sparse k-reciprocal metrics without replacing the primary result:
+
+```bash
+uv run python -m t2c_clip.cli.evaluate path/to/features.npz \
+  --report-rerank \
+  --rerank-k1 20 \
+  --rerank-k2 6 \
+  --rerank-lambda 0.3
+```
+
+Sparse rerank keeps exact all-sample neighbor search and therefore still has
+`O(N^2 D)` compute. After reciprocal edges are known, a second chunked Torch
+pass extracts their exact affinity distances; resident affinity and Jaccard
+structures remain sparse. Rerank distances within `1e-6` are treated as ties
+and ordered by gallery index in both backends.
+
+## Native Data Pipeline
+
+The default training loader sends path/ID records to a batch collator. Rust
+reads JPEG/PNG images, converts to RGB, applies flip, randomized ColorJitter,
+bilinear resize, padded crop, SigLIP normalization, and normalized-space random
+erasing, then transfers an owned contiguous `BCHW float32` allocation to NumPy
+and `torch.from_numpy` without copying the element buffer.
+
+A fixed `--seed` is repeatable within the same Rust pipeline version. The Rust
+augmentation parameters and operation order match the torchvision pipeline,
+but stochastic pixel values and random-number sequences are not bitwise
+compatible with the Python backend. Eval resize regression fixtures differ by
+at most one 8-bit quantization step after normalization.
+
+## Performance Benchmark
+
+Run the self-contained synthetic benchmark:
+
+```bash
+uv run python -m t2c_clip.cli.benchmark_native \
+  --mode all \
+  --runs 5 \
+  --warmup-runs 1 \
+  --output output/native-benchmark.json
+```
+
+Use real training images by adding `--dataset market1501|msmt17 --data-root
+PATH`. The benchmark defaults to two Rust threads per data worker because that
+was the first configuration to clear the synthetic throughput gate; production
+training retains the conservative `--rust-data-threads 1` default and should be
+tuned against available CPU cores. The JSON reports median/p95 duration, throughput, sampled RSS, backend
+speedup, metric parity, and the acceptance gates: data `1.5x`, primary
+evaluation `3x`, rerank `2x`, and rerank RSS ratio `<=0.4`. Benchmark gates are
+not CI assertions because timing is hardware-sensitive. The recorded synthetic
+Windows run and its real-dataset follow-up command are in
+[docs/native-performance.md](docs/native-performance.md).
 
 ## Verification
 
 Run the offline suite and inspect the CLI:
 
 ```bash
+uv run cargo test --manifest-path rust/Cargo.toml --locked
 uv run python -m unittest discover -s tests
+uv run python -m compileall -q t2c_clip scripts tests
 uv run python -m scripts.train --help
+uv run python -m t2c_clip.cli.evaluate --help
+uv run python -m t2c_clip.cli.benchmark_native --help
 ```
 
 The suite uses tiny randomly initialized fixed Transformers SigLIP models,

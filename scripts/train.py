@@ -21,7 +21,13 @@ from typing import Any, Sequence
 
 import torch
 
-from t2c_clip.evaluation import ReIDMetrics
+from t2c_clip.evaluation import (
+    DEFAULT_QUERY_CHUNK_SIZE,
+    ReIDMetrics,
+    RUST_EVALUATION_BACKEND,
+    SUPPORTED_EVALUATION_BACKENDS,
+)
+from t2c_clip.datasets import RUST_DATA_BACKEND, SUPPORTED_DATA_BACKENDS
 from t2c_clip.loops import (
     MetricLogger,
     TrainMetricLogger,
@@ -55,6 +61,11 @@ DEFAULT_GRADIENT_ACCUMULATION_STEPS = 4
 DEFAULT_PRECISION = "auto"
 DEFAULT_NUM_INSTANCES = 2
 DEFAULT_NUM_WORKERS = 4
+DEFAULT_PREFETCH_FACTOR = 2
+DEFAULT_RUST_DATA_THREADS = 1
+DEFAULT_DATA_BACKEND = RUST_DATA_BACKEND
+DEFAULT_EVALUATION_BACKEND = RUST_EVALUATION_BACKEND
+DEFAULT_EVALUATION_CHUNK_SIZE = DEFAULT_QUERY_CHUNK_SIZE
 DEFAULT_LEARNING_RATE = 1e-4
 DEFAULT_IMAGE_ENCODER_LR = 5e-6
 DEFAULT_BETA_WARMUP_EPOCHS = 0
@@ -254,6 +265,29 @@ def _add_project_training_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--image-width", type=int, default=DEFAULT_IMAGE_SIZE[1])
     parser.add_argument("--num-instances", type=int, default=DEFAULT_NUM_INSTANCES)
     parser.add_argument("--num-workers", type=int, default=DEFAULT_NUM_WORKERS)
+    parser.add_argument("--data-backend", choices=SUPPORTED_DATA_BACKENDS, default=DEFAULT_DATA_BACKEND)
+    parser.add_argument("--prefetch-factor", type=int, default=DEFAULT_PREFETCH_FACTOR)
+    parser.add_argument(
+        "--pin-memory",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
+        "--persistent-workers",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument("--rust-data-threads", type=int, default=DEFAULT_RUST_DATA_THREADS)
+    parser.add_argument(
+        "--evaluation-backend",
+        choices=SUPPORTED_EVALUATION_BACKENDS,
+        default=DEFAULT_EVALUATION_BACKEND,
+    )
+    parser.add_argument(
+        "--evaluation-chunk-size",
+        type=int,
+        default=DEFAULT_EVALUATION_CHUNK_SIZE,
+    )
     parser.add_argument("--lr", type=float, default=DEFAULT_LEARNING_RATE)
     parser.add_argument("--image-encoder-lr", type=float, default=DEFAULT_IMAGE_ENCODER_LR)
     parser.add_argument("--sie-coe", type=float, default=0.0)
