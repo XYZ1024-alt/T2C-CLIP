@@ -1,10 +1,10 @@
-# Train2Central-CLIP（T2C-CLIP）研究与实验蓝图
+# Train2Central ReID（T2C-ReID）研究与实验蓝图
 
 > 本文档只维护研究假设、实验表、消融方案与机制分析。当前架构、模块边界和实现验收标准以 [DESIGN.md](../DESIGN.md) 为准；可执行命令以 [README.md](../README.md) 为准。
 
 ## 1. 项目定位
 
-Train2Central-CLIP（T2C-CLIP）面向监控场景下的 Image-to-Image 行人重识别。检索输入始终是 query 图像和 gallery 图像，不使用自然语言 caption，不进行 Text-to-Image 检索评测，也不使用 CUHK-PEDES 等 Text-ReID 数据集。
+Train2Central ReID（T2C-ReID）面向监控场景下的 Image-to-Image 行人重识别。检索输入始终是 query 图像和 gallery 图像，不使用自然语言 caption，不进行 Text-to-Image 检索评测，也不使用 CUHK-PEDES 等 Text-ReID 数据集。
 
 模型基座为 SigLIP 2 So400m patch14 双流结构。训练和推理阶段都使用图像编码器与文本编码器：图像流提供主视觉特征，文本流通过 learnable prompt 产生辅助语义特征。训练与推理使用一致的最终检索特征：
 
@@ -19,7 +19,7 @@ f   = normalize(f_v + beta * f_t)
 
 ## 2. 明确不做的内容
 
-T2C-CLIP 不引入以下组件或评测设定：
+T2C-ReID 不引入以下组件或评测设定：
 
 - CCT-Proto、超图推理、原型传播、测试时图搜索。
 - Text-to-Image 检索评测。
@@ -197,7 +197,7 @@ Market-1501 作为辅数据集，按标准 Image-to-Image ReID 协议评测，�
 | AGW | CNN | 否 | 否 | 真实实验或核对引用后填写 | 真实实验或核对引用后填写 | 真实实验或核对引用后填写 | 真实实验或核对引用后填写 |
 | TransReID | ViT | 否 | 否 | 真实实验或核对引用后填写 | 真实实验或核对引用后填写 | 真实实验或核对引用后填写 | 真实实验或核对引用后填写 |
 | CLIP-ReID | CLIP ViT | 依论文协议核对 | 否 | 真实实验或核对引用后填写 | 真实实验或核对引用后填写 | 真实实验或核对引用后填写 | 真实实验或核对引用后填写 |
-| T2C-CLIP | SigLIP 2 So400m/14 | 是 | 否 | 真实实验后填写 | 真实实验后填写 | 真实实验后填写 | 真实实验后填写 |
+| T2C-ReID | SigLIP 2 So400m/14 | 是 | 否 | 真实实验后填写 | 真实实验后填写 | 真实实验后填写 | 真实实验后填写 |
 
 引用近期方法时必须核对协议：无 rerank 不能与 rerank 结果混报，Text-ReID 结果不能放入 Image-ReID 主结果表。
 
@@ -209,7 +209,7 @@ Market-1501 作为辅数据集，按标准 Image-to-Image ReID 协议评测，�
 | Dual stream without cam prompt | 是 | 是 | 否 | 否 | 真实实验后填写 | 真实实验后填写 |
 | Dual stream with cam prompt | 是 | 是 | 是 | 否 | 真实实验后填写 | 真实实验后填写 |
 | Dual stream with TFC, no cam prompt | 是 | 是 | 否 | 是 | 真实实验后填写 | 真实实验后填写 |
-| Full T2C-CLIP | 是 | 是 | 是 | 是 | 真实实验后填写 | 真实实验后填写 |
+| Full T2C-ReID | 是 | 是 | 是 | 是 | 真实实验后填写 | 真实实验后填写 |
 
 ### 8.3 TFC 消融表
 
@@ -249,7 +249,7 @@ Market-1501 作为辅数据集，按标准 Image-to-Image ReID 协议评测，�
 |---|---:|---:|---:|---:|---:|
 | Stage-2 only | 否 | 是 | 否 | 真实实验后填写 | 真实实验后填写 |
 | Stage-1 + Stage-2 | 是 | 是 | 否 | 真实实验后填写 | 真实实验后填写 |
-| Full T2C-CLIP | 是 | 是 | 是 | 真实实验后填写 | 真实实验后填写 |
+| Full T2C-ReID | 是 | 是 | 是 | 真实实验后填写 | 真实实验后填写 |
 
 ## 9. 机制分析设计
 

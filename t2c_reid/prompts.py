@@ -1,12 +1,12 @@
-"""Learnable prompt composition for T2C-SigLIP 2.
+"""Learnable prompt composition for T2C-ReID.
 
 The ``embedding_dim`` of the prompt bank must equal the SigLIP 2 text model
 **token embedding dimension** (``text_model.embeddings.token_embedding``'s
 hidden dimension), not the shared output feature dimension. The job
 builder obtains this dimension from
-:func:`t2c_clip.siglip2_backbone.siglip2_text_hidden_dim`. Each prompt
+:func:`t2c_reid.siglip2_backbone.siglip2_text_hidden_dim`. Each prompt
 parameter lives in token-embedding space and is injected by
-:class:`~t2c_clip.siglip2_backbone.TransformersSiglip2TextEncoder` into fixed
+:class:`~t2c_reid.siglip2_backbone.TransformersSiglip2TextEncoder` into fixed
 context slots using the loaded checkpoint's native fixed-length padding
 layout.
 

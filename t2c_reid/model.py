@@ -1,4 +1,4 @@
-"""Injectable dual-stream T2C-SigLIP 2 model wiring.
+"""Injectable dual-stream T2C-ReID model wiring.
 
 The model has three explicit forward paths:
 
@@ -21,12 +21,12 @@ from __future__ import annotations
 
 import torch
 
-from t2c_clip.features import fuse_features, l2_normalize
-from t2c_clip.prompts import PromptBank, validate_index_tensor
-from t2c_clip.retrieval import FUSED_RETRIEVAL, IMAGE_ONLY_RETRIEVAL, require_retrieval_mode
+from t2c_reid.features import fuse_features, l2_normalize
+from t2c_reid.prompts import PromptBank, validate_index_tensor
+from t2c_reid.retrieval import FUSED_RETRIEVAL, IMAGE_ONLY_RETRIEVAL, require_retrieval_mode
 
 
-class T2CSiglip2Model(torch.nn.Module):
+class T2CReIDModel(torch.nn.Module):
     def __init__(
         self,
         image_encoder: torch.nn.Module,

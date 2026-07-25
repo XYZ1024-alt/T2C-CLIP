@@ -4,8 +4,8 @@ import unittest
 
 import torch
 
-from t2c_clip.evaluation import ReIDMetrics
-from t2c_clip.loops import TrainingLoopConfig, run_training_loop
+from t2c_reid.evaluation import ReIDMetrics
+from t2c_reid.loops import TrainingLoopConfig, run_training_loop
 
 
 class ProgressRecorder:
@@ -322,7 +322,7 @@ class TrainingLoopTest(unittest.TestCase):
             self.assertEqual(result.best_map, 0.0123)
 
     def test_sanity_gate_raises_when_best_map_stays_at_random_floor(self):
-        from t2c_clip.loops import SanityCheckFailed
+        from t2c_reid.loops import SanityCheckFailed
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(SanityCheckFailed) as context:
                 run_training_loop(

@@ -1,4 +1,4 @@
-"""Weights & Biases tracking support for T2C-CLIP training."""
+"""Weights & Biases tracking support for T2C-ReID training."""
 
 from __future__ import annotations
 
@@ -10,12 +10,12 @@ from pathlib import Path
 from typing import Any, Literal, TYPE_CHECKING
 import warnings
 
-from t2c_clip.evaluation import ReIDMetrics
+from t2c_reid.evaluation import ReIDMetrics
 
 if TYPE_CHECKING:
-    from t2c_clip.loops import TrainMetricLogger, TrainStepMetricLogger
+    from t2c_reid.loops import TrainMetricLogger, TrainStepMetricLogger
 
-DEFAULT_WANDB_PROJECT = "T2C-CLIP"
+DEFAULT_WANDB_PROJECT = "T2C-ReID"
 DEFAULT_WANDB_MODE = "online"
 WANDB_MODES = ("online", "offline")
 TRAIN_STAGES = ("stage1", "stage2")

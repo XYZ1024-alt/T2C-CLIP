@@ -10,7 +10,7 @@ from typing import Sequence
 import numpy as np
 import torch
 
-from t2c_clip.evaluation import (
+from t2c_reid.evaluation import (
     DEFAULT_QUERY_CHUNK_SIZE,
     DEFAULT_RANKS,
     DEFAULT_RERANK_K1,

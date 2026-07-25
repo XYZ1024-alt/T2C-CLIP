@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 from transformers import Siglip2Config, Siglip2Model, SiglipConfig, SiglipModel
 
-from t2c_clip.siglip2_backbone import (
+from t2c_reid.siglip2_backbone import (
     TransformersSiglip2ImageEncoder,
     TransformersSiglip2TextEncoder,
     patchify_siglip2_images,
@@ -16,7 +16,7 @@ from t2c_clip.siglip2_backbone import (
     siglip2_uses_patchified_inputs,
     validate_siglip2_image_size,
 )
-from t2c_clip.transforms import Siglip2ImageTransform, Siglip2TrainImageTransform
+from t2c_reid.transforms import Siglip2ImageTransform, Siglip2TrainImageTransform
 from tests._siglip2_fakes import FakeSiglip2, FakeSiglip2ImageProcessor
 
 

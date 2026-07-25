@@ -1,12 +1,12 @@
-# T2C-CLIP 完整设计文档
+# T2C-ReID 完整设计文档
 
 ## 1. 项目定位
 
-T2C-CLIP 面向 Image-to-Image 行人重识别。检索输入始终是 query 图像和
+T2C-ReID 面向 Image-to-Image 行人重识别。检索输入始终是 query 图像和
 gallery 图像，不使用自然语言 caption，不做 Text-to-Image 检索，也不使用
 CUHK-PEDES 等 Text-ReID 数据集。
 
-项目品牌和 Python 包名继续使用 T2C-CLIP / `t2c_clip`。模型基座固定为：
+项目名称为 T2C-ReID，Python 包名为 `t2c_reid`。模型基座固定为：
 
 ```text
 google/siglip2-so400m-patch14-384
@@ -66,7 +66,7 @@ f_v_raw / f_v
 
 - `siglip2_backbone.py`：固定 BCHW 视觉/SIE adapter、文本 prompt 注入和格式校验。
 - `prompts.py`：global、camera、training identity prompt bank。
-- `model.py`：`T2CSiglip2Model` 的 Stage-1、Stage-2 和推理路径。
+- `model.py`：`T2CReIDModel` 的 Stage-1、Stage-2 和推理路径。
 - `losses.py`：监督式 SigLIP、全身份 anchor SigLIP、batch-hard triplet。
 - `training.py`：两阶段 loss 组合。
 - `jobs/siglip2_reid.py`：数据、模型、冻结、优化器、precision、缓存和验证。

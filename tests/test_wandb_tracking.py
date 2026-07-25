@@ -7,8 +7,8 @@ import tempfile
 import unittest
 from unittest import mock
 
-from t2c_clip.evaluation import ReIDMetrics
-from t2c_clip.wandb import (
+from t2c_reid.evaluation import ReIDMetrics
+from t2c_reid.wandb import (
     WandbConfig,
     WandbTracker,
     _load_wandb,
@@ -58,10 +58,10 @@ class FakeWandb:
 
 
 class WandbConfigTest(unittest.TestCase):
-    def test_defaults_to_online_t2c_clip_project(self):
+    def test_defaults_to_online_t2c_reid_project(self):
         config = WandbConfig()
 
-        self.assertEqual(config.project, "T2C-CLIP")
+        self.assertEqual(config.project, "T2C-ReID")
         self.assertEqual(config.mode, "online")
         self.assertIsNone(config.entity)
         self.assertIsNone(config.directory)
@@ -79,12 +79,12 @@ class WandbRunContextTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp) / "tracking"
             config = WandbConfig(
-                project="T2C-CLIP-Test",
+                project="T2C-ReID-Test",
                 entity="test-team",
                 mode="offline",
                 directory=directory,
             )
-            with mock.patch("t2c_clip.wandb._load_wandb", return_value=fake_wandb):
+            with mock.patch("t2c_reid.wandb._load_wandb", return_value=fake_wandb):
                 with start_wandb_run(config, "test-run") as tracker:
                     self.assertIs(tracker.run, fake_wandb.run)
 
@@ -95,7 +95,7 @@ class WandbRunContextTest(unittest.TestCase):
             fake_wandb.init_calls,
             [
                 {
-                    "project": "T2C-CLIP-Test",
+                    "project": "T2C-ReID-Test",
                     "entity": "test-team",
                     "name": "test-run",
                     "mode": "offline",
@@ -107,18 +107,18 @@ class WandbRunContextTest(unittest.TestCase):
 
     def test_init_omits_optional_entity_and_directory(self):
         fake_wandb = FakeWandb()
-        with mock.patch("t2c_clip.wandb._load_wandb", return_value=fake_wandb):
+        with mock.patch("t2c_reid.wandb._load_wandb", return_value=fake_wandb):
             with start_wandb_run(WandbConfig(), "train"):
                 pass
 
         self.assertEqual(
             fake_wandb.init_calls,
-            [{"project": "T2C-CLIP", "name": "train", "mode": "online"}],
+            [{"project": "T2C-ReID", "name": "train", "mode": "online"}],
         )
 
     def test_training_exception_finishes_failed_run_and_is_not_swallowed(self):
         fake_wandb = FakeWandb()
-        with mock.patch("t2c_clip.wandb._load_wandb", return_value=fake_wandb):
+        with mock.patch("t2c_reid.wandb._load_wandb", return_value=fake_wandb):
             with self.assertRaisesRegex(RuntimeError, "training failed"):
                 with start_wandb_run(WandbConfig(mode="offline"), "failed-run"):
                     raise RuntimeError("training failed")
@@ -128,7 +128,7 @@ class WandbRunContextTest(unittest.TestCase):
     def test_init_returning_no_run_fails_explicitly(self):
         fake_wandb = FakeWandb()
         fake_wandb.run = None
-        with mock.patch("t2c_clip.wandb._load_wandb", return_value=fake_wandb):
+        with mock.patch("t2c_reid.wandb._load_wandb", return_value=fake_wandb):
             with self.assertRaisesRegex(RuntimeError, "returned no run"):
                 with start_wandb_run(WandbConfig(mode="offline"), "missing-run"):
                     pass

@@ -1,4 +1,4 @@
-"""Stage-1 and Stage-2 loss wiring for T2C-SigLIP 2.
+"""Stage-1 and Stage-2 loss wiring for T2C-ReID.
 
 Stage-1 aligns image features with identity-aware prompt features using the
 native all-pairs SigLIP sigmoid objective. Stage-2 keeps the ReID identity,
@@ -15,13 +15,13 @@ from dataclasses import dataclass, field
 import torch
 from torch.nn import functional as F
 
-from t2c_clip.losses import (
+from t2c_reid.losses import (
     batch_hard_triplet_loss,
     siglip_identity_anchor_loss,
     supervised_siglip_loss,
 )
-from t2c_clip.model import T2CSiglip2Model
-from t2c_clip.tfc import TFCCenterBank
+from t2c_reid.model import T2CReIDModel
+from t2c_reid.tfc import TFCCenterBank
 
 DEFAULT_LOGIT_SCALE = 1.0
 DEFAULT_LOGIT_BIAS = 0.0
@@ -95,7 +95,7 @@ class Stage2LossBreakdown:
 
 
 def stage1_alignment_loss(
-    model: T2CSiglip2Model,
+    model: T2CReIDModel,
     batch: TrainingBatch,
     config: Stage1LossConfig,
 ) -> Stage1LossBreakdown:
@@ -110,7 +110,7 @@ def stage1_alignment_loss(
 
 
 def stage1_alignment_loss_from_visual(
-    model: T2CSiglip2Model,
+    model: T2CReIDModel,
     visual: torch.Tensor,
     camera_ids: torch.Tensor,
     person_ids: torch.Tensor,
@@ -130,7 +130,7 @@ def stage1_alignment_loss_from_visual(
 
 
 def stage2_loss_breakdown(
-    model: T2CSiglip2Model,
+    model: T2CReIDModel,
     batch: TrainingBatch,
     inputs: Stage2LossInputs,
 ) -> Stage2LossBreakdown:

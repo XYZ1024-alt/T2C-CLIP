@@ -9,9 +9,9 @@ import random
 from PIL import Image
 import torch
 
-from t2c_clip.native import native_extension as _native
-from t2c_clip.data import ReIDSample
-from t2c_clip.transforms import ImageTransformConfig
+from t2c_reid.native import native_extension as _native
+from t2c_reid.data import ReIDSample
+from t2c_reid.transforms import ImageTransformConfig
 
 ImageTransform = Callable[[Image.Image], torch.Tensor]
 MIN_IDENTITIES_PER_BATCH = 2

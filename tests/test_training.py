@@ -2,16 +2,16 @@ import unittest
 
 import torch
 
-from t2c_clip.features import l2_normalize
-from t2c_clip.losses import (
+from t2c_reid.features import l2_normalize
+from t2c_reid.losses import (
     batch_hard_triplet_loss,
     siglip_identity_anchor_loss,
     supervised_siglip_loss,
 )
-from t2c_clip.model import T2CSiglip2Model
-from t2c_clip.prompts import PromptBank, PromptConfig
-from t2c_clip.tfc import TFCCenterBank
-from t2c_clip.training import (
+from t2c_reid.model import T2CReIDModel
+from t2c_reid.prompts import PromptBank, PromptConfig
+from t2c_reid.tfc import TFCCenterBank
+from t2c_reid.training import (
     Stage1LossConfig,
     Stage2LossConfig,
     Stage2LossInputs,
@@ -556,7 +556,7 @@ def _training_model(
     beta: float,
     feature_head: torch.nn.Module | None = None,
     camera_prompt: torch.Tensor | None = None,
-) -> T2CSiglip2Model:
+) -> T2CReIDModel:
     bank = PromptBank(PromptConfig(num_cameras=2, num_train_ids=2, context_length=1, embedding_dim=2))
     with torch.no_grad():
         bank.global_prompt.zero_()
@@ -565,4 +565,4 @@ def _training_model(
             bank.camera_prompts.copy_(camera_prompt.unsqueeze(0).expand_as(bank.camera_prompts))
         bank.identity_prompts[0] = torch.tensor([[1.0, 0.0]])
         bank.identity_prompts[1] = torch.tensor([[0.0, 1.0]])
-    return T2CSiglip2Model(IdentityEncoder(), PromptMeanEncoder(), bank, beta=beta, feature_head=feature_head)
+    return T2CReIDModel(IdentityEncoder(), PromptMeanEncoder(), bank, beta=beta, feature_head=feature_head)

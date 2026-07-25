@@ -10,8 +10,8 @@ from PIL import Image
 import torch
 from transformers import SiglipConfig, SiglipModel
 
-from t2c_clip.datasets import ReIDImageBatch
-from t2c_clip.jobs.siglip2_reid import (
+from t2c_reid.datasets import ReIDImageBatch
+from t2c_reid.jobs.siglip2_reid import (
     Siglip2LoadResult,
     Siglip2ReIDTrainingModel,
     JobDataConfig,
@@ -24,9 +24,9 @@ from t2c_clip.jobs.siglip2_reid import (
     load_transformers_siglip2,
     _validate_loaded_siglip2,
 )
-from t2c_clip.retrieval import IMAGE_ONLY_RETRIEVAL
-from t2c_clip.siglip2_backbone import SIGLIP2_MODEL_ID
-from t2c_clip.transforms import Siglip2ImageTransform
+from t2c_reid.retrieval import IMAGE_ONLY_RETRIEVAL
+from t2c_reid.siglip2_backbone import SIGLIP2_MODEL_ID
+from t2c_reid.transforms import Siglip2ImageTransform
 from tests._siglip2_fakes import FakeSiglip2, FakeSiglip2Tokenizer, FakeSiglip2ImageProcessor
 
 
@@ -626,7 +626,7 @@ class Siglip2ReIDJobTest(unittest.TestCase):
             reid_head="linear",
             retrieval_mode="fused",
         )
-        from t2c_clip.jobs.siglip2_reid import _job_config_from_args
+        from t2c_reid.jobs.siglip2_reid import _job_config_from_args
 
         config = _job_config_from_args(args)
         self.assertFalse(config.freeze_image_encoder_stage2)
@@ -754,7 +754,7 @@ class Siglip2ReIDJobTest(unittest.TestCase):
         self.assertEqual(first, second)
 
     def test_job_config_reads_num_instances(self):
-        from t2c_clip.jobs.siglip2_reid import _job_config_from_args
+        from t2c_reid.jobs.siglip2_reid import _job_config_from_args
 
         args = _training_args(Path("."))
         args.num_instances = 4
@@ -764,7 +764,7 @@ class Siglip2ReIDJobTest(unittest.TestCase):
         self.assertEqual(config.num_instances, 4)
 
     def test_job_config_reads_id_logit_scale(self):
-        from t2c_clip.jobs.siglip2_reid import _job_config_from_args
+        from t2c_reid.jobs.siglip2_reid import _job_config_from_args
 
         args = _training_args(Path("."))
         args.id_logit_scale = 10.0
@@ -774,7 +774,7 @@ class Siglip2ReIDJobTest(unittest.TestCase):
         self.assertEqual(config.id_logit_scale, 10.0)
 
     def test_job_config_reads_triplet_metric(self):
-        from t2c_clip.jobs.siglip2_reid import _job_config_from_args
+        from t2c_reid.jobs.siglip2_reid import _job_config_from_args
 
         args = _training_args(Path("."))
         args.triplet_metric = "cosine"
@@ -784,7 +784,7 @@ class Siglip2ReIDJobTest(unittest.TestCase):
         self.assertEqual(config.triplet_metric, "cosine")
 
     def test_job_config_triplet_metric_defaults_to_euclidean_when_absent(self):
-        from t2c_clip.jobs.siglip2_reid import _job_config_from_args
+        from t2c_reid.jobs.siglip2_reid import _job_config_from_args
 
         args = _training_args(Path("."))
         del args.triplet_metric
@@ -794,7 +794,7 @@ class Siglip2ReIDJobTest(unittest.TestCase):
         self.assertEqual(config.triplet_metric, "euclidean")
 
     def test_stage_metadata_includes_triplet_metric(self):
-        from t2c_clip.jobs.siglip2_reid import _job_config_from_args, _stage_metadata
+        from t2c_reid.jobs.siglip2_reid import _job_config_from_args, _stage_metadata
 
         args = _training_args(Path("."))
         args.triplet_metric = "cosine"
@@ -804,7 +804,7 @@ class Siglip2ReIDJobTest(unittest.TestCase):
         self.assertEqual(metadata.get("triplet_metric"), "cosine")
 
     def test_job_config_num_instances_defaults_to_two_when_absent(self):
-        from t2c_clip.jobs.siglip2_reid import _job_config_from_args
+        from t2c_reid.jobs.siglip2_reid import _job_config_from_args
 
         args = _training_args(Path("."))
 
@@ -813,7 +813,7 @@ class Siglip2ReIDJobTest(unittest.TestCase):
         self.assertEqual(config.num_instances, 2)
 
     def test_train_loader_uses_configured_num_instances(self):
-        from t2c_clip.jobs.siglip2_reid import _job_config_from_args, _train_loader
+        from t2c_reid.jobs.siglip2_reid import _job_config_from_args, _train_loader
 
         class _StubDataset(torch.utils.data.Dataset):
             def __init__(self, person_ids):
@@ -843,7 +843,7 @@ class Siglip2ReIDJobTest(unittest.TestCase):
     def test_stage_loss_configs_read_logit_scale_from_siglip2_model(self):
         import math
 
-        from t2c_clip.jobs.siglip2_reid import (
+        from t2c_reid.jobs.siglip2_reid import (
             _job_config_from_args,
             _stage1_loss_config,
             _stage2_loss_config,
@@ -909,7 +909,7 @@ class Siglip2ReIDJobTest(unittest.TestCase):
                 build_training_job(_training_args(root), siglip2_loader=load_without_tokenizer)
 
     def test_job_config_reads_sie_coe(self):
-        from t2c_clip.jobs.siglip2_reid import _job_config_from_args
+        from t2c_reid.jobs.siglip2_reid import _job_config_from_args
 
         args = _training_args(Path("."))
         args.sie_coe = 1.5
@@ -919,14 +919,14 @@ class Siglip2ReIDJobTest(unittest.TestCase):
         self.assertEqual(config.sie_coe, 1.5)
 
     def test_job_config_sie_coe_defaults_to_zero_when_absent(self):
-        from t2c_clip.jobs.siglip2_reid import _job_config_from_args
+        from t2c_reid.jobs.siglip2_reid import _job_config_from_args
 
         config = _job_config_from_args(_training_args(Path(".")))
 
         self.assertEqual(config.sie_coe, 0.0)
 
     def test_stage_metadata_includes_sie_coe(self):
-        from t2c_clip.jobs.siglip2_reid import _job_config_from_args, _stage_metadata
+        from t2c_reid.jobs.siglip2_reid import _job_config_from_args, _stage_metadata
 
         args = _training_args(Path("."))
         args.sie_coe = 1.5
@@ -973,7 +973,7 @@ class Siglip2ReIDJobTest(unittest.TestCase):
         self.assertFalse(any("sie_embedding" in name for name in backbone_names))
 
     def test_sie_embedding_follows_image_encoder_freeze_per_stage(self):
-        from t2c_clip.jobs.siglip2_reid import _apply_freezing, _job_config_from_args
+        from t2c_reid.jobs.siglip2_reid import _apply_freezing, _job_config_from_args
 
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
@@ -995,21 +995,21 @@ class Siglip2ReIDJobTest(unittest.TestCase):
             self.assertTrue(sie.weight.requires_grad)
 
     def test_job_config_stage1_feature_cache_defaults_true(self):
-        from t2c_clip.jobs.siglip2_reid import _job_config_from_args
+        from t2c_reid.jobs.siglip2_reid import _job_config_from_args
 
         config = _job_config_from_args(_training_args(Path(".")))
 
         self.assertTrue(config.stage1_feature_cache)
 
     def test_stage_metadata_includes_stage1_feature_cache(self):
-        from t2c_clip.jobs.siglip2_reid import _job_config_from_args, _stage_metadata
+        from t2c_reid.jobs.siglip2_reid import _job_config_from_args, _stage_metadata
 
         metadata = _stage_metadata_for(_training_args(Path(".")))
 
         self.assertIs(metadata.get("stage1_feature_cache"), True)
 
     def test_stage_metadata_includes_image_size_and_prompt_template(self):
-        from t2c_clip.jobs.siglip2_reid import _job_config_from_args, _stage_metadata
+        from t2c_reid.jobs.siglip2_reid import _job_config_from_args, _stage_metadata
 
         metadata = _stage_metadata_for(_training_args(Path(".")))
 
@@ -1062,7 +1062,7 @@ class Siglip2ReIDJobTest(unittest.TestCase):
             build_training_job(args, siglip2_loader=_load_fake_siglip2)
 
     def test_stage1_feature_cache_can_be_disabled_with_trainable_image_encoder(self):
-        from t2c_clip.jobs.siglip2_reid import _job_config_from_args
+        from t2c_reid.jobs.siglip2_reid import _job_config_from_args
 
         args = _training_args(Path("."))
         args.freeze_image_encoder_stage1 = False
@@ -1157,7 +1157,7 @@ class Siglip2ReIDJobTest(unittest.TestCase):
             args.stage1_epochs = 1
             args.data_backend = "python"
             with mock.patch(
-                "t2c_clip.jobs.siglip2_reid.Siglip2TrainImageTransform", PoisonTrainTransform
+                "t2c_reid.jobs.siglip2_reid.Siglip2TrainImageTransform", PoisonTrainTransform
             ):
                 job = build_training_job(args, siglip2_loader=_load_fake_siglip2)
                 metrics = job.stage1.train_one_epoch(1, TrainBatchReporterRecorder())
@@ -1174,7 +1174,7 @@ class Siglip2ReIDJobTest(unittest.TestCase):
             args.stage1_epochs = 2
             args.stage1_feature_cache = feature_cache
             with mock.patch(
-                "t2c_clip.jobs.siglip2_reid.Siglip2TrainImageTransform", Siglip2ImageTransform
+                "t2c_reid.jobs.siglip2_reid.Siglip2TrainImageTransform", Siglip2ImageTransform
             ):
                 job = build_training_job(args, siglip2_loader=_load_fake_siglip2)
             losses = []
@@ -1218,13 +1218,13 @@ def _run_accumulation_fixture(
     targets: tuple[float, ...],
     accumulation_steps: int,
 ):
-    from t2c_clip.jobs.siglip2_reid import (
+    from t2c_reid.jobs.siglip2_reid import (
         LoaderBundle,
         StageTrainingRuntime,
         _train_one_epoch,
     )
-    from t2c_clip.precision import PrecisionController, PrecisionPolicy
-    from t2c_clip.training import Stage1LossBreakdown, Stage1LossConfig
+    from t2c_reid.precision import PrecisionController, PrecisionPolicy
+    from t2c_reid.training import Stage1LossBreakdown, Stage1LossConfig
 
     model = torch.nn.Linear(1, 1, bias=False)
     with torch.no_grad():
@@ -1247,7 +1247,7 @@ def _run_accumulation_fixture(
         return Stage1LossBreakdown(alignment=loss)
 
     with mock.patch(
-        "t2c_clip.jobs.siglip2_reid._micro_batch_breakdown",
+        "t2c_reid.jobs.siglip2_reid._micro_batch_breakdown",
         side_effect=breakdown,
     ):
         metrics = _train_one_epoch(runtime)(1, reporter)
@@ -1263,7 +1263,7 @@ def _load_fake_siglip2(model_name: str) -> Siglip2LoadResult:
 
 
 def _stage_metadata_for(args: Namespace):
-    from t2c_clip.jobs.siglip2_reid import (
+    from t2c_reid.jobs.siglip2_reid import (
         _job_config_from_args,
         _stage_metadata,
         _validate_loaded_siglip2,

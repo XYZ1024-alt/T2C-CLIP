@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from t2c_clip.features import l2_normalize
+from t2c_reid.features import l2_normalize
 
 MIN_MOMENTUM = 0.0
 MAX_MOMENTUM = 1.0

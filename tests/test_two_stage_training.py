@@ -8,8 +8,8 @@ from unittest import mock
 import torch
 
 from scripts.train import StageMetadata, TrainingJob, TwoStageTrainingJob, main
-from t2c_clip.evaluation import ReIDMetrics
-from t2c_clip.wandb import WandbConfig, WandbTracker
+from t2c_reid.evaluation import ReIDMetrics
+from t2c_reid.wandb import WandbConfig, WandbTracker
 
 RECORDED_STAGE_EPOCHS: dict[str, list[int]] = {"stage1": [], "stage2": []}
 
@@ -20,7 +20,7 @@ class TwoStageTrainingScriptTest(unittest.TestCase):
 
         @contextlib.contextmanager
         def fake_start_wandb_run(config: WandbConfig, run_name: str):
-            self.assertEqual(config.project, "T2C-CLIP-TwoStage-Script-Test")
+            self.assertEqual(config.project, "T2C-ReID-TwoStage-Script-Test")
             self.assertEqual(config.mode, "offline")
             self.assertEqual(run_name, "two-stage-test")
             yield WandbTracker(run)
@@ -42,7 +42,7 @@ class TwoStageTrainingScriptTest(unittest.TestCase):
                         str(checkpoint_dir),
                         "--enable-wandb",
                         "--wandb-project",
-                        "T2C-CLIP-TwoStage-Script-Test",
+                        "T2C-ReID-TwoStage-Script-Test",
                         "--wandb-mode",
                         "offline",
                         "--run-name",

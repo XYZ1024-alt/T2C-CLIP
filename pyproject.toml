@@ -1,7 +1,7 @@
 [project]
-name = "t2c-clip"
+name = "t2c-reid"
 version = "0.1.0"
-description = "Add your description here"
+description = "Train2Central ReID research codebase for Image-to-Image person re-identification"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
@@ -19,9 +19,9 @@ build-backend = "maturin"
 
 [tool.maturin]
 manifest-path = "rust/Cargo.toml"
-module-name = "t2c_clip._native"
+module-name = "t2c_reid._native"
 python-source = "."
-python-packages = ["t2c_clip", "scripts"]
+python-packages = ["t2c_reid", "scripts"]
 bindings = "pyo3"
 strip = true
 

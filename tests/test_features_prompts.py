@@ -2,8 +2,8 @@ import unittest
 
 import torch
 
-from t2c_clip.features import fuse_features, l2_normalize
-from t2c_clip.prompts import PromptBank, PromptConfig
+from t2c_reid.features import fuse_features, l2_normalize
+from t2c_reid.prompts import PromptBank, PromptConfig
 
 
 class FeaturePromptTest(unittest.TestCase):

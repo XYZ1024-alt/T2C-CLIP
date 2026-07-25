@@ -154,7 +154,7 @@ fn select_row(
     Ok((order, selected_values, maximum))
 }
 
-#[pyclass(module = "t2c_clip._native", frozen)]
+#[pyclass(module = "t2c_reid._native", frozen)]
 pub struct SparseRerankIndex {
     expanded_rows: Vec<SparseRow>,
     postings: Vec<Vec<(usize, f32)>>,

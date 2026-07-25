@@ -26,8 +26,8 @@ from PIL import Image
 import torch
 from torch.utils.data import DataLoader
 
-from t2c_clip.data import ReIDSample, load_market_split, load_msmt17_manifest
-from t2c_clip.datasets import (
+from t2c_reid.data import ReIDSample, load_market_split, load_msmt17_manifest
+from t2c_reid.datasets import (
     ReIDImageDataset,
     ReIDImageDatasetConfig,
     ReIDMetadataDataset,
@@ -37,9 +37,9 @@ from t2c_clip.datasets import (
     build_person_id_map,
     collate_reid_batches,
 )
-from t2c_clip.evaluation import RerankConfig, evaluate_reid, evaluate_reid_with_rerank
-from t2c_clip.native import NATIVE_VERSION
-from t2c_clip.transforms import Siglip2TrainImageTransform
+from t2c_reid.evaluation import RerankConfig, evaluate_reid, evaluate_reid_with_rerank
+from t2c_reid.native import NATIVE_VERSION
+from t2c_reid.transforms import Siglip2TrainImageTransform
 
 DATA_SPEEDUP_TARGET = 1.5
 EVALUATION_SPEEDUP_TARGET = 3.0
@@ -312,7 +312,7 @@ def _isolated_rerank_rss(args: argparse.Namespace, backend: str) -> int:
         command = [
             sys.executable,
             "-m",
-            "t2c_clip.cli.benchmark_native",
+            "t2c_reid.cli.benchmark_native",
             "--mode",
             "rerank",
             "--rss-worker-backend",

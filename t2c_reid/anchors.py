@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import torch
 
-from t2c_clip.model import T2CSiglip2Model
+from t2c_reid.model import T2CReIDModel
 
 DEFAULT_CHUNK_SIZE = 256
 
@@ -31,7 +31,7 @@ class IdentityAnchorProvider:
 
     def __init__(
         self,
-        model: T2CSiglip2Model,
+        model: T2CReIDModel,
         num_train_ids: int,
         frozen: bool,
         chunk_size: int = DEFAULT_CHUNK_SIZE,

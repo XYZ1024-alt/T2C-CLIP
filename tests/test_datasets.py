@@ -7,9 +7,9 @@ import unittest
 from PIL import Image
 import torch
 
-from t2c_clip.data import ReIDSample
-from t2c_clip.transforms import ImageTransformConfig
-from t2c_clip.datasets import (
+from t2c_reid.data import ReIDSample
+from t2c_reid.transforms import ImageTransformConfig
+from t2c_reid.datasets import (
     IdentityBalancedBatchSampler,
     ReIDImageBatch,
     ReIDImageDatasetConfig,
@@ -172,7 +172,7 @@ class ReIDImageDatasetTest(unittest.TestCase):
         self.assertEqual(pinned.original_person_ids, (10,))
 
     def test_native_pipeline_rejects_non_finite_erasing_ranges(self):
-        from t2c_clip.native import native_extension
+        from t2c_reid.native import native_extension
 
         with self.assertRaisesRegex(ValueError, "erase_scale"):
             ImageTransformConfig(
@@ -226,7 +226,7 @@ class ReIDImageDatasetTest(unittest.TestCase):
             image_mean = [0.5, 0.5, 0.5]
             image_std = [0.5, 0.5, 0.5]
 
-        from t2c_clip.transforms import Siglip2ImageTransform
+        from t2c_reid.transforms import Siglip2ImageTransform
 
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "pattern.png"

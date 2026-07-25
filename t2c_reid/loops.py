@@ -10,7 +10,7 @@ from typing import Any
 import torch
 from tqdm.auto import tqdm
 
-from t2c_clip.evaluation import ReIDMetrics
+from t2c_reid.evaluation import ReIDMetrics
 
 DEFAULT_VALIDATION_INTERVAL = 5
 DEFAULT_CHECKPOINT_DIR = Path("checkpoints")

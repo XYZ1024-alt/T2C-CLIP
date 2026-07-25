@@ -4,9 +4,9 @@
 
 ## OVERVIEW
 
-Project: **T2C-CLIP** (`t2c_clip`)
+Project: **T2C-ReID** (`t2c_reid`)
 
-T2C-CLIP is an Image-to-Image person re-identification research codebase. The
+T2C-ReID is an Image-to-Image person re-identification research codebase. The
 project name still contains CLIP, but the only supported foundation model is
 `google/siglip2-so400m-patch14-384`. The system preserves a two-stage ReID
 pipeline with learnable prompts, camera conditioning, SIE, TFC, optional
@@ -21,7 +21,7 @@ Stack:
 - Weights & Biases 0.28.1.
 - `uv` for dependency, environment, and command execution.
 - Rust 1.85+ with maturin 1.14, PyO3/rust-numpy 0.29, Rayon, and pure-Rust
-  JPEG/PNG preprocessing. `uv sync` must build `t2c_clip._native`.
+  JPEG/PNG preprocessing. `uv sync` must build `t2c_reid._native`.
 - Standard-library `unittest`; there is no pytest, formatter, linter, or static
   type checker configured in `pyproject.toml`.
 
@@ -59,10 +59,10 @@ Stack:
 ## STRUCTURE
 
 ```text
-T2C-CLIP/
-|-- t2c_clip/                  Core package
+T2C-ReID/
+|-- t2c_reid/                  Core package
 |   |-- siglip2_backbone.py    Fixed SigLIP 2 image/text adapters and validation
-|   |-- model.py               T2CSiglip2Model forward and retrieval paths
+|   |-- model.py               T2CReIDModel forward and retrieval paths
 |   |-- prompts.py             Global, camera, and train-identity prompt bank
 |   |-- anchors.py             Stage-2 identity text-anchor provider/cache
 |   |-- losses.py              Native SigLIP and batch-hard triplet losses
@@ -101,10 +101,10 @@ Run all Python tooling through `uv`; do not use pip or conda for this project.
 | Native Rust tests | `uv run cargo test --manifest-path rust/Cargo.toml --locked` |
 | Full test suite | `uv run python -m unittest discover -s tests` |
 | One test module | `uv run python -m unittest tests.test_siglip2_training_components` |
-| Syntax/import compile check | `uv run python -m compileall -q t2c_clip scripts tests` |
+| Syntax/import compile check | `uv run python -m compileall -q t2c_reid scripts tests` |
 | Training CLI help | `uv run python -m scripts.train --help` |
-| Evaluation CLI help | `uv run python -m t2c_clip.cli.evaluate --help` |
-| Native benchmark | `uv run python -m t2c_clip.cli.benchmark_native --help` |
+| Evaluation CLI help | `uv run python -m t2c_reid.cli.evaluate --help` |
+| Native benchmark | `uv run python -m t2c_reid.cli.benchmark_native --help` |
 | Check diff hygiene | `git diff --check` |
 
 There is no separate application build step. The useful pre-commit checks are
@@ -114,7 +114,7 @@ the full unittest suite, compileall, CLI help, and `git diff --check`.
 
 ```bash
 uv run python -m scripts.train \
-  --job-builder t2c_clip.jobs.siglip2_reid:build_training_job \
+  --job-builder t2c_reid.jobs.siglip2_reid:build_training_job \
   --dataset msmt17 \
   --data-root path/to/MSMT17_V1 \
   --stage1-epochs 20 \
@@ -136,7 +136,7 @@ pairwise SigLIP or triplet-mining scope; both operate on each micro-batch.
 ### Feature Evaluation
 
 ```bash
-uv run python -m t2c_clip.cli.evaluate path/to/features.npz \
+uv run python -m t2c_reid.cli.evaluate path/to/features.npz \
   --output metrics.json \
   --ranks 1 5 10
 ```
@@ -228,10 +228,10 @@ multiplications stay FP32.
 - Operational setup and CLI examples: `README.md`.
 - Normative architecture decisions and acceptance criteria: `DESIGN.md`.
 - Research claims, ablations, and result tables: `docs/research-blueprint.md`.
-- Full training assembly and defaults: `t2c_clip/jobs/siglip2_reid.py`.
+- Full training assembly and defaults: `t2c_reid/jobs/siglip2_reid.py`.
 - Generic training/checkpoint orchestration: `scripts/train.py` and
-  `t2c_clip/loops.py`.
-- Public package surface: `t2c_clip/__init__.py`.
+  `t2c_reid/loops.py`.
+- Public package surface: `t2c_reid/__init__.py`.
 - Behavioral specification: `tests/`.
 
 ## REPOSITORY HYGIENE
@@ -239,8 +239,8 @@ multiplications stay FP32.
 - Dataset directories, checkpoints, W&B runs, generated outputs, caches, and
   `.pi-subagents/` are ignored; do not commit them.
 - A real So400m load downloads a multi-gigabyte checkpoint. Keep ordinary unit
-  tests offline and use tiny initialized models for CI-like verification.
-- Preserve project branding (`T2C-CLIP`, `t2c_clip`) even though model-facing
+  tests offline and use tiny initialized models for offline verification.
+- Preserve project branding (`T2C-ReID`, `t2c_reid`) even though model-facing
   symbols use SigLIP 2 terminology.
 - Update `README.md`, `DESIGN.md`, tests, CLI help, and checkpoint metadata when
   changing a user-visible training contract.

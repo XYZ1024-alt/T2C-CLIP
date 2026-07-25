@@ -4,8 +4,8 @@ from unittest import mock
 import torch
 
 from scripts.train import TrainingJob, _restore_job_state
-from t2c_clip.loops import _checkpoint_payload
-from t2c_clip.precision import PrecisionController, PrecisionPolicy, resolve_precision
+from t2c_reid.loops import _checkpoint_payload
+from t2c_reid.precision import PrecisionController, PrecisionPolicy, resolve_precision
 
 
 class PrecisionResolutionTest(unittest.TestCase):
@@ -45,7 +45,7 @@ class PrecisionResolutionTest(unittest.TestCase):
 
 class PrecisionCheckpointTest(unittest.TestCase):
     def test_fp16_scaler_state_round_trips_through_training_checkpoint(self):
-        with mock.patch("t2c_clip.precision.torch.amp.GradScaler", _FakeGradScaler):
+        with mock.patch("t2c_reid.precision.torch.amp.GradScaler", _FakeGradScaler):
             source = PrecisionController(PrecisionPolicy("fp16", "fp16", "cuda"))
             source.scaler.scale_value = 2048.0
             model = torch.nn.Linear(2, 2)

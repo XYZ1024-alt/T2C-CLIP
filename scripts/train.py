@@ -1,4 +1,4 @@
-"""Training entrypoint for project-specific T2C-CLIP jobs.
+"""Training entrypoint for project-specific T2C-ReID jobs.
 
 Supports two-stage training (Stage-1 prompt alignment then Stage-2 ReID
 training) when the job builder returns a :class:`TwoStageTrainingJob`.
@@ -21,14 +21,14 @@ from typing import Any, Sequence
 
 import torch
 
-from t2c_clip.evaluation import (
+from t2c_reid.evaluation import (
     DEFAULT_QUERY_CHUNK_SIZE,
     ReIDMetrics,
     RUST_EVALUATION_BACKEND,
     SUPPORTED_EVALUATION_BACKENDS,
 )
-from t2c_clip.datasets import RUST_DATA_BACKEND, SUPPORTED_DATA_BACKENDS
-from t2c_clip.loops import (
+from t2c_reid.datasets import RUST_DATA_BACKEND, SUPPORTED_DATA_BACKENDS
+from t2c_reid.loops import (
     MetricLogger,
     TrainMetricLogger,
     TrainStepMetricLogger,
@@ -36,7 +36,7 @@ from t2c_clip.loops import (
     TrainingLoopConfig,
     run_training_loop,
 )
-from t2c_clip.wandb import (
+from t2c_reid.wandb import (
     DEFAULT_WANDB_MODE,
     DEFAULT_WANDB_PROJECT,
     WANDB_MODES,
@@ -44,10 +44,10 @@ from t2c_clip.wandb import (
     WandbTracker,
     start_wandb_run,
 )
-from t2c_clip.precision import SUPPORTED_PRECISIONS
-from t2c_clip.retrieval import SUPPORTED_RETRIEVAL_MODES
-from t2c_clip.siglip2_backbone import SIGLIP2_MODEL_ID
-from t2c_clip.transforms import DEFAULT_IMAGE_SIZE
+from t2c_reid.precision import SUPPORTED_PRECISIONS
+from t2c_reid.retrieval import SUPPORTED_RETRIEVAL_MODES
+from t2c_reid.siglip2_backbone import SIGLIP2_MODEL_ID
+from t2c_reid.transforms import DEFAULT_IMAGE_SIZE
 
 DEFAULT_TOTAL_EPOCHS = 120
 DEFAULT_VALIDATION_INTERVAL = 5
@@ -227,7 +227,7 @@ def _stage_metadata_values(metadata: Any) -> dict[str, Any]:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run a T2C-CLIP training job.")
+    parser = argparse.ArgumentParser(description="Run a T2C-ReID training job.")
     parser.add_argument("--job-builder", required=True)
     parser.add_argument("--epochs", type=int, default=DEFAULT_TOTAL_EPOCHS)
     parser.add_argument("--validation-interval", type=int, default=DEFAULT_VALIDATION_INTERVAL)

@@ -21,7 +21,7 @@ import torch
 import torch.nn.functional as F
 from transformers.masking_utils import create_bidirectional_mask
 
-from t2c_clip.prompts import validate_index_tensor
+from t2c_reid.prompts import validate_index_tensor
 
 
 SIGLIP2_MODEL_ID = "google/siglip2-so400m-patch14-384"

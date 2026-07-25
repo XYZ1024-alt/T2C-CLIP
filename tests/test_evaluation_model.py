@@ -3,10 +3,10 @@ import unittest
 import numpy as np
 import torch
 
-from t2c_clip.evaluation import RerankConfig, evaluate_reid, evaluate_reid_with_rerank
-from t2c_clip.model import T2CSiglip2Model
-from t2c_clip.prompts import PromptBank, PromptConfig
-from t2c_clip.retrieval import IMAGE_ONLY_RETRIEVAL
+from t2c_reid.evaluation import RerankConfig, evaluate_reid, evaluate_reid_with_rerank
+from t2c_reid.model import T2CReIDModel
+from t2c_reid.prompts import PromptBank, PromptConfig
+from t2c_reid.retrieval import IMAGE_ONLY_RETRIEVAL
 
 
 class IdentityEncoder(torch.nn.Module):
@@ -24,8 +24,8 @@ class EvaluationModelTest(unittest.TestCase):
         # Zhong et al. build the original-distance term from the TRANSPOSED
         # column-normalized matrix (np.transpose(dist / np.max(dist, axis=0))).
         # With lambda=1 the rerank distance must equal exactly that slice.
-        from t2c_clip.evaluation import _pairwise_distance, _rerank_distance
-        from t2c_clip.features import l2_normalize
+        from t2c_reid.evaluation import _pairwise_distance, _rerank_distance
+        from t2c_reid.features import l2_normalize
 
         torch.manual_seed(0)
         query = torch.randn(3, 4)
@@ -243,7 +243,7 @@ class EvaluationModelTest(unittest.TestCase):
         self.assertEqual(sparse, dense)
 
     def test_native_primary_signed_zero_uses_gallery_index_tie_break(self):
-        from t2c_clip.native import native_extension
+        from t2c_reid.native import native_extension
 
         average_precision, cmc, count = native_extension.evaluate_scores(
             np.array([[-0.0, 0.0]], dtype=np.float32),
@@ -257,7 +257,7 @@ class EvaluationModelTest(unittest.TestCase):
         self.assertEqual((average_precision, cmc, count), (1.0, [1], 1))
 
     def test_native_topk_uses_index_tie_break_and_reports_row_max(self):
-        from t2c_clip.native import native_extension
+        from t2c_reid.native import native_extension
 
         distances = np.array([[0.5, 0.1, 0.1, 0.8]], dtype=np.float32)
         indices, values, maxima = native_extension.select_topk_distances(distances, 3)
@@ -310,7 +310,7 @@ class EvaluationModelTest(unittest.TestCase):
             prompt_bank.global_prompt.zero_()
             prompt_bank.camera_prompts[0] = torch.tensor([[0.0, 1.0]])
             prompt_bank.identity_prompts[0] = torch.tensor([[10.0, 0.0]])
-        model = T2CSiglip2Model(IdentityEncoder(), PromptMeanEncoder(), prompt_bank, beta=1.0)
+        model = T2CReIDModel(IdentityEncoder(), PromptMeanEncoder(), prompt_bank, beta=1.0)
 
         output = model.encode_retrieval(torch.tensor([[1.0, 0.0]]), torch.tensor([0]))
 
@@ -323,7 +323,7 @@ class EvaluationModelTest(unittest.TestCase):
             prompt_bank.global_prompt.zero_()
             prompt_bank.camera_prompts[0] = torch.tensor([[0.0, 1.0]])
             prompt_bank.identity_prompts[0] = torch.tensor([[10.0, 0.0]])
-        model = T2CSiglip2Model(IdentityEncoder(), PromptMeanEncoder(), prompt_bank, beta=1.0)
+        model = T2CReIDModel(IdentityEncoder(), PromptMeanEncoder(), prompt_bank, beta=1.0)
 
         output = model.encode_retrieval(
             torch.tensor([[1.0, 0.0]]),
@@ -340,7 +340,7 @@ class EvaluationModelTest(unittest.TestCase):
             prompt_bank.global_prompt.zero_()
             prompt_bank.camera_prompts[0] = torch.tensor([[0.0, 1.0]])
             prompt_bank.identity_prompts[0] = torch.tensor([[10.0, 0.0]])
-        model = T2CSiglip2Model(IdentityEncoder(), PromptMeanEncoder(), prompt_bank, beta=1.0)
+        model = T2CReIDModel(IdentityEncoder(), PromptMeanEncoder(), prompt_bank, beta=1.0)
         images = torch.tensor([[1.0, 0.0]])
         camera_ids = torch.tensor([0])
         person_ids = torch.tensor([0])
@@ -365,10 +365,10 @@ class CameraRecordingImageEncoder(torch.nn.Module):
 
 
 class CameraIdThreadingTest(unittest.TestCase):
-    def _model(self) -> tuple[T2CSiglip2Model, CameraRecordingImageEncoder]:
+    def _model(self) -> tuple[T2CReIDModel, CameraRecordingImageEncoder]:
         prompt_bank = PromptBank(PromptConfig(num_cameras=2, num_train_ids=2, context_length=1, embedding_dim=2))
         encoder = CameraRecordingImageEncoder()
-        return T2CSiglip2Model(encoder, PromptMeanEncoder(), prompt_bank, beta=0.5), encoder
+        return T2CReIDModel(encoder, PromptMeanEncoder(), prompt_bank, beta=0.5), encoder
 
     def test_encode_retrieval_passes_camera_ids_to_image_encoder(self):
         model, encoder = self._model()

@@ -35,7 +35,7 @@ with filesystem cache and concurrent system load.
 ## Commands
 
 ```bash
-uv run python -m t2c_clip.cli.benchmark_native \
+uv run python -m t2c_reid.cli.benchmark_native \
   --mode data \
   --data-samples 256 \
   --batch-size 16 \
@@ -46,7 +46,7 @@ uv run python -m t2c_clip.cli.benchmark_native \
   --runs 5 \
   --warmup-runs 1
 
-uv run python -m t2c_clip.cli.benchmark_native \
+uv run python -m t2c_reid.cli.benchmark_native \
   --mode evaluation \
   --query-count 512 \
   --gallery-count 4096 \
@@ -55,7 +55,7 @@ uv run python -m t2c_clip.cli.benchmark_native \
   --runs 5 \
   --warmup-runs 1
 
-uv run python -m t2c_clip.cli.benchmark_native \
+uv run python -m t2c_reid.cli.benchmark_native \
   --mode rerank \
   --rerank-query-count 256 \
   --rerank-gallery-count 2048 \
@@ -71,7 +71,7 @@ Run the data benchmark separately on both supported operating systems with a
 real dataset root and the same storage/cache conditions:
 
 ```bash
-uv run python -m t2c_clip.cli.benchmark_native \
+uv run python -m t2c_reid.cli.benchmark_native \
   --mode data \
   --dataset market1501 \
   --data-root path/to/Market-1501-v15.09.15 \

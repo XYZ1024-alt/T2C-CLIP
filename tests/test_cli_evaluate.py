@@ -5,7 +5,7 @@ import unittest
 
 import numpy as np
 
-from t2c_clip.cli.evaluate import main
+from t2c_reid.cli.evaluate import main
 
 
 class EvaluateCliTest(unittest.TestCase):

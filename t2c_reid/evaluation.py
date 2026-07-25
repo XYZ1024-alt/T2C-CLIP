@@ -9,8 +9,8 @@ from typing import Sequence
 import numpy as np
 import torch
 
-from t2c_clip.native import native_extension as _native
-from t2c_clip.features import l2_normalize
+from t2c_reid.native import native_extension as _native
+from t2c_reid.features import l2_normalize
 
 DEFAULT_RANKS = (1, 5, 10)
 DEFAULT_RERANK_K1 = 20

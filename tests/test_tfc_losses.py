@@ -4,12 +4,12 @@ import unittest
 import torch
 import torch.nn.functional as F
 
-from t2c_clip.losses import (
+from t2c_reid.losses import (
     batch_hard_triplet_loss,
     siglip_identity_anchor_loss,
     supervised_siglip_loss,
 )
-from t2c_clip.tfc import TFCCenterBank
+from t2c_reid.tfc import TFCCenterBank
 
 
 class TFCLossTest(unittest.TestCase):

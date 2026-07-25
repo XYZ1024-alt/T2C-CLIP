@@ -1,8 +1,8 @@
-# T2C-CLIP
+# T2C-ReID
 
-Train2Central-CLIP foundation for Image-to-Image person ReID experiments.
-The project name and Python package remain `T2C-CLIP` / `t2c_clip`, while the
-foundation vision-language model is **SigLIP 2 So400m**.
+Train2Central ReID is a research codebase for Image-to-Image person ReID.
+The public project name is `T2C-ReID` and the Python package is `t2c_reid`;
+the foundation vision-language model is **SigLIP 2 So400m**.
 
 The implementation uses a two-stage training pipeline:
 
@@ -48,14 +48,14 @@ The project uses `uv` and builds a mandatory Rust extension with `maturin`:
 
 ```bash
 uv sync
-uv run python -c "from t2c_clip.native import NATIVE_VERSION; print(NATIVE_VERSION)"
+uv run python -c "from t2c_reid.native import NATIVE_VERSION; print(NATIVE_VERSION)"
 uv run python -m unittest discover -s tests
 ```
 
 Install stable Rust `1.85+` before `uv sync`. Windows x86_64 requires the
 MSVC Rust target and Visual Studio Build Tools; Linux x86_64 requires a C
 linker. The extension is built as the private CPython module
-`t2c_clip._native`. There is no automatic Python fallback when that module is
+`t2c_reid._native`. There is no automatic Python fallback when that module is
 missing or has an incompatible ABI.
 
 Core requirements are declared in `pyproject.toml`:
@@ -96,7 +96,7 @@ A 24GB single-GPU starting point is:
 
 ```bash
 uv run python -m scripts.train \
-  --job-builder t2c_clip.jobs.siglip2_reid:build_training_job \
+  --job-builder t2c_reid.jobs.siglip2_reid:build_training_job \
   --dataset msmt17 \
   --data-root path/to/MSMT17_V1 \
   --siglip2-model-name google/siglip2-so400m-patch14-384 \
@@ -263,7 +263,7 @@ Resume a Stage-2 run with the same architecture and precision:
 
 ```bash
 uv run python -m scripts.train \
-  --job-builder t2c_clip.jobs.siglip2_reid:build_training_job \
+  --job-builder t2c_reid.jobs.siglip2_reid:build_training_job \
   --dataset msmt17 \
   --data-root path/to/MSMT17_V1 \
   --stage1-epochs 20 \
@@ -283,11 +283,11 @@ Enable online tracking:
 ```bash
 uv run wandb login
 uv run python -m scripts.train \
-  --job-builder t2c_clip.jobs.siglip2_reid:build_training_job \
+  --job-builder t2c_reid.jobs.siglip2_reid:build_training_job \
   --dataset msmt17 \
   --data-root path/to/MSMT17_V1 \
   --enable-wandb \
-  --wandb-project T2C-CLIP \
+  --wandb-project T2C-ReID \
   --run-name msmt17-siglip2-so400m
 ```
 
@@ -306,7 +306,7 @@ micro-batches; epoch metrics average all micro-batches.
 Evaluate pre-extracted query/gallery features from `.npz`:
 
 ```bash
-uv run python -m t2c_clip.cli.evaluate path/to/features.npz \
+uv run python -m t2c_reid.cli.evaluate path/to/features.npz \
   --output metrics.json \
   --ranks 1 5 10
 ```
@@ -319,7 +319,7 @@ complete `Q x G` score matrix. Primary metrics remain no-rerank.
 Add exact sparse k-reciprocal metrics without replacing the primary result:
 
 ```bash
-uv run python -m t2c_clip.cli.evaluate path/to/features.npz \
+uv run python -m t2c_reid.cli.evaluate path/to/features.npz \
   --report-rerank \
   --rerank-k1 20 \
   --rerank-k2 6 \
@@ -351,7 +351,7 @@ at most one 8-bit quantization step after normalization.
 Run the self-contained synthetic benchmark:
 
 ```bash
-uv run python -m t2c_clip.cli.benchmark_native \
+uv run python -m t2c_reid.cli.benchmark_native \
   --mode all \
   --runs 5 \
   --warmup-runs 1 \
@@ -365,7 +365,7 @@ training retains the conservative `--rust-data-threads 1` default and should be
 tuned against available CPU cores. The JSON reports median/p95 duration, throughput, sampled RSS, backend
 speedup, metric parity, and the acceptance gates: data `1.5x`, primary
 evaluation `3x`, rerank `2x`, and rerank RSS ratio `<=0.4`. Benchmark gates are
-not CI assertions because timing is hardware-sensitive. The recorded synthetic
+not automated assertions because timing is hardware-sensitive. The recorded synthetic
 Windows run and its real-dataset follow-up command are in
 [docs/native-performance.md](docs/native-performance.md).
 
@@ -376,10 +376,10 @@ Run the offline suite and inspect the CLI:
 ```bash
 uv run cargo test --manifest-path rust/Cargo.toml --locked
 uv run python -m unittest discover -s tests
-uv run python -m compileall -q t2c_clip scripts tests
+uv run python -m compileall -q t2c_reid scripts tests
 uv run python -m scripts.train --help
-uv run python -m t2c_clip.cli.evaluate --help
-uv run python -m t2c_clip.cli.benchmark_native --help
+uv run python -m t2c_reid.cli.evaluate --help
+uv run python -m t2c_reid.cli.benchmark_native --help
 ```
 
 The suite uses tiny randomly initialized fixed Transformers SigLIP models,

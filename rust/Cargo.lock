@@ -471,7 +471,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "t2c-clip-native"
+name = "t2c-reid-native"
 version = "0.1.0"
 dependencies = [
  "fast_image_resize",

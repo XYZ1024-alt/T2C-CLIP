@@ -2,7 +2,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from t2c_clip.data import (
+from t2c_reid.data import (
     ReIDSample,
     load_market_split,
     load_msmt17_manifest,

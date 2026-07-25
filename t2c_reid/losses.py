@@ -1,11 +1,11 @@
-"""Loss functions used by the T2C-SigLIP 2 training design."""
+"""Loss functions used by the T2C-ReID training design."""
 
 from __future__ import annotations
 
 import torch
 from torch.nn import functional as F
 
-from t2c_clip.features import l2_normalize
+from t2c_reid.features import l2_normalize
 
 DEFAULT_LOGIT_SCALE = 1.0
 DEFAULT_LOGIT_BIAS = 0.0

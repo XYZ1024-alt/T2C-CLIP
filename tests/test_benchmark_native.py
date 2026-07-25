@@ -5,7 +5,7 @@ import time
 import unittest
 from unittest import mock
 
-from t2c_clip.cli.benchmark_native import _RssSampler, main
+from t2c_reid.cli.benchmark_native import _RssSampler, main
 
 
 class NativeBenchmarkCliTest(unittest.TestCase):
@@ -64,7 +64,7 @@ class NativeBenchmarkCliTest(unittest.TestCase):
 
     def test_rss_sampler_propagates_background_probe_failure(self):
         with mock.patch(
-            "t2c_clip.cli.benchmark_native._current_rss_bytes",
+            "t2c_reid.cli.benchmark_native._current_rss_bytes",
             side_effect=[100, RuntimeError("probe failed")],
         ):
             with self.assertRaisesRegex(RuntimeError, "RSS sampling failed"):

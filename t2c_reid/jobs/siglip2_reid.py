@@ -1,4 +1,4 @@
-"""SigLIP 2-backed T2C-CLIP two-stage training job builder.
+"""SigLIP 2-backed T2C-ReID two-stage training job builder.
 
 Stage-1 aligns frozen image features with identity-aware prompt text through
 SigLIP's supervised all-pairs sigmoid objective. Stage-2 trains the ReID head,
@@ -23,8 +23,8 @@ import torch
 from torch.utils.data import DataLoader
 
 from scripts.train import StageMetadata, TrainingJob, TwoStageTrainingJob
-from t2c_clip.anchors import IdentityAnchorProvider
-from t2c_clip.siglip2_backbone import (
+from t2c_reid.anchors import IdentityAnchorProvider
+from t2c_reid.siglip2_backbone import (
     TransformersSiglip2ImageEncoder,
     TransformersSiglip2TextEncoder,
     SIGLIP2_MODEL_ID,
@@ -35,8 +35,8 @@ from t2c_clip.siglip2_backbone import (
     siglip2_uses_patchified_inputs,
     validate_siglip2_image_size,
 )
-from t2c_clip.data import ReIDSample, load_market_split, load_msmt17_manifest
-from t2c_clip.datasets import (
+from t2c_reid.data import ReIDSample, load_market_split, load_msmt17_manifest
+from t2c_reid.datasets import (
     DEFAULT_INSTANCES_PER_IDENTITY,
     PYTHON_DATA_BACKEND,
     RUST_DATA_BACKEND,
@@ -52,7 +52,7 @@ from t2c_clip.datasets import (
     collate_reid_batches,
     require_data_backend,
 )
-from t2c_clip.evaluation import (
+from t2c_reid.evaluation import (
     DEFAULT_QUERY_CHUNK_SIZE,
     RUST_EVALUATION_BACKEND,
     ReIDMetrics,
@@ -60,13 +60,13 @@ from t2c_clip.evaluation import (
     evaluate_reid_with_rerank,
     require_evaluation_backend,
 )
-from t2c_clip.features import l2_normalize
-from t2c_clip.model import T2CSiglip2Model
-from t2c_clip.precision import PrecisionController, PrecisionPolicy, resolve_precision
-from t2c_clip.prompts import PromptBank, PromptConfig
-from t2c_clip.retrieval import FUSED_RETRIEVAL, require_retrieval_mode
-from t2c_clip.tfc import TFCCenterBank
-from t2c_clip.training import (
+from t2c_reid.features import l2_normalize
+from t2c_reid.model import T2CReIDModel
+from t2c_reid.precision import PrecisionController, PrecisionPolicy, resolve_precision
+from t2c_reid.prompts import PromptBank, PromptConfig
+from t2c_reid.retrieval import FUSED_RETRIEVAL, require_retrieval_mode
+from t2c_reid.tfc import TFCCenterBank
+from t2c_reid.training import (
     Stage1LossBreakdown,
     Stage1LossConfig,
     Stage2LossBreakdown,
@@ -77,7 +77,7 @@ from t2c_clip.training import (
     stage1_alignment_loss_from_visual,
     stage2_loss_breakdown,
 )
-from t2c_clip.transforms import (
+from t2c_reid.transforms import (
     DEFAULT_IMAGE_SIZE,
     ImageTransformConfig,
     Siglip2ImageTransform,
@@ -390,7 +390,7 @@ class StageLRScheduler:
 class Siglip2ReIDTrainingModel(torch.nn.Module):
     def __init__(
         self,
-        retrieval_model: T2CSiglip2Model,
+        retrieval_model: T2CReIDModel,
         classifier: torch.nn.Module,
         tfc_bank: TFCCenterBank,
     ):
@@ -766,9 +766,9 @@ def _transform_bundle(transforms) -> TransformBundle:
 
 def _job_config_from_args(args: Any) -> Siglip2ReIDJobConfig:
     if args.dataset is None:
-        raise ValueError("--dataset is required for t2c_clip.jobs.siglip2_reid")
+        raise ValueError("--dataset is required for t2c_reid.jobs.siglip2_reid")
     if args.data_root is None:
-        raise ValueError("--data-root is required for t2c_clip.jobs.siglip2_reid")
+        raise ValueError("--data-root is required for t2c_reid.jobs.siglip2_reid")
     freeze_image_encoder_stage1 = bool(getattr(args, "freeze_image_encoder_stage1", True))
     stage1_feature_cache = bool(getattr(args, "stage1_feature_cache", True))
     if stage1_feature_cache and not freeze_image_encoder_stage1:
@@ -974,7 +974,7 @@ def _image_encoder_trainable(config: Siglip2ReIDJobConfig, stage: str) -> bool:
     raise ValueError(f"unknown training stage: {stage!r}")
 
 
-def _siglip2_model_for(retrieval_model: T2CSiglip2Model) -> torch.nn.Module:
+def _siglip2_model_for(retrieval_model: T2CReIDModel) -> torch.nn.Module:
     if not isinstance(retrieval_model.image_encoder, TransformersSiglip2ImageEncoder):
         raise TypeError(
             "SigLIP 2 freezing requires a TransformersSiglip2ImageEncoder-backed "
@@ -1242,7 +1242,7 @@ def _build_training_model(
         include_bos_token=spec.include_bos_token,
         mask_padding=spec.mask_text_padding,
     )
-    retrieval = T2CSiglip2Model(
+    retrieval = T2CReIDModel(
         image_encoder=image_encoder,
         text_encoder=text_encoder,
         prompt_bank=prompt_bank,

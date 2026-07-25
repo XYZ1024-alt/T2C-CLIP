@@ -9,8 +9,8 @@ from unittest import mock
 import torch
 
 from scripts.train import StageMetadata, TrainingJob, main
-from t2c_clip.evaluation import ReIDMetrics
-from t2c_clip.wandb import WandbConfig, WandbTracker
+from t2c_reid.evaluation import ReIDMetrics
+from t2c_reid.wandb import WandbConfig, WandbTracker
 
 RECORDED_ARGS = None
 RECORDED_RNG_STATE = None
@@ -269,7 +269,7 @@ class TrainScriptTest(unittest.TestCase):
                         str(checkpoint_dir),
                         "--enable-wandb",
                         "--wandb-project",
-                        "T2C-CLIP-TrainScript-Test",
+                        "T2C-ReID-TrainScript-Test",
                         "--wandb-entity",
                         "test-team",
                         "--wandb-mode",
@@ -291,7 +291,7 @@ class TrainScriptTest(unittest.TestCase):
             [
                 (
                     WandbConfig(
-                        project="T2C-CLIP-TrainScript-Test",
+                        project="T2C-ReID-TrainScript-Test",
                         entity="test-team",
                         mode="offline",
                         directory=wandb_dir,
@@ -310,7 +310,7 @@ class TrainScriptTest(unittest.TestCase):
 
     def test_tracking_disabled_does_not_load_wandb(self):
         with tempfile.TemporaryDirectory() as tmp:
-            with mock.patch("t2c_clip.wandb._load_wandb") as load_wandb:
+            with mock.patch("t2c_reid.wandb._load_wandb") as load_wandb:
                 exit_code = main(
                     [
                         "--job-builder",
