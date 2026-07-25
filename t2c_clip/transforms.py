@@ -1,12 +1,9 @@
-"""Image transforms for CLIP-backed person ReID.
+"""Image transforms for SigLIP 2-backed person ReID.
 
-CLIP's own image processor resizes the shortest edge to 224 and center-crops
-a 224x224 square. On tall person crops (aspect ratio ~1:2) that discards the
-head and feet — only the torso survives. These transforms therefore reuse only
-the processor's normalization statistics (``image_mean``/``image_std``) and
-resize the whole person image to a fixed ReID aspect ratio instead. The CLIP
-vision encoder consumes the non-square input through position-embedding
-interpolation (see ``TransformersCLIPImageEncoder``).
+The transforms preserve the complete tall person crop at a fixed, patch-aligned
+2:1 resolution and reuse the checkpoint processor's normalization statistics.
+The image encoder dispatches the resulting BCHW tensor to the loaded
+Transformers SigLIP format.
 """
 
 from __future__ import annotations
@@ -18,8 +15,8 @@ import torch
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 
-# (height, width): standard whole-person ReID input resolution.
-DEFAULT_IMAGE_SIZE = (256, 128)
+# (height, width): 28 x 14 patch14 tokens, or 392 patches total.
+DEFAULT_IMAGE_SIZE = (392, 196)
 
 
 def _processor_normalization(image_processor: Any) -> tuple[list[float], list[float]]:
@@ -28,19 +25,32 @@ def _processor_normalization(image_processor: Any) -> tuple[list[float], list[fl
     if mean is None or std is None:
         raise ValueError(
             "image_processor must expose image_mean and image_std so ReID "
-            "transforms can normalize like the CLIP pretraining pipeline"
+            "transforms can normalize like the SigLIP 2 pretraining pipeline"
         )
     return [float(value) for value in mean], [float(value) for value in std]
 
 
-class CLIPImageTransform:
-    def __init__(self, image_processor: Any, image_size: tuple[int, int] = DEFAULT_IMAGE_SIZE):
+def _validated_image_size(image_size: tuple[int, int]) -> tuple[int, int]:
+    if len(image_size) != 2:
+        raise ValueError("image_size must be a (height, width) pair")
+    result = (int(image_size[0]), int(image_size[1]))
+    if result[0] < 1 or result[1] < 1:
+        raise ValueError("image dimensions must be positive")
+    return result
+
+
+class Siglip2ImageTransform:
+    def __init__(
+        self,
+        image_processor: Any,
+        image_size: tuple[int, int] = DEFAULT_IMAGE_SIZE,
+    ):
         self.image_processor = image_processor
-        self.image_size = (int(image_size[0]), int(image_size[1]))
+        self.image_size = _validated_image_size(image_size)
         mean, std = _processor_normalization(image_processor)
         self._pipeline = transforms.Compose(
             [
-                transforms.Resize(self.image_size, interpolation=InterpolationMode.BICUBIC),
+                transforms.Resize(self.image_size, interpolation=InterpolationMode.BILINEAR),
                 transforms.ToTensor(),
                 transforms.Normalize(mean, std),
             ]
@@ -50,7 +60,7 @@ class CLIPImageTransform:
         return self._pipeline(image)
 
 
-class CLIPTrainImageTransform:
+class Siglip2TrainImageTransform:
     def __init__(
         self,
         image_processor: Any,
@@ -66,7 +76,7 @@ class CLIPTrainImageTransform:
         if crop_padding < 0:
             raise ValueError("crop_padding must be non-negative")
         self.image_processor = image_processor
-        self.image_size = (int(image_size[0]), int(image_size[1]))
+        self.image_size = _validated_image_size(image_size)
         mean, std = _processor_normalization(image_processor)
         steps: list[Any] = [
             transforms.RandomHorizontalFlip(p=flip_prob),
@@ -76,11 +86,9 @@ class CLIPTrainImageTransform:
                 saturation=color_jitter[2],
                 hue=color_jitter[3],
             ),
-            transforms.Resize(self.image_size, interpolation=InterpolationMode.BICUBIC),
+            transforms.Resize(self.image_size, interpolation=InterpolationMode.BILINEAR),
         ]
         if crop_padding > 0:
-            # Standard ReID strong-baseline augmentation: zero-pad the resized
-            # image and randomly crop back to the target size.
             steps.append(transforms.Pad(crop_padding))
             steps.append(transforms.RandomCrop(self.image_size))
         steps.append(transforms.ToTensor())

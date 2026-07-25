@@ -1,7 +1,7 @@
-"""Identity anchor matrix provider for the Stage-2 image-to-text cross entropy.
+"""Identity anchor matrix provider for the Stage-2 SigLIP alignment loss.
 
-CLIP-ReID's Stage-2 classifies each image feature against the text features
-of ALL train identities, not just the batch's. The anchors are
+Stage-2 scores each image feature against the text features of ALL train
+identities. The anchors are
 camera-agnostic identity prototypes (``global + identity`` prompts, no camera
 component) encoded through the model's text tower in chunks, always under
 ``torch.no_grad()`` and detached — no gradient reaches the prompt bank or the
@@ -11,8 +11,7 @@ Freshness semantics:
 
 - ``frozen=True`` (the whole anchor path is frozen in Stage-2 — prompt bank
   AND text encoder): the matrix is computed once lazily at first use and
-  cached for the whole stage — true CLIP-ReID text-feature fixation. Epoch
-  boundaries are ignored.
+  cached for the whole stage. Epoch boundaries are ignored.
 - ``frozen=False``: :meth:`start_epoch` invalidates the cache, so the matrix
   is re-encoded at the start of every Stage-2 epoch and acts as a
   slowly-moving teacher.
@@ -22,7 +21,7 @@ from __future__ import annotations
 
 import torch
 
-from t2c_clip.model import T2CClipModel
+from t2c_clip.model import T2CSiglip2Model
 
 DEFAULT_CHUNK_SIZE = 256
 
@@ -32,7 +31,7 @@ class IdentityAnchorProvider:
 
     def __init__(
         self,
-        model: T2CClipModel,
+        model: T2CSiglip2Model,
         num_train_ids: int,
         frozen: bool,
         chunk_size: int = DEFAULT_CHUNK_SIZE,

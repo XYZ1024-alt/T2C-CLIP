@@ -3,7 +3,7 @@ import unittest
 import torch
 
 from t2c_clip.evaluation import RerankConfig, evaluate_reid, evaluate_reid_with_rerank
-from t2c_clip.model import T2CClipModel
+from t2c_clip.model import T2CSiglip2Model
 from t2c_clip.prompts import PromptBank, PromptConfig
 from t2c_clip.retrieval import IMAGE_ONLY_RETRIEVAL
 
@@ -145,7 +145,7 @@ class EvaluationModelTest(unittest.TestCase):
             prompt_bank.global_prompt.zero_()
             prompt_bank.camera_prompts[0] = torch.tensor([[0.0, 1.0]])
             prompt_bank.identity_prompts[0] = torch.tensor([[10.0, 0.0]])
-        model = T2CClipModel(IdentityEncoder(), PromptMeanEncoder(), prompt_bank, beta=1.0)
+        model = T2CSiglip2Model(IdentityEncoder(), PromptMeanEncoder(), prompt_bank, beta=1.0)
 
         output = model.encode_retrieval(torch.tensor([[1.0, 0.0]]), torch.tensor([0]))
 
@@ -158,7 +158,7 @@ class EvaluationModelTest(unittest.TestCase):
             prompt_bank.global_prompt.zero_()
             prompt_bank.camera_prompts[0] = torch.tensor([[0.0, 1.0]])
             prompt_bank.identity_prompts[0] = torch.tensor([[10.0, 0.0]])
-        model = T2CClipModel(IdentityEncoder(), PromptMeanEncoder(), prompt_bank, beta=1.0)
+        model = T2CSiglip2Model(IdentityEncoder(), PromptMeanEncoder(), prompt_bank, beta=1.0)
 
         output = model.encode_retrieval(
             torch.tensor([[1.0, 0.0]]),
@@ -175,7 +175,7 @@ class EvaluationModelTest(unittest.TestCase):
             prompt_bank.global_prompt.zero_()
             prompt_bank.camera_prompts[0] = torch.tensor([[0.0, 1.0]])
             prompt_bank.identity_prompts[0] = torch.tensor([[10.0, 0.0]])
-        model = T2CClipModel(IdentityEncoder(), PromptMeanEncoder(), prompt_bank, beta=1.0)
+        model = T2CSiglip2Model(IdentityEncoder(), PromptMeanEncoder(), prompt_bank, beta=1.0)
         images = torch.tensor([[1.0, 0.0]])
         camera_ids = torch.tensor([0])
         person_ids = torch.tensor([0])
@@ -200,10 +200,10 @@ class CameraRecordingImageEncoder(torch.nn.Module):
 
 
 class CameraIdThreadingTest(unittest.TestCase):
-    def _model(self) -> tuple[T2CClipModel, CameraRecordingImageEncoder]:
+    def _model(self) -> tuple[T2CSiglip2Model, CameraRecordingImageEncoder]:
         prompt_bank = PromptBank(PromptConfig(num_cameras=2, num_train_ids=2, context_length=1, embedding_dim=2))
         encoder = CameraRecordingImageEncoder()
-        return T2CClipModel(encoder, PromptMeanEncoder(), prompt_bank, beta=0.5), encoder
+        return T2CSiglip2Model(encoder, PromptMeanEncoder(), prompt_bank, beta=0.5), encoder
 
     def test_encode_retrieval_passes_camera_ids_to_image_encoder(self):
         model, encoder = self._model()

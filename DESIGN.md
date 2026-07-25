@@ -2,680 +2,402 @@
 
 ## 1. 项目定位
 
-T2C-CLIP 面向 Image-to-Image 行人重识别任务。检索输入始终是 query 图像和 gallery 图像，不使用自然语言 caption，不做 Text-to-Image 检索，不使用 CUHK-PEDES 等 Text-ReID 数据集。
+T2C-CLIP 面向 Image-to-Image 行人重识别。检索输入始终是 query 图像和
+gallery 图像，不使用自然语言 caption，不做 Text-to-Image 检索，也不使用
+CUHK-PEDES 等 Text-ReID 数据集。
 
-模型基座是 CLIP ViT 双流结构。图像流提供主视觉特征，文本流通过 learnable prompt 提供可学习的语义/摄像头条件补充。最终检索特征为：
+项目品牌和 Python 包名继续使用 T2C-CLIP / `t2c_clip`。模型基座固定为：
 
 ```text
-f_v = normalize(CLIP_ImageEncoder(image))
-f_t = normalize(CLIP_TextEncoder(prompt))
-f   = normalize(f_v + beta * f_t)
+google/siglip2-so400m-patch14-384
 ```
 
-其中 `beta` 控制文本流对最终检索特征的影响。主实验默认使用无 rerank 的 cosine 检索协议，并报告 mAP、Rank-1、Rank-5、Rank-10。
+旧 OpenAI CLIP backend、CLI 参数和 checkpoint 不再兼容。
 
-## 2. 明确不做的内容
+## 2. 最终检索特征
 
-- 不做 Text-to-Image 检索。
-- 不使用自然语言 caption 监督。
-- 不使用 CUHK-PEDES 等 Text-ReID 数据。
-- 不在测试时使用 identity prompt。
-- 不使用测试时优化、rerank、memory bank 检索、图传播或邻域搜索作为主结果。
-- 不返回 mock 指标，不吞掉训练/验证错误，不通过 silent fallback 制造“能跑”的假象。
-
-## 3. 当前问题与修复目标
-
-当前工程曾经使用随机线性层 `PromptTextEncoder` 近似文本分支：
+模型保留图像流和 prompt 文本流：
 
 ```text
-prompt embeddings -> mean pooling -> Linear -> feature
+f_v_raw = SigLIP2_ImageEncoder(image)
+f_v     = FeatureHead(f_v_raw)              # Identity or BNNeck
+f_t     = normalize(SigLIP2_TextEncoder(prompt))
+f       = normalize(f_v + beta * f_t)
 ```
 
-这不等价于真实 CLIP text encoder。它会导致 `clip_loss` 下降不代表图像特征进入真实 CLIP text space，也会让训练期和推理期文本分支分布不一致。因此完整修复目标是方案 B：
-
-1. 使用真实 CLIP text encoder。
-2. 将 learnable prompt 注入 CLIP token embedding 空间。
-3. 补齐 Stage-1 prompt alignment。
-4. Stage-2 使用真实图文融合特征训练 ReID。
-5. 推理只使用 `global + camera` prompt，不使用训练 ID prompt。
-
-## 4. 总体架构
+推理只允许身份无关 prompt：
 
 ```text
-Image
-  -> CLIP Image Encoder
+training prompt  = global + camera + identity
+inference prompt = global + camera
+```
+
+`identity prompt` 只能参与训练对齐和训练身份 anchor 构造，禁止进入 query / gallery
+特征。`image_only` 模式返回归一化 `FeatureHead(f_v_raw)`；`fused` 模式返回上述融合
+特征。Stage-1 和 Stage-2 alignment、triplet 仍使用归一化或未归一化的视觉 raw feature，
+具体见损失章节。
+
+## 3. 模块边界
+
+```text
+PIL person crop
+  -> Siglip2TrainImageTransform / Siglip2ImageTransform
+  -> normalized BCHW tensor
+  -> fixed SigLIP 2 vision_model + positional interpolation
+  -> f_v_raw
+  -> feature head (Identity or BNNeck)
   -> f_v
 
-Prompt Bank
-  -> global prompt
-  -> camera prompt
-  -> identity prompt, training only
-  -> CLIP Text Encoder
+PromptBank
+  -> checkpoint-native fixed-length token sequence
+  -> bidirectional text encoder + text_model.head
   -> f_t
 
 f_v + beta * f_t
-  -> normalized retrieval feature f
-  -> identity classifier
-  -> triplet loss
-  -> TFC loss
-  -> evaluation retrieval
+  -> normalize
+  -> retrieval
+
+f_v_raw / f_v
+  -> alignment / triplet / ID losses
 ```
 
-模块边界：
+主要实现文件：
 
-- `clip_backbone.py`: Transformers CLIP image/text encoder adapter。
-- `prompts.py`: learnable prompt bank，不直接依赖数据集文件结构。
-- `model.py`: T2C-CLIP 前向路径，区分 Stage-1、Stage-2、Inference。
-- `training.py`: loss 组合与训练阶段输入输出结构。
-- `jobs/clip_reid.py`: Market-1501/MSMT17 数据加载、模型构建、训练回调、验证回调。
-- `loops.py`: backend-agnostic epoch/batch 进度、checkpoint、验证调度与 logger 回调。
-- `wandb.py`: Weights & Biases run 生命周期、配置和 stage-aware 指标适配。
+- `siglip2_backbone.py`：固定 BCHW 视觉/SIE adapter、文本 prompt 注入和格式校验。
+- `prompts.py`：global、camera、training identity prompt bank。
+- `model.py`：`T2CSiglip2Model` 的 Stage-1、Stage-2 和推理路径。
+- `losses.py`：监督式 SigLIP、全身份 anchor SigLIP、batch-hard triplet。
+- `training.py`：两阶段 loss 组合。
+- `jobs/siglip2_reid.py`：数据、模型、冻结、优化器、precision、缓存和验证。
+- `precision.py`：precision 解析、autocast、GradScaler 和 optimizer step。
+- `loops.py` / `scripts/train.py`：epoch、checkpoint、resume、W&B 回调。
 
-## 5. 数据与评估协议
+不存在旧 `clip_backbone.py`、`jobs/clip_reid.py` 或兼容 alias。
 
-### 5.1 数据集
+## 4. SigLIP 2 视觉边界
 
-支持两个 Image-ReID 数据集：
+### 4.1 输入尺寸
 
-- MSMT17：主数据集。
-- Market-1501：辅助验证数据集。
-
-MSMT17 需要：
+默认 ReID 输入为：
 
 ```text
-list_train.txt
-list_query.txt
-list_gallery.txt
-train/
-test/
+height = 392
+width  = 196
+patch  = 14
+spatial shape = 28 x 14
+patch count = 392
 ```
 
-Market-1501 需要：
+该尺寸保持 2:1 行人比例，并确保两个维度都能被 patch14 整除。启动阶段必须校验：
+
+1. 高宽均为正数。
+2. 默认 `392x196` 高宽都能被 patch14 整除；固定 `SiglipModel` 也允许官方
+   `384x384` valid-stride Conv2d 的 floor 语义。
+3. patch 数不超过模型位置 embedding 的实际行数。
+4. 位置 embedding 数为完全平方数，保证非方形 ReID 网格可从预训练方形网格插值。
+5. 默认固定 checkpoint 的 processor 预训练尺寸、模型 `image_size`、视觉 embedding
+   和 patch budget 一致。
+
+`google/siglip2-so400m-patch14-384` 虽然是 SigLIP 2 权重，但 Hugging Face Hub
+将其固定分辨率格式注册为 `model_type=siglip`。因此必须使用 `AutoModel` 按 checkpoint
+配置加载；强制使用 `Siglip2Model.from_pretrained` 会错误地产生默认 256 patch budget，
+且权重结构不受支持。训练 builder 对模型 ID 使用硬 allowlist，任何其他固定或 NaFlex
+checkpoint 都在下载前失败。
+
+### 4.2 图像增强
+
+训练增强保留：
+
+- horizontal flip；
+- color jitter；
+- resize 后 pad + random crop；
+- normalization 后 random erasing。
+
+验证只做 bilinear resize、tensor 转换和 checkpoint processor mean/std normalization。
+不做 center crop，避免高瘦行人图像丢失头部和脚部。
+
+### 4.3 Transformers 固定视觉输入
+
+目标 checkpoint 直接接收 BCHW tensor。adapter 调用官方：
 
 ```text
-bounding_box_train/
-query/
-bounding_box_test/
+vision_model(pixel_values=images, interpolate_pos_encoding=True)
 ```
 
-### 5.2 身份与摄像头映射
+其 stride-14 convolution 完成 patch embedding，`392x196` 得到 `28x14 = 392`
+tokens；位置 embedding 从预训练的 `27x27 = 729` 网格插值到非方形网格。训练 job
+不接受 patchified/NaFlex checkpoint。
 
-训练集身份 ID 映射只用于训练：
+### 4.4 视觉前向与 SIE
+
+无 SIE 时调用官方 `vision_model`，读取 `pooler_output`。
+
+有 SIE 时在 patch/token embedding 后加入 camera embedding，再继续官方 encoder、
+post-layernorm 和 attention pooling head。固定 BCHW 格式不使用 patch attention mask。
+
+零值 SIE embedding 的结果必须与官方前向 bitwise 相同。SIE embedding 跟随当前 stage
+的视觉塔冻结状态。
+
+## 5. SigLIP 2 文本边界
+
+### 5.1 Prompt 参数空间
+
+三类 prompt 参数都位于 `text_model.embeddings.token_embedding` 的 hidden dimension：
 
 ```text
-raw_train_pid -> train_person_id
+P_global              [context_length, text_hidden]
+P_cam[c]              [context_length, text_hidden]
+P_id[y] (training)    [context_length, text_hidden]
 ```
 
-query/gallery 使用原始身份 ID 做评估匹配，不能复用训练 ID 映射。camera ID 可跨 train/query/gallery 构建统一映射，因为标准 ReID 协议下测试 camera ID 可见。
+它们不是最终 feature dimension，也不经过随机投影层。
 
-### 5.3 评估
+### 5.2 模板与 checkpoint-native padding
 
-评估使用标准 Image-to-Image ReID 协议：
+模板片段使用同 checkpoint tokenizer，并以 `add_special_tokens=False` 编码：
 
 ```text
-similarity = normalize(query_features) @ normalize(gallery_features).T
+prefix = "a photo of a"
+suffix = "person ."
 ```
 
-对每个 query，过滤同身份同摄像头 gallery 样本，然后计算 AP 和 CMC。主指标：
-
-- mAP
-- Rank-1
-- Rank-5
-- Rank-10
-
-不做 rerank。
-
-## 6. Prompt 设计
-
-### 6.1 Prompt 类型
-
-Prompt bank 包含三类 learnable prompt：
+最终序列长度固定为 `max_position_embeddings`（目标模型为 64）。目标固定 checkpoint
+使用 Gemma tokenizer 的右填充布局：
 
 ```text
-P_global: shared global context prompt
-P_cam[c]: camera-specific prompt
-P_id[y]: training identity prompt
+prefix + learnable slots + suffix + EOS + PAD ... PAD
 ```
 
-三类 prompt 都位于 CLIP text token embedding 维度中，而不是 CLIP projection 维度中。
+官方 processor 的文本输入只声明 `input_ids`，因此 adapter 不构造 padding attention
+mask，也不额外插入 BOS。learnable prompt 只替换 slots 的 token embedding。
 
-### 6.2 Prompt 组合
+目标固定 checkpoint 的 `SiglipConfig` 包含遗留默认 special-token ID，与 checkpoint 的
+Gemma tokenizer 不一致。adapter 以 tokenizer ID 为准，并验证这些 ID 位于模型词表内。
 
-训练阶段：
+### 5.3 文本前向
+
+SigLIP 2 文本塔不是 CLIP causal transformer。正确路径为：
 
 ```text
-P_train = P_global + P_cam[c_i] + P_id[y_i]
+token embedding with injected slots
+  + position embedding
+  -> optional bidirectional padding mask
+  -> text_model.encoder
+  -> final_layer_norm
+  -> final sequence position
+  -> text_model.head
+  -> L2 normalize
 ```
 
-推理/验证阶段：
+目标 checkpoint 的 final sequence position 是 PAD，这是 Transformers 官方
+`SiglipTextModel` 的预训练 pooling 语义。禁止使用 causal mask、最大 token ID pooling
+或不存在的额外 `text_projection`。
+
+## 6. 两阶段训练
+
+### 6.1 Stage-1：监督式 SigLIP prompt 对齐
+
+Stage-1 默认冻结图像塔，只训练 prompt bank；文本塔默认冻结。对 PK micro-batch：
 
 ```text
-P_eval = P_global + P_cam[c_i]
+S_ij = exp(logit_scale) * cosine(f_v[i], f_t[j]) + logit_bias
+Y_ij = +1, person_id[i] == person_id[j]
+       -1, otherwise
+
+L_alignment = -mean_i sum_j log_sigmoid(Y_ij * S_ij)
 ```
 
-测试阶段禁止使用 `P_id`，因为测试身份未见过。训练 ID prompt 只用于训练期对齐和正则化文本分支。
+所有同身份 image/text 组合都为正样本，不局限于对角线。完整 pairwise 矩阵同时覆盖
+两个模态方向的关系，不再计算旧式双向 softmax CE。
 
-### 6.3 CLIP Text Encoder 注入方式
+Stage-1 feature cache 只在图像塔冻结时合法。缓存提取使用 eval transform 和当前
+autocast policy，之后每个 epoch 只做 prompt/text 前向。
 
-需要使用真实 CLIP text encoder：
+### 6.2 Stage-2：ReID + 全身份 SigLIP anchor
+
+Stage-2 默认解冻视觉塔，保留冻结文本塔。每个训练身份生成 camera-agnostic anchor：
 
 ```text
-token embedding + learnable prompt embedding
-  -> CLIP text transformer
-  -> pooled/eos hidden state
-  -> text_projection
-  -> f_t
+anchor[y] = TextEncoder(P_global + P_id[y])
 ```
 
-learnable prompt 应该替换或插入到 prompt token 位置，不应通过随机线性层直接投影成 CLIP feature。输出的 `f_t` 必须与 `CLIP_ImageEncoder` 输出的 `f_v` 位于同一 projection space。
-
-## 7. 模型前向路径
-
-模型应显式区分三条路径。
-
-### 7.1 Stage-1 前向
+每张图像只把其标签对应 anchor 视为正，其余所有训练身份 anchor 为负：
 
 ```text
-f_v = normalize(CLIP_ImageEncoder(image))
-f_t_id = normalize(CLIP_TextEncoder(P_global + P_cam[c] + P_id[y]))
+S_iy = exp(logit_scale) * cosine(f_v[i], anchor[y]) + logit_bias
+Y_iy = +1, y == person_id[i]
+       -1, otherwise
 ```
 
-输出：
+loss 采用 SigLIP 原生 reduction：按 anchor 维求和，再按 image row 求均值。其数值会随
+训练身份数变化，这是有意行为，`alignment_weight` 需要通过真实实验调优。
+
+Stage-2 总损失：
 
 ```text
-{
-  "visual": f_v,
-  "text": f_t_id
-}
+L_total = L_id
+        + L_triplet
+        + alignment_weight * L_alignment
+        + tfc_weight * L_TFC
 ```
 
-Stage-1 不计算 ReID classifier、triplet、TFC。
+- `L_id`：BNNeck/linear classifier cross entropy。
+- `L_triplet`：BN 前视觉 feature 的 batch-hard triplet。
+- `L_alignment`：全身份文本 anchor SigLIP loss。
+- `L_TFC`：融合检索 feature 的中心约束。
+- `label_smoothing` 只作用于 `L_id`。
 
-### 7.2 Stage-2 前向
+`logit_scale` 和 `logit_bias` 读取预训练值后永久冻结，不进入 optimizer。归一化、logit、
+bias 和 `logsigmoid` 在 FP32 中计算。
 
-Stage-2 computes two text features:
+## 7. 冻结、缓存与优化器
+
+默认冻结策略：
 
 ```text
-f_v = normalize(CLIP_ImageEncoder(image))
-f_t_train = normalize(CLIP_TextEncoder(P_global + P_cam[c] + P_id[y]))
-f_t_eval  = normalize(CLIP_TextEncoder(P_global + P_cam[c]))
-f_reid    = normalize(f_v + beta * f_t_eval)
+Stage-1 vision: frozen
+Stage-2 vision: trainable
+text tower: frozen
+Stage-2 prompt bank: trainable
+logit_scale / logit_bias: frozen
 ```
 
-输出：
+文本身份 anchor：
+
+- prompt bank 和 text tower 都冻结：全 Stage-2 只编码一次。
+- 任一可训练：每个 Stage-2 epoch 重新编码并 detach。
+
+camera retrieval text：
+
+- prompt bank 和 text tower 都冻结：每个 camera 只编码一次。
+- 否则在线编码。
+
+AdamW 参数分组：
+
+- `vision_model.*` 使用 `image_encoder_lr`。
+- prompt、classifier、TFC、BNNeck、可训练文本塔使用 `lr`。
+- 一维参数、bias、prompt 和 SIE 不做 weight decay。
+- 其他矩阵参数使用 `1e-4` weight decay。
+
+## 8. 24GB 单卡 precision 与梯度累积
+
+默认：
 
 ```text
-{
-  "visual": f_v,
-  "text": f_t_train,
-  "retrieval": f_reid
-}
+micro batch = 8
+gradient accumulation = 4
+effective optimizer batch = 32
+eval batch = 16
+gradient checkpointing = on
+precision = auto
 ```
 
-`L_id`, `L_triplet`, and `L_TFC` act on `f_reid`, so the training target
-matches the validation and inference feature. `f_t_train` is used only for
-the auxiliary CLIP alignment loss, which prevents identity prompts from
-becoming a training-time shortcut that disappears during validation.
+`batch-size` 是真实 pairwise / triplet mining 范围。累积 4 次不会把 SigLIP matrix 或
+hard mining 扩展到 32。
 
-### 7.3 推理/验证前向
+precision 解析：
 
 ```text
-f_v = normalize(CLIP_ImageEncoder(image))
-f_t_eval = normalize(CLIP_TextEncoder(P_global + P_cam[c]))
-f_eval = normalize(f_v + beta * f_t_eval)
+auto + CUDA BF16 support -> bf16
+auto + other CUDA        -> fp16 + GradScaler
+auto + CPU               -> fp32
 ```
 
-输出 `f_eval` 用于 query/gallery 检索。
+显式请求不支持的低精度必须启动失败，禁止静默回退。
 
-## 8. 两阶段训练
+梯度累积以窗口为单位：
 
-### 8.1 Stage-1: Prompt Alignment
+1. 每个窗口开始执行一次 `zero_grad(set_to_none=True)`。
+2. 每个 micro-batch loss 除以该窗口的实际长度后 backward。
+3. 每个窗口只执行一次 optimizer/scaler step。
+4. epoch 尾部不足 4 个 micro-batch 时按实际长度归一化。
+5. FP16 overflow 跳过的窗口不计为 W&B optimizer update step。
 
-Stage-1 目标是让训练身份 prompt 通过真实 CLIP text encoder 后，与对应图像特征进入同一语义空间。
+Stage-1 cache、anchor/camera cache、训练和验证使用同一 precision controller。落到 CPU
+进行 ReID 距离计算的最终 feature 强制转换为 FP32。
 
-推荐配置：
+## 9. 推理与评估
+
+每个 query/gallery 样本执行同一路径：
+
+1. 解析 camera ID。
+2. 编码 SigLIP 2 图像 feature。
+3. `fused` 模式组合 global + camera prompt 并编码文本。
+4. 应用共享 feature head。
+5. 输出归一化 feature。
+6. 计算 cosine retrieval。
+
+标准协议排除同身份同 camera gallery。主指标始终是无 rerank mAP/CMC；rerank 只能作为
+额外报告，不能覆盖主指标。
+
+## 10. Checkpoint 契约
+
+新 checkpoint schema version 为 2，并保存：
+
+- `backbone_family = siglip2`；
+- Hugging Face model ID；
+- feature dimension；
+- image size、patch size、patch count、最大 patch budget、vision input format；
+- text padding side、BOS/padding-mask layout；
+- resolved precision；
+- model 和 optimizer state；
+- FP16 GradScaler auxiliary state；
+- epoch、stage、best mAP 和验证指标。
+
+resume 必须先验证 metadata，再加载 model state。旧 checkpoint 缺少 SigLIP 2 schema，
+或 model/image/feature/precision 字段不一致时明确失败。旧 OpenAI CLIP state dict 不做转换。
+
+## 11. W&B 契约
+
+Stage-1 训练指标：
 
 ```text
---stage1-epochs 20
---freeze-image-encoder-stage1
-```
-
-Stage-1 默认冻结 CLIP image encoder，只训练：
-
-- prompt bank
-- 必要的 text-side prompt 参数
-
-Stage-1 loss：
-
-```text
-L_stage1 = L_clip_dual(f_v, f_t_id)
-```
-
-`L_clip_dual` 使用 batch 内双向 image-text contrastive loss。
-
-### 8.2 Stage-2: ReID Training
-
-Stage-2 目标是在真实 CLIP 图文融合空间训练行人检索特征。
-
-Stage-2 loss：
-
-```text
-L_total =
-  L_id
-  + L_triplet
-  + clip_weight * L_clip_dual
-  + tfc_weight * L_TFC
-```
-
-推荐默认：
-
-```text
---clip-weight 0.1
---tfc-weight 1.0
---triplet-margin 0.3
---beta 0.1
-```
-
-`clip_weight` 不应硬编码为 1。过大的 CLIP 对齐权重会压制 ReID 目标，尤其在 prompt 尚未稳定时会损害 mAP。
-
-### 8.3 冻结策略
-
-推荐阶段化策略：
-
-```text
-Stage-1:
-  freeze image encoder
-  train prompt/text-side parameters
-
-Stage-2:
-  train prompt bank
-  train classifier
-  fine-tune CLIP image encoder (default; matches CLIP-ReID Stage-2 and is the
-  only path for ReID gradients to reach f_v)
-  --freeze-image-encoder-stage2 opts back into prompt-only mode (caps mAP near
-  the frozen CLIP image-only floor)
-```
-
-是否 fine-tune image encoder 应作为显式参数控制，不能 silently fallback。
-
-## 9. Loss 设计
-
-### 9.1 Image-Text Contrastive Loss
-
-输入：
-
-```text
-visual: [B, D]
-text: [B, D]
-```
-
-计算：
-
-```text
-logits = visual @ text.T * logit_scale
-loss_i2t = CE(logits, labels)
-loss_t2i = CE(logits.T, labels)
-L_clip_dual = (loss_i2t + loss_t2i) / 2
-```
-
-### 9.2 Identity Classification Loss
-
-使用推理一致的检索特征：
-
-```text
-logits = classifier(f_reid)
-L_id = CE(logits, train_person_id)
-```
-
-### 9.3 Batch-Hard Triplet Loss
-
-使用推理一致的检索特征：
-
-```text
-L_triplet = batch_hard_triplet_loss(f_reid, train_person_id)
-```
-
-训练 batch 必须 identity-balanced，至少包含有效 positive 和 negative pair。
-
-### 9.4 TFC Loss
-
-TFC 维护训练身份的 EMA center：
-
-```text
-center_y <- momentum * center_y + (1 - momentum) * mean(f_reid | y)
-```
-
-损失：
-
-```text
-L_TFC = mean(1 - cosine(f_reid_i, stopgrad(center_yi)))
-```
-
-TFC 只用于训练，不参与推理和验证。
-
-## 10. 训练入口设计
-
-`scripts/train.py` 应支持：
-
-```bash
-uv run python -m scripts.train \
-  --job-builder t2c_clip.jobs.clip_reid:build_training_job \
-  --dataset msmt17 \
-  --data-root MSMT17_V1 \
-  --clip-model-name openai/clip-vit-base-patch16 \
-  --stage1-epochs 20 \
-  --epochs 120 \
-  --validation-interval 5 \
-  --checkpoint-dir checkpoints \
-  --batch-size 384 \
-  --num-workers 4 \
-  --lr 0.0001 \
-  --device cuda \
-  --beta 0.1 \
-  --clip-weight 0.1 \
-  --tfc-weight 1.0 \
-  --freeze-image-encoder-stage1 \
-  --enable-wandb \
-  --wandb-project T2C-CLIP \
-  --wandb-mode online \
-  --run-name msmt17-stage1-stage2
-```
-
-参数语义：
-
-- `--stage1-epochs`: Stage-1 prompt alignment 轮数。
-- `--epochs`: Stage-2 轮数。
-- `--validation-interval`: Stage-2 验证间隔。
-- `--clip-weight`: Stage-2 中 CLIP 对齐损失权重。
-- `--tfc-weight`: Stage-2 中 TFC 损失权重。
-- `--beta`: 图文特征融合系数。
-- `--freeze-image-encoder-stage1`: Stage-1 冻结图像编码器。
-- `--enable-wandb`: 启用实验追踪；关闭时不导入 wandb。
-- `--wandb-project` / `--wandb-entity`: 选择线上项目与可选团队。
-- `--wandb-mode`: 默认 `online`，也可显式设为 `offline` 后运行
-  `uv run wandb sync wandb/offline-run-*`。
-- `--wandb-dir`: 可选的本地 wandb 元数据根目录。
-
-在线认证或初始化失败必须终止训练，不得静默切换到离线模式。checkpoint
-继续只保存在本地，不通过 wandb artifact 上传。
-
-## 11. 进度条与日志
-
-### 11.1 终端输出
-
-每个 epoch 应有 batch 级进度条：
-
-```text
-stage1 epoch 3/20: loss=... clip_loss=... lr=...
-stage2 epoch 5/120: loss=... reid_loss=... triplet_loss=... clip_loss=... tfc_loss=... lr=...
-```
-
-验证完成后用 `tqdm.write` 输出：
-
-```text
-stage2 epoch=5 mAP=... rank1=... rank5=... rank10=... best_mAP=... best=True
-```
-
-### 11.2 Weights & Biases 指标
-
-Stage-1 batch step：
-
-```text
-stage1_train_step_loss
-stage1_train_step_clip_loss
-stage1_train_step_lr
-```
-
-Stage-1 epoch：
-
-```text
-stage1_train_loss
-stage1_train_clip_loss
-stage1_lr
-```
-
-Stage-2 batch step：
-
-```text
-stage2_train_step_loss
-stage2_train_step_reid_loss
-stage2_train_step_triplet_loss
-stage2_train_step_clip_loss
-stage2_train_step_tfc_loss
-stage2_train_step_lr
-```
-
-Stage-2 epoch：
-
-```text
-stage2_train_loss
-stage2_train_reid_loss
-stage2_train_triplet_loss
-stage2_train_clip_loss
-stage2_train_tfc_loss
-stage2_lr
-```
-
-Validation：
-
-```text
-mAP
-rank_1
-rank_5
-rank_10
-best_mAP
-is_best
-```
-
-wandb 为不同日志频率记录独立步进轴：
-
-```text
-stage1_train_step
-stage1_epoch
-stage2_train_step
-stage2_epoch
-validation_epoch
-```
-
-各业务指标通过 `define_metric` 绑定到对应轴，写入时不设置 wandb
-全局 `step`，避免两阶段计数重置导致指标被丢弃。
-
-wandb config 应记录：
-
-```text
-dataset
-clip_model_name
-stage1_epochs
-stage2_epochs
-batch_size
+loss
+alignment_loss
 lr
-beta
-clip_weight
-tfc_weight
-retrieval_mode=fused
 ```
 
-## 12. Checkpoint 设计
-
-保存文件：
+Stage-2 训练指标：
 
 ```text
-last.pth
-best.pth
+loss
+alignment_loss
+reid_loss
+triplet_loss
+tfc_loss
+lr
 ```
 
-`last.pth` 每个 Stage-2 epoch 后保存。`best.pth` 只在验证 mAP 创新高时保存。
+`stage*_train_step` 统计成功的 optimizer update window。step 指标为窗口内 micro-batch
+均值；epoch 指标为所有 micro-batch 的均值。metadata 必须记录 requested/resolved
+precision、micro/effective/eval batch、累积步数、gradient checkpointing 和 patch 信息。
 
-checkpoint payload 应包含：
+## 12. 验收标准
 
-```text
-stage
-epoch
-best_map
-metrics
-model_state
-optimizer_state
-config
-```
+实现必须满足：
 
-如果 Stage-1 单独保存初始化结果，可额外保存：
+1. 默认模型 ID 为 `google/siglip2-so400m-patch14-384`。
+2. 默认固定格式以 BCHW 接收 `392x196` 并产生 392 tokens；H-W-C patch utility
+   的低层顺序测试同样生成 392 patches。
+3. tiny 固定 SigLIP 2 无 SIE、零 SIE 与官方 vision forward 一致。
+4. learnable slots 使用真实 token embedding 时，文本 adapter 与官方固定右填充 forward
+   一致。
+5. 图像和文本最终 feature dimension 相同且归一化。
+6. Stage-1 同身份多正样本和 Stage-2 全身份 anchor 使用原生 sigmoid loss。
+7. `logit_scale/logit_bias` 冻结且不在 optimizer。
+8. `label_smoothing` 不影响 alignment loss。
+9. accumulation 尾窗口梯度不被低估，W&B step 按 optimizer window 计数。
+10. FP16 scaler 和 SigLIP metadata 可 checkpoint/resume。
+11. 推理路径永远不访问 identity prompt。
+12. `uv run python -m unittest discover -s tests` 全部通过。
+13. `python -m scripts.train --help` 只显示 SigLIP 2 公共参数，不显示旧 `--clip-*` 参数。
 
-```text
-stage1_last.pth
-```
+## 13. 明确不做
 
-但主训练恢复路径应优先围绕 `last.pth`。
-
-## 13. Sanity Check
-
-完整训练前必须先跑短程 sanity check：
-
-`--retrieval-mode image_only` must skip the text branch and evaluate
-`normalize(f_v)` directly. This result is the CLIP image-only baseline sanity
-check and must be above the random floor before long Stage-2 training.
-
-1. image-only CLIP baseline mAP 高于随机水平。
-2. Stage-1 `clip_loss` 明显低于 `ln(batch_size)`。
-3. Stage-2 `reid_loss` 明显低于 `ln(num_train_ids)`。
-4. Stage-2 前 5 到 10 个 epoch 的 mAP 不应长期贴近随机。
-5. query/gallery 验证路径不使用 identity prompt。
-6. `f_v`、`f_t`、`f` 都是二维 tensor，且最后一维相同。
-7. 检索特征输出前必须 L2 normalize。
-
-如果 sanity check 失败，应暴露错误或输出明确诊断，不添加静默 fallback。
-
-## 14. Ablation 设计
-
-主消融：
-
-| Variant | Image Stream | Text Stream | Stage-1 | Camera Prompt | TFC |
-|---|---:|---:|---:|---:|---:|
-| Image-only baseline | yes | no | no | no | no |
-| Fused without Stage-1 | yes | yes | no | yes | no |
-| Stage-1 + fused | yes | yes | yes | yes | no |
-| Full T2C-CLIP | yes | yes | yes | yes | yes |
-
-Prompt 消融：
-
-| Variant | Global | Camera | Train ID | Eval ID |
-|---|---:|---:|---:|---:|
-| Global only | yes | no | no | no |
-| Global + camera | yes | yes | no | no |
-| Stage-1 ID alignment | yes | yes | yes | no |
-
-Beta 消融：
-
-| Variant | Feature |
-|---|---|
-| beta = 0 | `f = f_v` |
-| fixed beta | `f = normalize(f_v + beta * f_t)` |
-| learnable beta | `f = normalize(f_v + beta_learned * f_t)` |
-
-TFC 消融：
-
-| Variant | TFC Target |
-|---|---|
-| Without TFC | none |
-| Main TFC | fused feature `f` |
-| Visual TFC | visual feature `f_v` |
-
-主结果必须使用无 rerank 指标。
-
-## 15. 实现验收标准
-
-代码修复完成后应满足：
-
-1. 不再使用随机线性 `PromptTextEncoder` 作为主文本路径。
-2. 真实 CLIP text encoder 参与 Stage-1、Stage-2 和 inference。
-3. Stage-1 只训练图文 prompt alignment，不计算 ReID/TFC。
-4. Stage-2 计算 ReID、triplet、weighted CLIP alignment、weighted TFC。
-5. 验证路径不使用 identity prompt。
-6. wandb 同时记录 stage-aware batch step、epoch 平均和验证指标。
-7. `best.pth` 和 `last.pth` 语义稳定。
-8. 测试覆盖 text encoder path、Stage-1、Stage-2、inference prompt、wandb 指标、checkpoint。
-
-## 16. 推荐实施顺序
-
-1. 新增真实 CLIP text encoder adapter。
-2. 重写 prompt bank，使 prompt 参数处于 CLIP token embedding 维度。
-3. 改 `T2CClipModel`，增加 `forward_stage1`、`forward_stage2`、`encode_retrieval`。
-4. 改 loss 输入结构，加入 `clip_weight`。
-5. 改真实 training job，支持 Stage-1 + Stage-2。
-6. 改训练入口参数和 wandb stage-aware logging。
-7. 补 image-only baseline 评估命令，作为 sanity check。
-8. 更新 README 训练流程。
-9. 跑短程 sanity check，再跑完整训练。
-
-## 17. 预期训练流程
-
-先从仓库根目录同步锁定环境：
-
-```bash
-uv sync
-```
-
-登录 Weights & Biases（也可通过 `WANDB_API_KEY` 配置服务器环境）：
-
-```bash
-uv run wandb login
-```
-
-训练：
-
-```bash
-uv run python -m scripts.train \
-  --job-builder t2c_clip.jobs.clip_reid:build_training_job \
-  --dataset msmt17 \
-  --data-root MSMT17_V1 \
-  --clip-model-name openai/clip-vit-base-patch16 \
-  --stage1-epochs 20 \
-  --epochs 120 \
-  --validation-interval 5 \
-  --checkpoint-dir checkpoints \
-  --batch-size 384 \
-  --num-workers 4 \
-  --lr 0.0001 \
-  --device cuda \
-  --beta 0.1 \
-  --clip-weight 0.1 \
-  --tfc-weight 1.0 \
-  --freeze-image-encoder-stage1 \
-  --enable-wandb \
-  --wandb-project T2C-CLIP \
-  --wandb-mode online \
-  --run-name msmt17-full-t2c
-```
-
-短程调试建议先跑：
-
-```bash
-uv run python -m scripts.train \
-  --job-builder t2c_clip.jobs.clip_reid:build_training_job \
-  --dataset msmt17 \
-  --data-root MSMT17_V1 \
-  --clip-model-name openai/clip-vit-base-patch16 \
-  --stage1-epochs 2 \
-  --epochs 5 \
-  --validation-interval 5 \
-  --checkpoint-dir checkpoints/debug \
-  --batch-size 128 \
-  --num-workers 4 \
-  --lr 0.0001 \
-  --device cuda \
-  --beta 0.1 \
-  --clip-weight 0.1 \
-  --tfc-weight 1.0 \
-  --freeze-image-encoder-stage1 \
-  --enable-wandb \
-  --wandb-project T2C-CLIP \
-  --wandb-mode online \
-  --run-name sanity-msmt17
-```
-
-## 18. 风险与约束
-
-- 真实 CLIP text encoder prompt 注入比随机线性 text branch 更复杂，但这是修复 mAP 随机化问题的必要条件。
-- Stage-1 会增加训练时间，但能降低 Stage-2 初期随机对齐对 ReID 目标的干扰。
-- MSMT17 验证耗时明显长于训练 epoch，需要在验证开始/结束时输出明确日志。
-- batch size 增大后需要监控吞吐、显存峰值和验证阶段显存占用。
-- 所有失败必须显式暴露，不通过 mock 指标或静默降级隐藏。
+- 不加入旧 CLIP backend 或兼容 alias。
+- 不迁移旧 T2C-CLIP checkpoint。
+- 不引入 DDP、FSDP、DeepSpeed。
+- 不将默认固定 backbone 改为 NaFlex。
+- 不改成 Text-to-Image ReID。
+- 不让测试身份 prompt 进入推理。
+- 不把 rerank 指标当作主结果。

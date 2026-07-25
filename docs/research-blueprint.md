@@ -6,11 +6,12 @@
 
 Train2Central-CLIP（T2C-CLIP）面向监控场景下的 Image-to-Image 行人重识别。检索输入始终是 query 图像和 gallery 图像，不使用自然语言 caption，不进行 Text-to-Image 检索评测，也不使用 CUHK-PEDES 等 Text-ReID 数据集。
 
-模型基座为 CLIP ViT 双流结构。训练和推理阶段都使用图像编码器与文本编码器：图像流提供主视觉特征，文本流通过 learnable prompt 产生辅助语义特征。训练与推理使用一致的最终检索特征：
+模型基座为 SigLIP 2 So400m patch14 双流结构。训练和推理阶段都使用图像编码器与文本编码器：图像流提供主视觉特征，文本流通过 learnable prompt 产生辅助语义特征。训练与推理使用一致的最终检索特征：
 
 ```text
-f_v = CLIP_ImageEncoder(image)
-f_t = CLIP_TextEncoder(prompt)
+f_v_raw = SigLIP2_ImageEncoder(image)
+f_v = FeatureHead(f_v_raw)
+f_t = SigLIP2_TextEncoder(prompt)
 f   = normalize(f_v + beta * f_t)
 ```
 
@@ -31,7 +32,7 @@ T2C-CLIP 不引入以下组件或评测设定：
 
 ### 3.1 图像流
 
-图像流使用 CLIP ViT image encoder。给定行人图像 `x`，图像编码器输出归一化视觉特征：
+图像流使用 `google/siglip2-so400m-patch14-384` image encoder。给定行人图像 `x`，图像编码器输出归一化视觉特征：
 
 ```text
 f_v = normalize(E_v(x))
@@ -41,11 +42,11 @@ f_v = normalize(E_v(x))
 
 ### 3.2 文本流
 
-文本流使用 CLIP text encoder 与 learnable prompt。文本编码器在训练和推理阶段都参与特征生成。
+文本流使用 SigLIP 2 text encoder 与 learnable prompt。文本编码器在训练和推理阶段都参与特征生成。
 
 训练阶段使用两类 prompt：
 
-- 每身份 ID prompt：仅用于训练身份，服务于 CLIP-ReID 风格的 Stage-1/Stage-2 图文对齐。
+- 每身份 ID prompt：仅用于训练身份，服务于 Stage-1/Stage-2 的监督式 SigLIP 图文对齐。
 - 每摄像头 cam prompt：从图像文件名解析 camera ID 后学习。标准 ReID 协议下 camera ID 在测试集可见。
 
 推理阶段只使用对未见身份合法的 prompt：
@@ -64,7 +65,7 @@ training prompt = global prompt + cam prompt + training ID prompt
 inference prompt = global prompt + cam prompt
 ```
 
-训练 ID prompt 的作用是让训练身份上的图像特征与文本特征先在 CLIP 空间中对齐。推理 prompt 刻意保持身份无关，使文本流能泛化到未见身份。
+训练 ID prompt 的作用是让训练身份上的图像特征与文本特征先在 SigLIP 2 共享空间中对齐。推理 prompt 刻意保持身份无关，使文本流能泛化到未见身份。
 
 ### 3.4 特征融合
 
@@ -80,7 +81,7 @@ f = normalize(f_v + beta * f_t)
 
 ### 4.1 Stage-1：Prompt 预对齐
 
-Stage-1 参考 CLIP-ReID 思路，在训练集身份上学习 identity-aware prompt，使图像特征和 ID prompt 生成的文本特征在 CLIP embedding 空间中对齐：
+Stage-1 在训练集身份上学习 identity-aware prompt，使图像特征和 ID prompt 生成的文本特征在 SigLIP 2 共享空间中对齐：
 
 ```text
 f_v    = normalize(E_v(x_i))
@@ -94,7 +95,8 @@ f_t_id = normalize(E_t(P_id(y_i)))
 Stage-2 训练检索模型，包括图像监督、prompt 文本特征、融合特征与 TFC：
 
 ```text
-f_v = normalize(E_v(x_i))
+f_v_raw = E_v(x_i)
+f_v = FeatureHead(f_v_raw)
 f_t = normalize(E_t(P_global + P_cam(c_i) [+ P_id(y_i) for training alignment]))
 f   = normalize(f_v + beta * f_t)
 ```
@@ -103,17 +105,22 @@ f   = normalize(f_v + beta * f_t)
 
 ## 5. 损失函数设计
 
-总损失为：
+Stage-2 总损失为：
 
 ```text
-L_total = L_clip_dual + L_reid + lambda * L_TFC
+L_total = L_id + L_triplet + alignment_weight * L_siglip + tfc_weight * L_TFC
 ```
 
-### 5.1 双流 CLIP 对齐损失
+### 5.1 SigLIP 对齐损失
 
-`L_clip_dual` 约束图像流与文本流在共享语义空间中对齐。可采用 batch 内双向 image-text contrastive loss，或训练身份级的图像特征与 prompt 文本特征对齐。
+图文对齐使用预训练 SigLIP 2 的 sigmoid pairwise 目标：
 
-对齐目标只能来自训练标签，不能让最终推理依赖不可得的测试身份 prompt。
+```text
+S_ij = exp(logit_scale) * cosine(f_v[i], f_t[j]) + logit_bias
+L_siglip = -mean_i sum_j log_sigmoid(Y_ij * S_ij)
+```
+
+Stage-1 中，同 person ID 的所有 image/text 组合为正样本。Stage-2 中，每张图像与其训练身份 anchor 为正，其余所有训练身份 anchor 为负。`logit_scale` 与 `logit_bias` 保持冻结。对齐目标只能来自训练标签，不能让最终推理依赖不可得的测试身份 prompt。
 
 ### 5.2 ReID 损失
 
@@ -123,7 +130,7 @@ L_total = L_clip_dual + L_reid + lambda * L_TFC
 L_reid = L_id + L_triplet
 ```
 
-`L_id` 是训练身份分类损失，`L_triplet` 是融合特征 `f` 上的度量学习损失。如果实现中额外对 `f_v` 施加 ReID 监督，应作为辅助设定或消融报告，不默认成为主方法。
+`L_id` 是训练身份分类损失，`L_triplet` 作用于图像侧 BN 前特征。融合特征继续用于最终检索和 TFC；`label_smoothing` 只作用于 `L_id`，不修改 SigLIP binary target。
 
 ### 5.3 TFC 中心化损失
 
@@ -148,9 +155,9 @@ TFC 仅用于训练。推理阶段不使用中心、不进行最近邻搜索、�
 对每张 query 与 gallery 图像执行同一流程：
 
 1. 按数据集标准从文件名解析 camera ID。
-2. 使用 CLIP image encoder 得到 `f_v`。
+2. 使用 SigLIP 2 image encoder 和 feature head 得到 `f_v`。
 3. 组合 `global prompt + cam prompt`。
-4. 使用 CLIP text encoder 得到 `f_t`。
+4. 使用 SigLIP 2 text encoder 得到 `f_t`。
 5. 计算 `f = normalize(f_v + beta * f_t)`。
 6. 使用 query/gallery 的融合特征 `f` 计算 cosine similarity。
 
@@ -190,7 +197,7 @@ Market-1501 作为辅数据集，按标准 Image-to-Image ReID 协议评测，�
 | AGW | CNN | 否 | 否 | 真实实验或核对引用后填写 | 真实实验或核对引用后填写 | 真实实验或核对引用后填写 | 真实实验或核对引用后填写 |
 | TransReID | ViT | 否 | 否 | 真实实验或核对引用后填写 | 真实实验或核对引用后填写 | 真实实验或核对引用后填写 | 真实实验或核对引用后填写 |
 | CLIP-ReID | CLIP ViT | 依论文协议核对 | 否 | 真实实验或核对引用后填写 | 真实实验或核对引用后填写 | 真实实验或核对引用后填写 | 真实实验或核对引用后填写 |
-| T2C-CLIP | CLIP ViT | 是 | 否 | 真实实验后填写 | 真实实验后填写 | 真实实验后填写 | 真实实验后填写 |
+| T2C-CLIP | SigLIP 2 So400m/14 | 是 | 否 | 真实实验后填写 | 真实实验后填写 | 真实实验后填写 | 真实实验后填写 |
 
 引用近期方法时必须核对协议：无 rerank 不能与 rerank 结果混报，Text-ReID 结果不能放入 Image-ReID 主结果表。
 
@@ -271,7 +278,8 @@ Market-1501 作为辅数据集，按标准 Image-to-Image ReID 协议评测，�
 - 任务范围：仅 Image-to-Image 行人重识别。
 - 主数据集：MSMT17。
 - 辅数据集：Market-1501。
-- 基座：CLIP ViT 双流。
+- 基座：SigLIP 2 So400m patch14-384 双流。
+- 图文目标：冻结预训练 scale/bias 的监督式 SigLIP sigmoid loss。
 - 推理特征：`f = normalize(f_v + beta * f_t)`。
 - 推理文本 prompt：global prompt + cam prompt。
 - 训练期 prompt：per-ID prompt 仅用于训练身份对齐。

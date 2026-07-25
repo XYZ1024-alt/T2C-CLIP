@@ -1,12 +1,14 @@
-"""Learnable prompt composition for T2C-CLIP.
+"""Learnable prompt composition for T2C-SigLIP 2.
 
-The ``embedding_dim`` of the prompt bank must equal the CLIP text model
+The ``embedding_dim`` of the prompt bank must equal the SigLIP 2 text model
 **token embedding dimension** (``text_model.embeddings.token_embedding``'s
-hidden dimension), not the CLIP shared projection dimension. The job
-builder obtains this dimension from :func:`t2c_clip.clip_backbone.clip_text_hidden_dim`.
-Each prompt parameter lives in token-embedding space and is injected by
-:class:`~t2c_clip.clip_backbone.TransformersCLIPTextEncoder` into fixed
-context slots between the SOT and EOS tokens.
+hidden dimension), not the shared output feature dimension. The job
+builder obtains this dimension from
+:func:`t2c_clip.siglip2_backbone.siglip2_text_hidden_dim`. Each prompt
+parameter lives in token-embedding space and is injected by
+:class:`~t2c_clip.siglip2_backbone.TransformersSiglip2TextEncoder` into fixed
+context slots using the loaded checkpoint's native fixed-length padding
+layout.
 
 Training-time prompts combine ``global + camera + identity`` prompts.
 Inference-time prompts combine ``global + camera`` prompts only —
@@ -62,7 +64,7 @@ class PromptBank(torch.nn.Module):
     def identity_anchor_prompts(self, person_ids: torch.Tensor) -> torch.Tensor:
         """Camera-agnostic identity prototype prompts: global + identity only.
 
-        Used as the Stage-2 image-to-text classification anchors; the camera
+        Used as the Stage-2 supervised SigLIP identity-anchor bank; the camera
         component is deliberately excluded so camera prompts stay dedicated
         to retrieval fusion.
         """

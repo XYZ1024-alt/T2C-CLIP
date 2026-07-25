@@ -3,7 +3,7 @@
 from t2c_clip.data import ReIDSample
 from t2c_clip.evaluation import ReIDMetrics, evaluate_reid
 from t2c_clip.features import fuse_features, l2_normalize
-from t2c_clip.losses import batch_hard_triplet_loss, bidirectional_contrastive_loss
+from t2c_clip.losses import batch_hard_triplet_loss, supervised_siglip_loss
 from t2c_clip.loops import (
     DEFAULT_VALIDATION_INTERVAL,
     EpochResult,
@@ -12,7 +12,7 @@ from t2c_clip.loops import (
     run_training_loop,
     should_validate_epoch,
 )
-from t2c_clip.model import T2CClipModel
+from t2c_clip.model import T2CSiglip2Model
 from t2c_clip.wandb import WandbConfig, WandbTracker, start_wandb_run
 from t2c_clip.prompts import PromptBank, PromptConfig
 from t2c_clip.tfc import TFCCenterBank
@@ -37,7 +37,7 @@ __all__ = [
     "Stage2LossBreakdown",
     "Stage2LossConfig",
     "Stage2LossInputs",
-    "T2CClipModel",
+    "T2CSiglip2Model",
     "TFCCenterBank",
     "TrainingBatch",
     "TrainingLoopConfig",
@@ -45,7 +45,7 @@ __all__ = [
     "WandbConfig",
     "WandbTracker",
     "batch_hard_triplet_loss",
-    "bidirectional_contrastive_loss",
+    "supervised_siglip_loss",
     "evaluate_reid",
     "fuse_features",
     "l2_normalize",

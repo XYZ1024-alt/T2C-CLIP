@@ -5,10 +5,10 @@ import torch
 from t2c_clip.features import l2_normalize
 from t2c_clip.losses import (
     batch_hard_triplet_loss,
-    image_to_text_cross_entropy,
-    supervised_bidirectional_contrastive_loss,
+    siglip_identity_anchor_loss,
+    supervised_siglip_loss,
 )
-from t2c_clip.model import T2CClipModel
+from t2c_clip.model import T2CSiglip2Model
 from t2c_clip.prompts import PromptBank, PromptConfig
 from t2c_clip.tfc import TFCCenterBank
 from t2c_clip.training import (
@@ -43,8 +43,10 @@ class TrainingLossTest(unittest.TestCase):
 
         breakdown = stage1_alignment_loss(model, batch, Stage1LossConfig(logit_scale=10.0))
 
-        self.assertLess(float(breakdown.total.detach()), 0.01)
-        self.assertTrue(torch.allclose(breakdown.total, breakdown.clip_dual))
+        # Native SigLIP sums the negative pair's softplus(0), so the matched
+        # two-sample fixture approaches ln(2), not zero.
+        self.assertLess(float(breakdown.total.detach()), 0.7)
+        self.assertTrue(torch.allclose(breakdown.total, breakdown.alignment))
 
     def test_stage1_alignment_treats_same_identity_as_positive(self):
         # PK-sampled batches repeat identities; the stage-1 alignment loss must
@@ -57,13 +59,13 @@ class TrainingLossTest(unittest.TestCase):
         )
         config = Stage1LossConfig(logit_scale=5.0)
         outputs = model.forward_stage1(batch.images, batch.camera_ids, batch.person_ids)
-        expected = supervised_bidirectional_contrastive_loss(
+        expected = supervised_siglip_loss(
             outputs["visual"], outputs["text"], batch.person_ids, logit_scale=5.0
         )
 
         breakdown = stage1_alignment_loss(model, batch, config)
 
-        self.assertTrue(torch.allclose(breakdown.clip_dual, expected))
+        self.assertTrue(torch.allclose(breakdown.alignment, expected))
 
     def test_stage1_alignment_loss_from_visual_matches_full_loss(self):
         # The cached Stage-1 path feeds a precomputed normalized image feature
@@ -86,10 +88,10 @@ class TrainingLossTest(unittest.TestCase):
             config=config,
         )
 
-        self.assertTrue(torch.equal(breakdown.clip_dual, expected.clip_dual))
+        self.assertTrue(torch.equal(breakdown.alignment, expected.alignment))
 
-    def test_stage2_i2t_classifies_visual_against_anchor_matrix(self):
-        # CLIP-ReID Stage-2: the L2-normalized image feature is classified
+    def test_stage2_alignment_classifies_visual_against_anchor_matrix(self):
+        # SigLIP 2 Stage-2: the L2-normalized image feature is classified
         # against the frozen identity anchor matrix over ALL train ids.
         model = _training_model(beta=0.0)
         classifier = torch.nn.Linear(2, 2, bias=False)
@@ -104,7 +106,7 @@ class TrainingLossTest(unittest.TestCase):
         tfc_bank = TFCCenterBank(num_train_ids=2, feature_dim=2, momentum=0.5)
         tfc_bank.update(model.forward_stage2(batch.images, batch.camera_ids, batch.person_ids)["retrieval"], batch.person_ids)
         outputs = model.forward_stage2(batch.images, batch.camera_ids, batch.person_ids)
-        expected = image_to_text_cross_entropy(
+        expected = siglip_identity_anchor_loss(
             outputs["visual"], anchors, batch.person_ids, logit_scale=Stage2LossConfig().logit_scale
         )
 
@@ -114,9 +116,9 @@ class TrainingLossTest(unittest.TestCase):
             Stage2LossInputs(classifier=classifier, tfc_bank=tfc_bank, anchors=anchors),
         )
 
-        self.assertTrue(torch.allclose(breakdown.i2t, expected))
+        self.assertTrue(torch.allclose(breakdown.alignment, expected))
 
-    def test_stage2_i2t_uses_configured_label_smoothing(self):
+    def test_stage2_alignment_ignores_reid_label_smoothing(self):
         model = _training_model(beta=0.0)
         classifier = torch.nn.Linear(2, 2, bias=False)
         batch = TrainingBatch(
@@ -139,9 +141,18 @@ class TrainingLossTest(unittest.TestCase):
                 ),
             )
 
-        self.assertGreater(float(breakdowns[0.4].i2t.detach()), float(breakdowns[0.0].i2t.detach()))
+        self.assertTrue(
+            torch.equal(
+                breakdowns[0.4].alignment,
+                breakdowns[0.0].alignment,
+            )
+        )
+        self.assertNotEqual(
+            float(breakdowns[0.4].identity.detach()),
+            float(breakdowns[0.0].identity.detach()),
+        )
 
-    def test_stage2_loss_breakdown_combines_clip_reid_and_tfc(self):
+    def test_stage2_loss_breakdown_combines_alignment_reid_and_tfc(self):
         model = _training_model(beta=0.0)
         classifier = torch.nn.Linear(2, 2, bias=False)
         with torch.no_grad():
@@ -157,18 +168,18 @@ class TrainingLossTest(unittest.TestCase):
             classifier=classifier,
             tfc_bank=tfc_bank,
             anchors=torch.eye(2),
-            config=Stage2LossConfig(tfc_weight=0.5, clip_weight=1.0),
+            config=Stage2LossConfig(tfc_weight=0.5, alignment_weight=1.0),
         )
 
         breakdown = stage2_loss_breakdown(model, batch, inputs)
 
         expected = (
             breakdown.identity + breakdown.triplet
-            + breakdown.clip_weight * breakdown.i2t
+            + breakdown.alignment_weight * breakdown.alignment
             + breakdown.tfc_weight * breakdown.tfc
         )
         self.assertTrue(torch.allclose(breakdown.total, expected))
-        self.assertEqual(breakdown.clip_weight, 1.0)
+        self.assertEqual(breakdown.alignment_weight, 1.0)
         self.assertEqual(breakdown.tfc_weight, 0.5)
 
     def test_stage2_loss_uses_configured_label_smoothing(self):
@@ -401,7 +412,7 @@ class TrainingLossTest(unittest.TestCase):
 
 class Stage2ForwardLayoutTest(unittest.TestCase):
     def test_forward_stage2_returns_image_side_features_only(self):
-        # The i2t term classifies against the precomputed identity anchor
+        # The alignment term classifies against the precomputed identity anchor
         # matrix, so Stage-2 must not encode per-sample training text anymore.
         model = _training_model(beta=0.0)
 
@@ -545,7 +556,7 @@ def _training_model(
     beta: float,
     feature_head: torch.nn.Module | None = None,
     camera_prompt: torch.Tensor | None = None,
-) -> T2CClipModel:
+) -> T2CSiglip2Model:
     bank = PromptBank(PromptConfig(num_cameras=2, num_train_ids=2, context_length=1, embedding_dim=2))
     with torch.no_grad():
         bank.global_prompt.zero_()
@@ -554,4 +565,4 @@ def _training_model(
             bank.camera_prompts.copy_(camera_prompt.unsqueeze(0).expand_as(bank.camera_prompts))
         bank.identity_prompts[0] = torch.tensor([[1.0, 0.0]])
         bank.identity_prompts[1] = torch.tensor([[0.0, 1.0]])
-    return T2CClipModel(IdentityEncoder(), PromptMeanEncoder(), bank, beta=beta, feature_head=feature_head)
+    return T2CSiglip2Model(IdentityEncoder(), PromptMeanEncoder(), bank, beta=beta, feature_head=feature_head)

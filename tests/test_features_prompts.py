@@ -54,7 +54,7 @@ class FeaturePromptTest(unittest.TestCase):
         self.assertTrue(torch.equal(prompt, torch.full((1, 1, 2), 3.0)))
 
     def test_prompt_bank_identity_anchor_excludes_camera_prompt(self):
-        # The i2t anchor is a camera-agnostic identity prototype: global +
+        # The alignment anchor is a camera-agnostic identity prototype: global +
         # identity only, never the camera component.
         bank = PromptBank(PromptConfig(num_cameras=2, num_train_ids=3, context_length=2, embedding_dim=2))
         with torch.no_grad():

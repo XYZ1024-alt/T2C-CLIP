@@ -1,41 +1,12 @@
-"""Real CLIP-backed T2C-CLIP two-stage training job builder.
+"""SigLIP 2-backed T2C-CLIP two-stage training job builder.
 
-Stage-1 prompt alignment:
+Stage-1 aligns frozen image features with identity-aware prompt text through
+SigLIP's supervised all-pairs sigmoid objective. Stage-2 trains the ReID head,
+TFC centers, prompt bank, and (by default) the SigLIP 2 vision tower, while
+aligning each image against every training-identity text anchor.
 
-- Trains the learnable prompt bank via real CLIP text encoder + text_projection.
-- CLIP image encoder is frozen by default (``--freeze-image-encoder-stage1``).
-- With ``--stage1-feature-cache`` (default) the frozen image tower runs once:
-  train-split features are extracted with the eval transform at the start of
-  the first Stage-1 epoch and every Stage-1 step is served from the cache.
-- Loss is ``bidirectional_contrastive_loss(f_v, f_t_id)`` only.
-- No classifier / triplet / TFC gradients flow in Stage-1.
-
-Stage-2 ReID training:
-
-- Trains prompt bank, classifier, TFC centers, and (by default) the CLIP
-  vision backbone + visual projection. CLIP-ReID's Stage-2 recipe fine-tunes
-  the image encoder so the ReID signal can actually act on ``f_v``; freezing
-  it caps the retrieval mAP near the frozen CLIP image-only floor
-  (~1% on MSMT17) and is opt-in via ``--freeze-image-encoder-stage2``.
-- The unfrozen backbone uses its own (smaller) learning rate
-  ``image_encoder_lr`` to avoid catastrophic forgetting of the pretrained
-  visual features.
-- ``--beta-warmup-epochs`` ramps the fused retrieval beta from ``0`` at
-  epoch 1 to ``config.beta`` at ``warmup_epochs + 1``, so the random
-  camera-conditioned text feature does not pull ``f_eval`` below the
-  image-only floor at startup.
-- The CLIP alignment term is CLIP-ReID's image-to-text cross entropy: the
-  image feature is classified against the identity anchor text matrix over
-  ALL train identities (prompt bank and text encoder both frozen: encoded
-  once; otherwise re-encoded at each Stage-2 epoch start, always detached).
-- Total loss is::
-
-      L_id + L_triplet + clip_weight * L_i2t + tfc_weight * L_TFC
-
-Validation:
-
-- Uses ``encode_retrieval`` (global + camera prompts only). Identity prompts
-  never touch query/gallery retrieval.
+Validation and inference use only global + camera prompts. Identity prompts
+never touch query/gallery retrieval.
 """
 
 from __future__ import annotations
@@ -44,6 +15,7 @@ import math
 
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
+from itertools import batched
 from pathlib import Path
 from typing import Any
 
@@ -52,11 +24,16 @@ from torch.utils.data import DataLoader
 
 from scripts.train import StageMetadata, TrainingJob, TwoStageTrainingJob
 from t2c_clip.anchors import IdentityAnchorProvider
-from t2c_clip.clip_backbone import (
-    TransformersCLIPImageEncoder,
-    TransformersCLIPTextEncoder,
-    clip_projection_dim,
-    clip_text_hidden_dim,
+from t2c_clip.siglip2_backbone import (
+    TransformersSiglip2ImageEncoder,
+    TransformersSiglip2TextEncoder,
+    SIGLIP2_MODEL_ID,
+    siglip2_feature_dim,
+    siglip2_max_num_patches,
+    siglip2_patch_size,
+    siglip2_text_hidden_dim,
+    siglip2_uses_patchified_inputs,
+    validate_siglip2_image_size,
 )
 from t2c_clip.data import ReIDSample, load_market_split, load_msmt17_manifest
 from t2c_clip.datasets import (
@@ -71,7 +48,8 @@ from t2c_clip.datasets import (
 )
 from t2c_clip.evaluation import ReIDMetrics, evaluate_reid, evaluate_reid_with_rerank
 from t2c_clip.features import l2_normalize
-from t2c_clip.model import T2CClipModel
+from t2c_clip.model import T2CSiglip2Model
+from t2c_clip.precision import PrecisionController, PrecisionPolicy, resolve_precision
 from t2c_clip.prompts import PromptBank, PromptConfig
 from t2c_clip.retrieval import FUSED_RETRIEVAL, require_retrieval_mode
 from t2c_clip.tfc import TFCCenterBank
@@ -86,29 +64,47 @@ from t2c_clip.training import (
     stage1_alignment_loss_from_visual,
     stage2_loss_breakdown,
 )
-from t2c_clip.transforms import CLIPImageTransform, CLIPTrainImageTransform, DEFAULT_IMAGE_SIZE
+from t2c_clip.transforms import Siglip2ImageTransform, Siglip2TrainImageTransform, DEFAULT_IMAGE_SIZE
 
 DEFAULT_RANKS = (1, 5, 10)
 SUPPORTED_DATASETS = ("market1501", "msmt17")
-DEFAULT_CLIP_TOKEN_IDS = {"sot": 49406, "eos": 49407, "pad": 0}
-# Natural-language frame around the learnable prompt slots. Keeping the text
-# tower close to its pretraining distribution matters (CLIP-ReID ablation):
-# the encoded sequence is [SOT] + prefix + <slots> + suffix + [EOS].
 PROMPT_TEMPLATE_PREFIX = "a photo of a"
 PROMPT_TEMPLATE_SUFFIX = "person ."
-STAGE1_TRAIN_LOSS_METRIC_NAMES = ("loss", "clip_loss")
-STAGE2_TRAIN_LOSS_METRIC_NAMES = ("loss", "i2t_loss", "reid_loss", "triplet_loss", "tfc_loss")
+STAGE1_TRAIN_LOSS_METRIC_NAMES = ("loss", "alignment_loss")
+STAGE2_TRAIN_LOSS_METRIC_NAMES = (
+    "loss",
+    "alignment_loss",
+    "reid_loss",
+    "triplet_loss",
+    "tfc_loss",
+)
 STAGE1 = "stage1"
 STAGE2 = "stage2"
 
-ClipLoader = Callable[[str], "CLIPLoadResult"]
+Siglip2Loader = Callable[[str], "Siglip2LoadResult"]
 
 
 @dataclass(frozen=True)
-class CLIPLoadResult:
+class Siglip2LoadResult:
     model: torch.nn.Module
     image_processor: Any
     tokenizer: Any
+
+
+@dataclass(frozen=True)
+class Siglip2ModelSpec:
+    feature_dim: int
+    text_hidden_dim: int
+    patch_size: int
+    max_num_patches: int
+    patch_count: int
+    vision_input_format: str
+    text_padding_side: str
+    include_bos_token: bool
+    mask_text_padding: bool
+    bos_token_id: int
+    eos_token_id: int
+    pad_token_id: int
 
 
 @dataclass(frozen=True)
@@ -117,28 +113,33 @@ class JobDataConfig:
     root: Path
 
 
-# CLIP-ReID ViT recipe: ~5e-6 x (batch/64) at the default batch size of 128.
-DEFAULT_IMAGE_ENCODER_LR = 1e-5
+# Conservative full-backbone learning rate for the 400M-parameter foundation model.
+DEFAULT_IMAGE_ENCODER_LR = 5e-6
 
 
 @dataclass(frozen=True)
-class CLIPReIDJobConfig:
+class Siglip2ReIDJobConfig:
     dataset: str
     data_root: Path
-    clip_model_name: str
-    clip_checkpoint: Path | None
+    siglip2_model_name: str
+    siglip2_checkpoint: Path | None
     batch_size: int
+    eval_batch_size: int
+    gradient_accumulation_steps: int
     num_workers: int
     lr: float
     image_encoder_lr: float
     device: torch.device
+    precision: PrecisionPolicy
+    gradient_checkpointing: bool
+    image_size: tuple[int, int]
     beta: float
     context_length: int
     tfc_momentum: float
     triplet_margin: float
     triplet_metric: str
     tfc_weight: float
-    clip_weight: float
+    alignment_weight: float
     id_logit_scale: float
     label_smoothing: float
     stage1_epochs: int
@@ -211,14 +212,18 @@ class Stage1FeatureCache:
     (including any SIE camera injection) would produce for every later epoch.
     """
 
-    def __init__(self, dataset: ReIDImageDataset, config: CLIPReIDJobConfig):
+    def __init__(self, dataset: ReIDImageDataset, config: Siglip2ReIDJobConfig):
         self._dataset = dataset
         self._config = config
         self._visual_raw: torch.Tensor | None = None
         self._person_ids: torch.Tensor | None = None
         self._camera_ids: torch.Tensor | None = None
 
-    def ensure_extracted(self, model: "CLIPReIDTrainingModel") -> None:
+    def ensure_extracted(
+        self,
+        model: "Siglip2ReIDTrainingModel",
+        precision: PrecisionController,
+    ) -> None:
         if self._visual_raw is not None:
             return
         loader = _loader(self._dataset, self._config, shuffle=False)
@@ -227,7 +232,7 @@ class Stage1FeatureCache:
         visual_parts: list[torch.Tensor] = []
         person_parts: list[torch.Tensor] = []
         camera_parts: list[torch.Tensor] = []
-        with torch.no_grad():
+        with torch.no_grad(), precision.autocast():
             for batch in loader:
                 images = batch.images.to(self._config.device)
                 cameras = batch.camera_ids.to(self._config.device)
@@ -262,28 +267,31 @@ class Stage1FeatureCache:
 
 @dataclass(frozen=True)
 class StageTrainingRuntime:
-    model: "CLIPReIDTrainingModel"
+    model: "Siglip2ReIDTrainingModel"
     loaders: LoaderBundle
     optimizer: torch.optim.Optimizer
     stage: str
     loss_config: Any
     device: torch.device
     beta_schedule: "BetaSchedule | None" = None
-    freeze_config: "CLIPReIDJobConfig | None" = None
+    freeze_config: "Siglip2ReIDJobConfig | None" = None
     lr_scheduler: "StageLRScheduler | None" = None
     anchor_provider: IdentityAnchorProvider | None = None
     feature_cache: Stage1FeatureCache | None = None
+    precision: PrecisionController | None = None
+    gradient_accumulation_steps: int = 1
 
 
 @dataclass(frozen=True)
 class ValidationRuntime:
-    model: "CLIPReIDTrainingModel"
+    model: "Siglip2ReIDTrainingModel"
     loaders: LoaderBundle
     device: torch.device
     retrieval_mode: str
-    model_config: "CLIPReIDJobConfig"
+    model_config: "Siglip2ReIDJobConfig"
     beta_schedule: "BetaSchedule | None" = None
     report_rerank: bool = False
+    precision: PrecisionController | None = None
 
 
 @dataclass(frozen=True)
@@ -312,7 +320,7 @@ class BetaSchedule:
             return 0.0
         return self.beta * min(1.0, (stage_epoch - 1) / self.warmup_epochs)
 
-    def apply(self, model: "CLIPReIDTrainingModel", epoch: int) -> None:
+    def apply(self, model: "Siglip2ReIDTrainingModel", epoch: int) -> None:
         stage_epoch = epoch - self.first_epoch + 1
         model.retrieval_model.beta = self.effective_beta(stage_epoch)
 
@@ -350,10 +358,10 @@ class StageLRScheduler:
             group["lr"] = base_lr * factor
 
 
-class CLIPReIDTrainingModel(torch.nn.Module):
+class Siglip2ReIDTrainingModel(torch.nn.Module):
     def __init__(
         self,
-        retrieval_model: T2CClipModel,
+        retrieval_model: T2CSiglip2Model,
         classifier: torch.nn.Module,
         tfc_bank: TFCCenterBank,
     ):
@@ -394,43 +402,76 @@ class BNNeck(torch.nn.Module):
 
 def build_training_job(
     args: Any,
-    clip_loader: ClipLoader = lambda model_name: load_transformers_clip(model_name),
+    siglip2_loader: Siglip2Loader = lambda model_name: load_transformers_siglip2(model_name),
 ) -> TwoStageTrainingJob | TrainingJob:
     config = _job_config_from_args(args)
-    loaded_clip = clip_loader(config.clip_model_name)
-    _load_clip_checkpoint_if_requested(loaded_clip.model, config.clip_checkpoint, config.device)
-    transforms = TransformBundle(
-        train=CLIPTrainImageTransform(loaded_clip.image_processor),
-        eval=CLIPImageTransform(loaded_clip.image_processor),
+    loaded_siglip2 = siglip2_loader(config.siglip2_model_name)
+    _load_siglip2_checkpoint_if_requested(
+        loaded_siglip2.model, config.siglip2_checkpoint, config.device
     )
-    data = load_dataset_bundle(JobDataConfig(config.dataset, config.data_root), transforms)
+    spec = _validate_loaded_siglip2(loaded_siglip2, config.image_size)
+    _configure_gradient_checkpointing(
+        loaded_siglip2.model, config.gradient_checkpointing
+    )
+    transforms = TransformBundle(
+        train=Siglip2TrainImageTransform(
+            loaded_siglip2.image_processor, image_size=config.image_size
+        ),
+        eval=Siglip2ImageTransform(
+            loaded_siglip2.image_processor, image_size=config.image_size
+        ),
+    )
+    data = load_dataset_bundle(
+        JobDataConfig(config.dataset, config.data_root), transforms
+    )
     shared_model = _build_training_model(
         config,
-        loaded_clip.model,
+        loaded_siglip2.model,
         data,
-        prefix_token_ids=_encode_template_token_ids(loaded_clip.tokenizer, PROMPT_TEMPLATE_PREFIX),
-        suffix_token_ids=_encode_template_token_ids(loaded_clip.tokenizer, PROMPT_TEMPLATE_SUFFIX),
+        spec=spec,
+        prefix_token_ids=_encode_template_token_ids(
+            loaded_siglip2.tokenizer, PROMPT_TEMPLATE_PREFIX
+        ),
+        suffix_token_ids=_encode_template_token_ids(
+            loaded_siglip2.tokenizer, PROMPT_TEMPLATE_SUFFIX
+        ),
     ).to(config.device)
+    precision = PrecisionController(config.precision)
     loaders = _build_loaders(data, config)
-    stage1_runtime, stage2_runtime, optimizer_stage1, optimizer_stage2, stage2_beta_schedule = _build_runtimes(
-        config, shared_model, loaders, data.num_train_ids,
+    (
+        stage1_runtime,
+        stage2_runtime,
+        optimizer_stage1,
+        optimizer_stage2,
+        stage2_beta_schedule,
+    ) = _build_runtimes(
+        config,
+        shared_model,
+        loaders,
+        data.num_train_ids,
+        precision=precision,
         stage1_feature_cache=_build_stage1_feature_cache(config, data),
     )
-    metadata = _stage_metadata(config)
+    metadata = _stage_metadata(config, spec)
     stage2_job = TrainingJob(
         model=shared_model,
         optimizer=optimizer_stage2,
         train_one_epoch=_train_one_epoch(stage2_runtime),
-        validate=_validate(ValidationRuntime(
-            shared_model,
-            loaders,
-            config.device,
-            config.retrieval_mode,
-            config,
-            beta_schedule=stage2_beta_schedule,
-            report_rerank=config.report_rerank,
-        )),
+        validate=_validate(
+            ValidationRuntime(
+                shared_model,
+                loaders,
+                config.device,
+                config.retrieval_mode,
+                config,
+                beta_schedule=stage2_beta_schedule,
+                report_rerank=config.report_rerank,
+                precision=precision,
+            )
+        ),
         stage_metadata=metadata,
+        checkpoint_metadata=_checkpoint_metadata(config, spec),
+        auxiliary_state=precision,
     )
     if config.stage1_epochs <= 0:
         return stage2_job
@@ -439,6 +480,9 @@ def build_training_job(
         optimizer=optimizer_stage1,
         train_one_epoch=_train_one_epoch(stage1_runtime),
         validate=_noop_validate(),
+        stage_metadata=metadata,
+        checkpoint_metadata=_checkpoint_metadata(config, spec),
+        auxiliary_state=precision,
     )
     return TwoStageTrainingJob(
         stage1=stage1_job,
@@ -447,21 +491,190 @@ def build_training_job(
     )
 
 
-def load_transformers_clip(model_name: str) -> CLIPLoadResult:
+def load_transformers_siglip2(model_name: str) -> Siglip2LoadResult:
+    if model_name != SIGLIP2_MODEL_ID:
+        raise ValueError(
+            f"this training job only supports {SIGLIP2_MODEL_ID!r}, got "
+            f"{model_name!r}"
+        )
     try:
-        from transformers import AutoTokenizer, CLIPModel, CLIPProcessor
+        from transformers import AutoModel, AutoProcessor, AutoTokenizer
     except ImportError as exc:
-        raise ImportError("transformers is required for the CLIP ReID training job") from exc
-    model = CLIPModel.from_pretrained(model_name)
-    processor = CLIPProcessor.from_pretrained(model_name)
-    try:
+        raise ImportError("transformers with SigLIP 2 support is required") from exc
+    model = AutoModel.from_pretrained(model_name)
+    if getattr(getattr(model, "config", None), "model_type", None) != "siglip":
+        raise ValueError(
+            f"{SIGLIP2_MODEL_ID!r} must load as the fixed Transformers "
+            "model_type 'siglip'"
+        )
+    processor = AutoProcessor.from_pretrained(model_name)
+    tokenizer = getattr(processor, "tokenizer", None)
+    if tokenizer is None:
         tokenizer = AutoTokenizer.from_pretrained(model_name)
-    except Exception:
-        # The prompt template must be encoded with the model's tokenizer;
-        # CLIPProcessor bundles one, so fall back to it.
-        tokenizer = getattr(processor, "tokenizer", None)
-    image_processor = getattr(processor, "image_processor", processor)
-    return CLIPLoadResult(model, image_processor, tokenizer)
+    image_processor = getattr(processor, "image_processor", None)
+    if image_processor is None:
+        raise ValueError("SigLIP 2 processor must expose image_processor")
+    return Siglip2LoadResult(model, image_processor, tokenizer)
+
+
+def _validate_loaded_siglip2(
+    loaded: Siglip2LoadResult,
+    image_size: tuple[int, int],
+) -> Siglip2ModelSpec:
+    model = loaded.model
+    model_type = getattr(getattr(model, "config", None), "model_type", None)
+    if model_type != "siglip":
+        raise ValueError(
+            "the fixed SigLIP 2 checkpoint must load as Transformers "
+            f"model_type 'siglip', got {model_type!r}"
+        )
+    patch_size = siglip2_patch_size(model)
+    max_num_patches = siglip2_max_num_patches(model)
+    feature_dim = siglip2_feature_dim(model)
+    text_hidden_dim = siglip2_text_hidden_dim(model)
+    patch_count = validate_siglip2_image_size(image_size, model)
+
+    uses_patchified_inputs = siglip2_uses_patchified_inputs(model)
+    if uses_patchified_inputs:
+        processor_patch_size = _processor_integer(
+            loaded.image_processor, "patch_size"
+        )
+        processor_max_patches = _processor_integer(
+            loaded.image_processor, "max_num_patches"
+        )
+        if processor_patch_size != patch_size:
+            raise ValueError(
+                "SigLIP 2 processor/model patch size mismatch "
+                f"({processor_patch_size} != {patch_size})"
+            )
+        if processor_max_patches != max_num_patches:
+            raise ValueError(
+                "SigLIP 2 processor/model patch budget mismatch "
+                f"({processor_max_patches} != {max_num_patches}); load the "
+                "processor from the same checkpoint instead of relying on class "
+                "defaults"
+            )
+    else:
+        _validate_fixed_image_processor(
+            loaded.image_processor,
+            model,
+            patch_size,
+            max_num_patches,
+        )
+
+    embeddings = getattr(getattr(model, "vision_model", None), "embeddings", None)
+    embedding_patch_size = getattr(embeddings, "patch_size", None)
+    embedding_num_patches = getattr(embeddings, "num_patches", None)
+    position_embedding = getattr(embeddings, "position_embedding", None)
+    position_count = getattr(getattr(position_embedding, "weight", None), "shape", (None,))[0]
+    if embedding_patch_size != patch_size:
+        raise ValueError("SigLIP 2 vision embeddings patch size disagrees with model config")
+    if embedding_num_patches != max_num_patches or position_count != max_num_patches:
+        raise ValueError("SigLIP 2 vision positional embedding budget disagrees with model config")
+
+    bos, eos, pad = _resolve_siglip2_token_ids(
+        model,
+        loaded.tokenizer,
+        strict_config_match=uses_patchified_inputs,
+    )
+    text_padding_side = "left" if uses_patchified_inputs else str(
+        getattr(loaded.tokenizer, "padding_side", "right")
+    )
+    if text_padding_side not in {"left", "right"}:
+        raise ValueError(
+            f"unsupported SigLIP 2 tokenizer padding side: {text_padding_side!r}"
+        )
+    if not uses_patchified_inputs and text_padding_side != "right":
+        raise ValueError(
+            "the fixed SigLIP 2 tokenizer must use right padding to preserve "
+            "its final-position pooling semantics"
+        )
+    include_bos_token = uses_patchified_inputs
+    mask_text_padding = uses_patchified_inputs or (
+        "attention_mask"
+        in tuple(getattr(loaded.tokenizer, "model_input_names", ()))
+    )
+    if not uses_patchified_inputs and mask_text_padding:
+        raise ValueError(
+            "the fixed SigLIP 2 tokenizer must expose the checkpoint-native "
+            "input_ids-only text contract"
+        )
+    return Siglip2ModelSpec(
+        feature_dim=feature_dim,
+        text_hidden_dim=text_hidden_dim,
+        patch_size=patch_size,
+        max_num_patches=max_num_patches,
+        patch_count=patch_count,
+        vision_input_format=(
+            "patchified" if uses_patchified_inputs else "fixed_bchw"
+        ),
+        text_padding_side=text_padding_side,
+        include_bos_token=include_bos_token,
+        mask_text_padding=mask_text_padding,
+        bos_token_id=bos,
+        eos_token_id=eos,
+        pad_token_id=pad,
+    )
+
+
+def _validate_fixed_image_processor(
+    image_processor: Any,
+    model: Any,
+    patch_size: int,
+    max_num_patches: int,
+) -> None:
+    size = getattr(image_processor, "size", None)
+    if isinstance(size, dict):
+        height = size.get("height")
+        width = size.get("width")
+    else:
+        height = getattr(size, "height", None)
+        width = getattr(size, "width", None)
+    if size is None:
+        raise ValueError(
+            "fixed SigLIP 2 image processor must expose a height/width size"
+        )
+    model_size = getattr(
+        getattr(getattr(model, "config", None), "vision_config", None),
+        "image_size",
+        None,
+    )
+    if not all(isinstance(value, int) and value > 0 for value in (height, width)):
+        raise ValueError(
+            "fixed SigLIP 2 image processor size must contain positive height/width"
+        )
+    if not isinstance(model_size, int) or height != model_size or width != model_size:
+        raise ValueError(
+            "fixed SigLIP 2 processor/model pretraining size mismatch "
+            f"({height}x{width} != {model_size}x{model_size})"
+        )
+    processor_budget = (height // patch_size) * (width // patch_size)
+    if processor_budget != max_num_patches:
+        raise ValueError(
+            "fixed SigLIP 2 processor/model patch budget mismatch "
+            f"({processor_budget} != {max_num_patches})"
+        )
+
+
+def _processor_integer(image_processor: Any, name: str) -> int:
+    value = getattr(image_processor, name, None)
+    if isinstance(value, (tuple, list)):
+        if len(value) != 2 or int(value[0]) != int(value[1]):
+            raise ValueError(f"SigLIP 2 image processor {name} must be square")
+        value = int(value[0])
+    if not isinstance(value, int) or value < 1:
+        raise ValueError(f"SigLIP 2 image processor must expose positive integer {name}")
+    return value
+
+
+def _configure_gradient_checkpointing(model: torch.nn.Module, enabled: bool) -> None:
+    method_name = (
+        "gradient_checkpointing_enable" if enabled else "gradient_checkpointing_disable"
+    )
+    method = getattr(model, method_name, None)
+    if not callable(method):
+        raise ValueError(f"SigLIP 2 model does not support {method_name}")
+    method()
 
 
 def load_dataset_bundle(config: JobDataConfig, transforms) -> DatasetBundle:
@@ -487,11 +700,11 @@ def _transform_bundle(transforms) -> TransformBundle:
     return TransformBundle(train=transforms, eval=transforms)
 
 
-def _job_config_from_args(args: Any) -> CLIPReIDJobConfig:
+def _job_config_from_args(args: Any) -> Siglip2ReIDJobConfig:
     if args.dataset is None:
-        raise ValueError("--dataset is required for t2c_clip.jobs.clip_reid")
+        raise ValueError("--dataset is required for t2c_clip.jobs.siglip2_reid")
     if args.data_root is None:
-        raise ValueError("--data-root is required for t2c_clip.jobs.clip_reid")
+        raise ValueError("--data-root is required for t2c_clip.jobs.siglip2_reid")
     freeze_image_encoder_stage1 = bool(getattr(args, "freeze_image_encoder_stage1", True))
     stage1_feature_cache = bool(getattr(args, "stage1_feature_cache", True))
     if stage1_feature_cache and not freeze_image_encoder_stage1:
@@ -500,23 +713,54 @@ def _job_config_from_args(args: Any) -> CLIPReIDJobConfig:
             "Stage-1 image encoder makes the cached image features stale; pass "
             "--no-stage1-feature-cache or keep the Stage-1 image encoder frozen"
         )
-    return CLIPReIDJobConfig(
+    device = torch.device(args.device)
+    batch_size = int(getattr(args, "batch_size", 8))
+    eval_batch_size = int(getattr(args, "eval_batch_size", 16))
+    gradient_accumulation_steps = int(
+        getattr(args, "gradient_accumulation_steps", 4)
+    )
+    image_size = (
+        int(getattr(args, "image_height", DEFAULT_IMAGE_SIZE[0])),
+        int(getattr(args, "image_width", DEFAULT_IMAGE_SIZE[1])),
+    )
+    for value, name in (
+        (batch_size, "--batch-size"),
+        (eval_batch_size, "--eval-batch-size"),
+        (gradient_accumulation_steps, "--gradient-accumulation-steps"),
+        (image_size[0], "--image-height"),
+        (image_size[1], "--image-width"),
+    ):
+        if value < 1:
+            raise ValueError(f"{name} must be positive")
+    precision = resolve_precision(str(getattr(args, "precision", "auto")), device)
+    model_name = str(getattr(args, "siglip2_model_name", SIGLIP2_MODEL_ID))
+    if model_name != SIGLIP2_MODEL_ID:
+        raise ValueError(
+            f"this training job only supports {SIGLIP2_MODEL_ID!r}, got "
+            f"{model_name!r}"
+        )
+    return Siglip2ReIDJobConfig(
         dataset=args.dataset,
         data_root=args.data_root,
-        clip_model_name=args.clip_model_name,
-        clip_checkpoint=getattr(args, "clip_checkpoint", None),
-        batch_size=int(getattr(args, "batch_size", 64)),
+        siglip2_model_name=model_name,
+        siglip2_checkpoint=getattr(args, "siglip2_checkpoint", None),
+        batch_size=batch_size,
+        eval_batch_size=eval_batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
         num_workers=int(getattr(args, "num_workers", 4)),
         lr=float(getattr(args, "lr", 1e-4)),
         image_encoder_lr=float(getattr(args, "image_encoder_lr", DEFAULT_IMAGE_ENCODER_LR)),
-        device=torch.device(args.device),
+        device=device,
+        precision=precision,
+        gradient_checkpointing=bool(getattr(args, "gradient_checkpointing", True)),
+        image_size=image_size,
         beta=float(args.beta),
         context_length=int(args.context_length),
         tfc_momentum=float(args.tfc_momentum),
         triplet_margin=float(args.triplet_margin),
         triplet_metric=str(getattr(args, "triplet_metric", "euclidean")),
         tfc_weight=float(args.tfc_weight),
-        clip_weight=float(getattr(args, "clip_weight", 1.0)),
+        alignment_weight=float(getattr(args, "alignment_weight", 1.0)),
         id_logit_scale=float(getattr(args, "id_logit_scale", 1.0)),
         label_smoothing=float(getattr(args, "label_smoothing", 0.0)),
         stage1_epochs=int(getattr(args, "stage1_epochs", 0)),
@@ -540,10 +784,11 @@ def _job_config_from_args(args: Any) -> CLIPReIDJobConfig:
 
 
 def _build_runtimes(
-    config: CLIPReIDJobConfig,
-    model: CLIPReIDTrainingModel,
+    config: Siglip2ReIDJobConfig,
+    model: Siglip2ReIDTrainingModel,
     loaders: LoaderBundle,
     num_train_ids: int,
+    precision: PrecisionController,
     stage1_feature_cache: Stage1FeatureCache | None,
 ) -> tuple[
     StageTrainingRuntime,
@@ -554,16 +799,18 @@ def _build_runtimes(
 ]:
     _apply_freezing(model, config, stage=STAGE1)
     optimizer_stage1 = _build_optimizer(model, config)
-    clip_model = _clip_model_for(model.retrieval_model)
+    siglip2_model = _siglip2_model_for(model.retrieval_model)
     stage1_runtime = StageTrainingRuntime(
         model=model, loaders=loaders, optimizer=optimizer_stage1, stage=STAGE1,
-        loss_config=_stage1_loss_config(clip_model), device=config.device,
+        loss_config=_stage1_loss_config(siglip2_model), device=config.device,
         freeze_config=config,
         feature_cache=stage1_feature_cache,
+        precision=precision,
+        gradient_accumulation_steps=config.gradient_accumulation_steps,
     )
     _apply_freezing(model, config, stage=STAGE2)
     optimizer_stage2 = _build_optimizer(model, config)
-    stage2_loss_config = _stage2_loss_config(config, clip_model)
+    stage2_loss_config = _stage2_loss_config(config, siglip2_model)
     stage2_beta_schedule = BetaSchedule(
         beta=config.beta,
         warmup_epochs=config.beta_warmup_epochs,
@@ -573,9 +820,7 @@ def _build_runtimes(
     stage2_anchor_provider = IdentityAnchorProvider(
         model.retrieval_model,
         num_train_ids=num_train_ids,
-        # The anchors pass through the prompt bank AND the text encoder, so
-        # true CLIP-ReID fixation requires both frozen (same gate as
-        # _ensure_camera_text_cache); otherwise re-encode every epoch.
+        # Fixed anchors require both the prompt bank and text tower frozen.
         frozen=config.freeze_prompt_bank_stage2 and config.freeze_text_encoder,
     )
     stage2_runtime = StageTrainingRuntime(
@@ -585,12 +830,14 @@ def _build_runtimes(
         freeze_config=config,
         lr_scheduler=stage2_lr_scheduler,
         anchor_provider=stage2_anchor_provider,
+        precision=precision,
+        gradient_accumulation_steps=config.gradient_accumulation_steps,
     )
     return stage1_runtime, stage2_runtime, optimizer_stage1, optimizer_stage2, stage2_beta_schedule
 
 
 def _build_stage1_feature_cache(
-    config: CLIPReIDJobConfig,
+    config: Siglip2ReIDJobConfig,
     data: DatasetBundle,
 ) -> Stage1FeatureCache | None:
     if not config.stage1_feature_cache:
@@ -598,22 +845,20 @@ def _build_stage1_feature_cache(
     return Stage1FeatureCache(data.train_eval, config)
 
 
-def _apply_freezing(model: CLIPReIDTrainingModel, config: CLIPReIDJobConfig, stage: str) -> None:
+def _apply_freezing(model: Siglip2ReIDTrainingModel, config: Siglip2ReIDJobConfig, stage: str) -> None:
     retrieval = model.retrieval_model
-    clip_model = _clip_model_for(retrieval)
+    siglip2_model = _siglip2_model_for(retrieval)
     image_trainable = _image_encoder_trainable(config, stage)
     text_trainable = not config.freeze_text_encoder
-    _set_module_requires_grad(clip_model.vision_model, image_trainable)
-    _set_module_requires_grad(clip_model.visual_projection, image_trainable)
+    _set_module_requires_grad(siglip2_model.vision_model, image_trainable)
     # The SIE camera embedding feeds the vision tower, so it follows the
     # image-encoder freeze state of the current stage.
     if retrieval.image_encoder.sie_embedding is not None:
         _set_module_requires_grad(retrieval.image_encoder.sie_embedding, image_trainable)
-    _set_module_requires_grad(clip_model.text_model, text_trainable)
-    _set_module_requires_grad(clip_model.text_projection, text_trainable)
-    # The contrastive losses read logit_scale as a frozen constant; keep the
-    # parameter out of every stage optimizer.
-    clip_model.logit_scale.requires_grad_(False)
+    _set_module_requires_grad(siglip2_model.text_model, text_trainable)
+    # SigLIP's calibrated temperature and bias remain fixed for both stages.
+    siglip2_model.logit_scale.requires_grad_(False)
+    siglip2_model.logit_bias.requires_grad_(False)
     prompt_trainable = stage == STAGE1 or not config.freeze_prompt_bank_stage2
     retrieval.prompt_bank.requires_grad_(prompt_trainable)
     if stage == STAGE1:
@@ -625,7 +870,7 @@ def _apply_freezing(model: CLIPReIDTrainingModel, config: CLIPReIDJobConfig, sta
         retrieval.feature_head.freeze_bias()
 
 
-def _image_encoder_trainable(config: CLIPReIDJobConfig, stage: str) -> bool:
+def _image_encoder_trainable(config: Siglip2ReIDJobConfig, stage: str) -> bool:
     if stage == STAGE1:
         return not config.freeze_image_encoder_stage1
     if stage == STAGE2:
@@ -633,10 +878,13 @@ def _image_encoder_trainable(config: CLIPReIDJobConfig, stage: str) -> bool:
     raise ValueError(f"unknown training stage: {stage!r}")
 
 
-def _clip_model_for(retrieval_model: T2CClipModel) -> torch.nn.Module:
-    if not isinstance(retrieval_model.image_encoder, TransformersCLIPImageEncoder):
-        raise TypeError("CLIP freezing requires a TransformersCLIPImageEncoder-backed retrieval model")
-    return retrieval_model.image_encoder.clip_model
+def _siglip2_model_for(retrieval_model: T2CSiglip2Model) -> torch.nn.Module:
+    if not isinstance(retrieval_model.image_encoder, TransformersSiglip2ImageEncoder):
+        raise TypeError(
+            "SigLIP 2 freezing requires a TransformersSiglip2ImageEncoder-backed "
+            "retrieval model"
+        )
+    return retrieval_model.image_encoder.siglip2_model
 
 
 def _set_module_requires_grad(module: torch.nn.Module, value: bool) -> None:
@@ -644,16 +892,13 @@ def _set_module_requires_grad(module: torch.nn.Module, value: bool) -> None:
         parameter.requires_grad_(value)
 
 
-# Parameter-name prefixes whose owner is the CLIP vision backbone. These receive the
-# smaller image-encoder learning rate so the pretrained visual features are tuned, not
-# catastrophically forgotten, when Stage-2 unfreezes the image encoder.
+# Parameters owned by the pretrained SigLIP 2 vision tower use the smaller
+# backbone learning rate.
 BACKBONE_PARAMETER_PREFIXES = (
-    "retrieval_model.image_encoder.clip_model.vision_model.",
-    "retrieval_model.image_encoder.clip_model.visual_projection.",
+    "retrieval_model.image_encoder.siglip2_model.vision_model.",
 )
-# CLIP-ReID-style AdamW weight decay: applied to matrix weights only. Norm
-# parameters and biases (ndim <= 1), the prompt bank, and the SIE embedding
-# train without decay.
+# AdamW weight decay is applied to matrix weights only. Norms, biases,
+# prompts, and the SIE embedding train without decay.
 WEIGHT_DECAY = 1e-4
 NO_DECAY_PARAMETER_PREFIXES = (
     "retrieval_model.prompt_bank.",
@@ -661,7 +906,7 @@ NO_DECAY_PARAMETER_PREFIXES = (
 )
 
 
-def _build_optimizer(model: torch.nn.Module, config: CLIPReIDJobConfig) -> torch.optim.Optimizer:
+def _build_optimizer(model: torch.nn.Module, config: Siglip2ReIDJobConfig) -> torch.optim.Optimizer:
     grouped: dict[tuple[str, bool], list[torch.nn.Parameter]] = {}
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
@@ -690,29 +935,35 @@ def _build_optimizer(model: torch.nn.Module, config: CLIPReIDJobConfig) -> torch
     return torch.optim.AdamW(param_groups)
 
 
-def _contrastive_logit_scale(clip_model: torch.nn.Module) -> float:
-    """Pretrained CLIP contrastive temperature (``exp(logit_scale)``, ~100).
-
-    Read once as a frozen constant — the parameter itself never enters the
-    optimizer, matching CLIP-ReID's use of the pretrained scale.
-    """
-    logit_scale = getattr(clip_model, "logit_scale", None)
+def _pretrained_siglip_calibration(
+    siglip2_model: torch.nn.Module,
+) -> tuple[float, float]:
+    logit_scale = getattr(siglip2_model, "logit_scale", None)
+    logit_bias = getattr(siglip2_model, "logit_bias", None)
     if not isinstance(logit_scale, torch.Tensor):
-        raise ValueError("CLIP model must expose a logit_scale tensor for the contrastive losses")
-    return float(logit_scale.detach().exp())
+        raise ValueError("SigLIP 2 model must expose a logit_scale tensor")
+    if not isinstance(logit_bias, torch.Tensor):
+        raise ValueError("SigLIP 2 model must expose a logit_bias tensor")
+    return float(logit_scale.detach().exp()), float(logit_bias.detach())
 
 
-def _stage1_loss_config(clip_model: torch.nn.Module) -> Stage1LossConfig:
-    return Stage1LossConfig(logit_scale=_contrastive_logit_scale(clip_model))
+def _stage1_loss_config(siglip2_model: torch.nn.Module) -> Stage1LossConfig:
+    logit_scale, logit_bias = _pretrained_siglip_calibration(siglip2_model)
+    return Stage1LossConfig(logit_scale=logit_scale, logit_bias=logit_bias)
 
 
-def _stage2_loss_config(config: CLIPReIDJobConfig, clip_model: torch.nn.Module) -> Stage2LossConfig:
+def _stage2_loss_config(
+    config: Siglip2ReIDJobConfig,
+    siglip2_model: torch.nn.Module,
+) -> Stage2LossConfig:
+    logit_scale, logit_bias = _pretrained_siglip_calibration(siglip2_model)
     return Stage2LossConfig(
-        logit_scale=_contrastive_logit_scale(clip_model),
+        logit_scale=logit_scale,
+        logit_bias=logit_bias,
         triplet_margin=config.triplet_margin,
         triplet_metric=config.triplet_metric,
         tfc_weight=config.tfc_weight,
-        clip_weight=config.clip_weight,
+        alignment_weight=config.alignment_weight,
         id_logit_scale=config.id_logit_scale,
         label_smoothing=config.label_smoothing,
     )
@@ -720,7 +971,7 @@ def _stage2_loss_config(config: CLIPReIDJobConfig, clip_model: torch.nn.Module) 
 
 def _build_stage2_lr_scheduler(
     optimizer: torch.optim.Optimizer,
-    config: CLIPReIDJobConfig,
+    config: Siglip2ReIDJobConfig,
 ) -> "StageLRScheduler | None":
     if config.stage2_lr_scheduler == "none":
         return None
@@ -734,7 +985,10 @@ def _build_stage2_lr_scheduler(
     )
 
 
-def _stage_metadata(config: CLIPReIDJobConfig) -> StageMetadata:
+def _stage_metadata(
+    config: Siglip2ReIDJobConfig,
+    spec: Siglip2ModelSpec,
+) -> StageMetadata:
     """Bundle two-stage config into the canonical ``StageMetadata`` container.
 
     Returning a ``StageMetadata`` (rather than a raw dict) keeps
@@ -744,20 +998,30 @@ def _stage_metadata(config: CLIPReIDJobConfig) -> StageMetadata:
     """
     return StageMetadata(
         values={
+            "checkpoint_schema_version": 2,
+            "backbone_family": "siglip2",
             "dataset": config.dataset,
-            "clip_model_name": config.clip_model_name,
-            "clip_checkpoint": str(config.clip_checkpoint) if config.clip_checkpoint is not None else None,
+            "siglip2_model_name": config.siglip2_model_name,
+            "siglip2_checkpoint": str(config.siglip2_checkpoint) if config.siglip2_checkpoint is not None else None,
             "stage1_epochs": config.stage1_epochs,
             "stage2_epochs": config.stage2_epochs,
             "stage2_first_epoch": config.stage2_first_epoch,
             "validation_interval": config.validation_interval,
             "batch_size": config.batch_size,
+            "effective_batch_size": (
+                config.batch_size * config.gradient_accumulation_steps
+            ),
+            "eval_batch_size": config.eval_batch_size,
+            "gradient_accumulation_steps": config.gradient_accumulation_steps,
+            "precision_requested": config.precision.requested,
+            "precision_resolved": config.precision.resolved,
+            "gradient_checkpointing": config.gradient_checkpointing,
             "num_workers": config.num_workers,
             "lr": config.lr,
             "image_encoder_lr": config.image_encoder_lr,
             "beta": config.beta,
             "beta_warmup_epochs": config.beta_warmup_epochs,
-            "clip_weight": config.clip_weight,
+            "alignment_weight": config.alignment_weight,
             "id_logit_scale": config.id_logit_scale,
             "label_smoothing": config.label_smoothing,
             "tfc_weight": config.tfc_weight,
@@ -777,11 +1041,40 @@ def _stage_metadata(config: CLIPReIDJobConfig) -> StageMetadata:
             "num_instances": config.num_instances,
             "sie_coe": config.sie_coe,
             "stage1_feature_cache": config.stage1_feature_cache,
-            "image_size": "x".join(str(side) for side in DEFAULT_IMAGE_SIZE),
+            "feature_dim": spec.feature_dim,
+            "image_size": "x".join(str(side) for side in config.image_size),
+            "patch_size": spec.patch_size,
+            "patch_count": spec.patch_count,
+            "max_num_patches": spec.max_num_patches,
+            "vision_input_format": spec.vision_input_format,
+            "text_padding_side": spec.text_padding_side,
+            "include_bos_token": spec.include_bos_token,
+            "mask_text_padding": spec.mask_text_padding,
             "prompt_template_prefix": PROMPT_TEMPLATE_PREFIX,
             "prompt_template_suffix": PROMPT_TEMPLATE_SUFFIX,
         }
     )
+
+
+def _checkpoint_metadata(
+    config: Siglip2ReIDJobConfig,
+    spec: Siglip2ModelSpec,
+) -> dict[str, Any]:
+    return {
+        "schema_version": 2,
+        "backbone_family": "siglip2",
+        "model_id": config.siglip2_model_name,
+        "feature_dim": spec.feature_dim,
+        "image_size": tuple(config.image_size),
+        "patch_size": spec.patch_size,
+        "patch_count": spec.patch_count,
+        "max_num_patches": spec.max_num_patches,
+        "vision_input_format": spec.vision_input_format,
+        "text_padding_side": spec.text_padding_side,
+        "include_bos_token": spec.include_bos_token,
+        "mask_text_padding": spec.mask_text_padding,
+        "precision": config.precision.resolved,
+    }
 
 
 def _load_split_samples(config: JobDataConfig) -> SplitSamples:
@@ -816,48 +1109,51 @@ def _require_non_empty_splits(splits: SplitSamples) -> None:
 
 
 def _build_training_model(
-    config: CLIPReIDJobConfig,
-    clip_model: torch.nn.Module,
+    config: Siglip2ReIDJobConfig,
+    siglip2_model: torch.nn.Module,
     data: DatasetBundle,
+    spec: Siglip2ModelSpec,
     prefix_token_ids: tuple[int, ...],
     suffix_token_ids: tuple[int, ...],
-) -> CLIPReIDTrainingModel:
-    text_hidden_dim = clip_text_hidden_dim(clip_model)
-    projection_dim = clip_projection_dim(clip_model)
-    sot_id, eos_id, pad_id = _resolve_clip_token_ids(clip_model, config)
+) -> Siglip2ReIDTrainingModel:
     prompt_bank = PromptBank(
         PromptConfig(
             num_cameras=data.num_cameras,
             num_train_ids=data.num_train_ids,
             context_length=config.context_length,
-            embedding_dim=text_hidden_dim,
+            embedding_dim=spec.text_hidden_dim,
         )
     )
-    image_encoder = TransformersCLIPImageEncoder(
-        clip_model, num_cameras=data.num_cameras, sie_coe=config.sie_coe
+    image_encoder = TransformersSiglip2ImageEncoder(
+        siglip2_model, num_cameras=data.num_cameras, sie_coe=config.sie_coe
     )
-    text_encoder = TransformersCLIPTextEncoder(
-        clip_model,
+    text_encoder = TransformersSiglip2TextEncoder(
+        siglip2_model,
         context_length=config.context_length,
-        sot_token_id=sot_id,
-        eos_token_id=eos_id,
-        pad_token_id=pad_id,
+        bos_token_id=spec.bos_token_id,
+        eos_token_id=spec.eos_token_id,
+        pad_token_id=spec.pad_token_id,
         prefix_token_ids=prefix_token_ids,
         suffix_token_ids=suffix_token_ids,
+        left_padding=spec.text_padding_side == "left",
+        include_bos_token=spec.include_bos_token,
+        mask_padding=spec.mask_text_padding,
     )
-    retrieval = T2CClipModel(
+    retrieval = T2CSiglip2Model(
         image_encoder=image_encoder,
         text_encoder=text_encoder,
         prompt_bank=prompt_bank,
         beta=config.beta,
-        feature_head=_build_feature_head(config.reid_head, projection_dim),
+        feature_head=_build_feature_head(config.reid_head, spec.feature_dim),
     )
-    classifier = torch.nn.Linear(projection_dim, data.num_train_ids, bias=False)
-    tfc_bank = TFCCenterBank(data.num_train_ids, projection_dim, config.tfc_momentum)
-    return CLIPReIDTrainingModel(retrieval, classifier, tfc_bank)
+    classifier = torch.nn.Linear(spec.feature_dim, data.num_train_ids, bias=False)
+    tfc_bank = TFCCenterBank(
+        data.num_train_ids, spec.feature_dim, config.tfc_momentum
+    )
+    return Siglip2ReIDTrainingModel(retrieval, classifier, tfc_bank)
 
 
-def _load_clip_checkpoint_if_requested(
+def _load_siglip2_checkpoint_if_requested(
     model: torch.nn.Module,
     checkpoint: Path | None,
     device: torch.device,
@@ -865,16 +1161,16 @@ def _load_clip_checkpoint_if_requested(
     if checkpoint is None:
         return
     if not checkpoint.exists():
-        raise FileNotFoundError(f"CLIP checkpoint does not exist: {checkpoint}")
-    payload = torch.load(checkpoint, map_location=device)
+        raise FileNotFoundError(f"SigLIP 2 checkpoint does not exist: {checkpoint}")
+    payload = torch.load(checkpoint, map_location=device, weights_only=True)
     state_dict = payload.get("state_dict", payload) if isinstance(payload, dict) else payload
     if not isinstance(state_dict, dict):
-        raise TypeError("CLIP checkpoint must be a state_dict or contain a state_dict key")
+        raise TypeError("SigLIP 2 checkpoint must be a state_dict or contain a state_dict key")
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     if unexpected:
-        raise ValueError(f"unexpected CLIP checkpoint keys: {unexpected}")
+        raise ValueError(f"unexpected SigLIP 2 checkpoint keys: {unexpected}")
     if missing:
-        raise ValueError(f"missing CLIP checkpoint keys: {missing}")
+        raise ValueError(f"missing SigLIP 2 checkpoint keys: {missing}")
 
 
 def _build_feature_head(reid_head: str, projection_dim: int) -> torch.nn.Module:
@@ -885,34 +1181,54 @@ def _build_feature_head(reid_head: str, projection_dim: int) -> torch.nn.Module:
     raise ValueError(f"unsupported reid_head: {reid_head!r}")
 
 
-def _resolve_clip_token_ids(clip_model: torch.nn.Module, config: CLIPReIDJobConfig) -> tuple[int, int, int]:
-    config_obj = getattr(clip_model, "config", None)
-    text_config = getattr(config_obj, "text_config", None)
-    bos = getattr(text_config, "bos_token_id", None)
-    eos = getattr(text_config, "eos_token_id", None)
-    pad = getattr(text_config, "pad_token_id", None)
-    sot = bos if isinstance(bos, int) else DEFAULT_CLIP_TOKEN_IDS["sot"]
-    eos_id = eos if isinstance(eos, int) else DEFAULT_CLIP_TOKEN_IDS["eos"]
-    pad_id = pad if isinstance(pad, int) else DEFAULT_CLIP_TOKEN_IDS["pad"]
-    if eos_id == bos:  # Some CLIP configs reuse BOS as EOS (eos_token_id == 2 historically).
-        eos_id = DEFAULT_CLIP_TOKEN_IDS["eos"]
-    return sot, eos_id, pad_id
+def _resolve_siglip2_token_ids(
+    siglip2_model: torch.nn.Module,
+    tokenizer: Any,
+    *,
+    strict_config_match: bool,
+) -> tuple[int, int, int]:
+    if tokenizer is None:
+        raise ValueError("a SigLIP 2 tokenizer is required")
+    text_config = getattr(getattr(siglip2_model, "config", None), "text_config", None)
+    vocab_size = getattr(text_config, "vocab_size", None)
+    if not isinstance(vocab_size, int) or vocab_size < 1:
+        raise ValueError("SigLIP 2 text config must expose a positive vocab_size")
+    resolved: list[int] = []
+    for name in ("bos_token_id", "eos_token_id", "pad_token_id"):
+        tokenizer_id = getattr(tokenizer, name, None)
+        config_id = getattr(text_config, name, None)
+        if not isinstance(tokenizer_id, int):
+            raise ValueError(f"SigLIP 2 tokenizer must expose integer {name}")
+        if tokenizer_id < 0 or tokenizer_id >= vocab_size:
+            raise ValueError(
+                f"SigLIP 2 tokenizer {name}={tokenizer_id} is outside the model "
+                f"vocabulary of {vocab_size} tokens"
+            )
+        if strict_config_match:
+            if not isinstance(config_id, int):
+                raise ValueError(f"SigLIP 2 text config must expose integer {name}")
+            if tokenizer_id != config_id:
+                raise ValueError(
+                    f"SigLIP 2 tokenizer/model {name} mismatch "
+                    f"({tokenizer_id} != {config_id})"
+                )
+        resolved.append(tokenizer_id)
+    return resolved[0], resolved[1], resolved[2]
 
 
 def _encode_template_token_ids(tokenizer: Any, text: str) -> tuple[int, ...]:
-    """Encode a constant template fragment, stripping the tokenizer's SOT/EOS wrap."""
+    """Encode a constant template fragment without adding special tokens."""
     if tokenizer is None:
-        raise ValueError("a CLIP tokenizer is required to encode the prompt template")
-    encoded = tokenizer(text)
+        raise ValueError("a SigLIP 2 tokenizer is required to encode the prompt template")
+    encoded = tokenizer(text, add_special_tokens=False)
     input_ids = encoded["input_ids"]
-    special_ids = {getattr(tokenizer, "bos_token_id", None), getattr(tokenizer, "eos_token_id", None)}
-    token_ids = tuple(int(token_id) for token_id in input_ids if token_id not in special_ids)
+    token_ids = tuple(int(token_id) for token_id in input_ids)
     if not token_ids:
         raise ValueError(f"prompt template fragment {text!r} encoded to no token ids")
     return token_ids
 
 
-def _build_loaders(data: DatasetBundle, config: CLIPReIDJobConfig) -> LoaderBundle:
+def _build_loaders(data: DatasetBundle, config: Siglip2ReIDJobConfig) -> LoaderBundle:
     return LoaderBundle(
         train=_train_loader(data.train, config),
         query=_loader(data.query, config, shuffle=False),
@@ -920,7 +1236,7 @@ def _build_loaders(data: DatasetBundle, config: CLIPReIDJobConfig) -> LoaderBund
     )
 
 
-def _train_loader(dataset: ReIDImageDataset, config: CLIPReIDJobConfig) -> DataLoader:
+def _train_loader(dataset: ReIDImageDataset, config: Siglip2ReIDJobConfig) -> DataLoader:
     sampler = IdentityBalancedBatchSampler(
         dataset.person_ids,
         batch_size=config.batch_size,
@@ -934,10 +1250,10 @@ def _train_loader(dataset: ReIDImageDataset, config: CLIPReIDJobConfig) -> DataL
     )
 
 
-def _loader(dataset: ReIDImageDataset, config: CLIPReIDJobConfig, shuffle: bool) -> DataLoader:
+def _loader(dataset: ReIDImageDataset, config: Siglip2ReIDJobConfig, shuffle: bool) -> DataLoader:
     return DataLoader(
         dataset,
-        batch_size=config.batch_size,
+        batch_size=config.eval_batch_size,
         shuffle=shuffle,
         num_workers=config.num_workers,
         collate_fn=collate_reid_batches,
@@ -955,17 +1271,46 @@ def _train_one_epoch(runtime: StageTrainingRuntime):
         if runtime.anchor_provider is not None:
             runtime.anchor_provider.start_epoch()
         if runtime.stage == STAGE2 and runtime.freeze_config is not None:
-            _ensure_camera_text_cache(runtime.model, runtime.freeze_config)
+            if runtime.precision is None:
+                raise ValueError("stage2 training requires a precision controller")
+            _ensure_camera_text_cache(
+                runtime.model, runtime.freeze_config, runtime.precision
+            )
         runtime.model.train()
+        if runtime.precision is None:
+            raise ValueError("training requires a precision controller")
         metric_names = _train_metric_names(runtime.stage)
         totals = {name: 0.0 for name in metric_names}
-        batch_count = 0
-        for batch in reporter.batches(_train_batches(runtime)):
-            values = _train_batch(runtime, batch, runtime.stage)
-            reporter.report_batch(values)
-            totals = {name: totals[name] + values[name] for name in metric_names}
-            batch_count += 1
-        return _average_train_metrics(totals, batch_count, runtime.optimizer, runtime.stage)
+        micro_batch_count = 0
+        source = reporter.batches(_train_batches(runtime))
+        for window in batched(source, runtime.gradient_accumulation_steps):
+            runtime.optimizer.zero_grad(set_to_none=True)
+            window_totals = {name: 0.0 for name in metric_names}
+            window_size = len(window)
+            for batch in window:
+                with runtime.precision.autocast():
+                    breakdown = _micro_batch_breakdown(
+                        runtime, batch, runtime.stage
+                    )
+                values = _breakdown_metric_values(breakdown, runtime.stage)
+                runtime.precision.backward(breakdown.total / window_size)
+                for name in metric_names:
+                    totals[name] += values[name]
+                    window_totals[name] += values[name]
+                micro_batch_count += 1
+            update_succeeded = runtime.precision.step(runtime.optimizer)
+            if update_succeeded:
+                reported = {
+                    name: window_totals[name] / window_size for name in metric_names
+                }
+                reported["lr"] = _optimizer_lr(runtime.optimizer)
+                reporter.report_batch(reported)
+        return _average_train_metrics(
+            totals,
+            micro_batch_count,
+            runtime.optimizer,
+            runtime.stage,
+        )
 
     return train
 
@@ -978,7 +1323,9 @@ def _train_batches(runtime: StageTrainingRuntime):
     training step of every Stage-1 epoch is served from the cached tensors.
     """
     if runtime.stage == STAGE1 and runtime.feature_cache is not None:
-        runtime.feature_cache.ensure_extracted(runtime.model)
+        if runtime.precision is None:
+            raise ValueError("stage1 feature cache requires a precision controller")
+        runtime.feature_cache.ensure_extracted(runtime.model, runtime.precision)
         return runtime.feature_cache.batches()
     return runtime.loaders.train
 
@@ -994,7 +1341,11 @@ def _noop_validate():
 def _validate(runtime: ValidationRuntime):
     def validate(epoch: int) -> ReIDMetrics:
         _apply_freezing(runtime.model, runtime.model_config, STAGE2)
-        _ensure_camera_text_cache(runtime.model, runtime.model_config)
+        if runtime.precision is None:
+            raise ValueError("validation requires a precision controller")
+        _ensure_camera_text_cache(
+            runtime.model, runtime.model_config, runtime.precision
+        )
         if runtime.beta_schedule is not None:
             runtime.beta_schedule.apply(runtime.model, epoch)
         runtime.model.eval()
@@ -1003,12 +1354,14 @@ def _validate(runtime: ValidationRuntime):
             runtime.loaders.query,
             runtime.device,
             runtime.retrieval_mode,
+            runtime.precision,
         )
         gallery = _extract_features(
             runtime.model,
             runtime.loaders.gallery,
             runtime.device,
             runtime.retrieval_mode,
+            runtime.precision,
         )
         metrics = evaluate_reid(
             query.features,
@@ -1050,20 +1403,25 @@ class FeatureSet:
 
 
 def _extract_features(
-    model: CLIPReIDTrainingModel,
+    model: Siglip2ReIDTrainingModel,
     loader: DataLoader,
     device: torch.device,
     retrieval_mode: str,
+    precision: PrecisionController | None = None,
 ) -> FeatureSet:
+    if precision is None:
+        precision = PrecisionController(
+            PrecisionPolicy("fp32", "fp32", device.type)
+        )
     feature_parts: list[torch.Tensor] = []
     person_ids: list[int] = []
     camera_ids: list[int] = []
-    with torch.no_grad():
+    with torch.no_grad(), precision.autocast():
         for batch in loader:
             images = batch.images.to(device)
             cameras = batch.camera_ids.to(device)
             features = model.encode_retrieval(images, cameras, retrieval_mode=retrieval_mode)
-            feature_parts.append(features.cpu())
+            feature_parts.append(features.float().cpu())
             person_ids.extend(batch.original_person_ids)
             camera_ids.extend(batch.original_camera_ids)
     if not feature_parts:
@@ -1079,22 +1437,27 @@ def _training_batch(batch: ReIDImageBatch, device: torch.device) -> TrainingBatc
     )
 
 
-def _train_batch(
+def _micro_batch_breakdown(
     runtime: StageTrainingRuntime,
     batch: ReIDImageBatch | Stage1CachedBatch,
     stage: str,
-) -> dict[str, float]:
-    runtime.optimizer.zero_grad()
+) -> Stage1LossBreakdown | Stage2LossBreakdown:
     if stage == STAGE1:
-        breakdown = _stage1_step(runtime, batch)
-        values = _stage1_metric_values(breakdown)
-    else:
-        breakdown = _stage2_step(runtime, _training_batch(batch, runtime.device))
-        values = _stage2_metric_values(breakdown)
-    breakdown.total.backward()
-    runtime.optimizer.step()
-    values["lr"] = _optimizer_lr(runtime.optimizer)
-    return values
+        return _stage1_step(runtime, batch)
+    return _stage2_step(runtime, _training_batch(batch, runtime.device))
+
+
+def _breakdown_metric_values(
+    breakdown: Stage1LossBreakdown | Stage2LossBreakdown,
+    stage: str,
+) -> dict[str, float]:
+    if stage == STAGE1:
+        if not isinstance(breakdown, Stage1LossBreakdown):
+            raise TypeError("stage1 must produce Stage1LossBreakdown")
+        return _stage1_metric_values(breakdown)
+    if not isinstance(breakdown, Stage2LossBreakdown):
+        raise TypeError("stage2 must produce Stage2LossBreakdown")
+    return _stage2_metric_values(breakdown)
 
 
 def _stage1_step(
@@ -1125,7 +1488,11 @@ def _stage2_step(runtime: StageTrainingRuntime, batch: TrainingBatch) -> Stage2L
     return stage2_loss_breakdown(runtime.model.retrieval_model, batch, inputs)
 
 
-def _ensure_camera_text_cache(model: CLIPReIDTrainingModel, config: CLIPReIDJobConfig) -> None:
+def _ensure_camera_text_cache(
+    model: Siglip2ReIDTrainingModel,
+    config: Siglip2ReIDJobConfig,
+    precision: PrecisionController,
+) -> None:
     """Precompute the per-camera retrieval text once when it is provably constant.
 
     With the prompt bank frozen in Stage-2 AND the text encoder frozen, the
@@ -1139,7 +1506,7 @@ def _ensure_camera_text_cache(model: CLIPReIDTrainingModel, config: CLIPReIDJobC
         return
     camera_prompts = retrieval.prompt_bank.camera_prompts
     camera_ids = torch.arange(camera_prompts.shape[0], device=camera_prompts.device)
-    with torch.no_grad():
+    with torch.no_grad(), precision.autocast():
         cache = retrieval.encode_inference_text(camera_ids)
     retrieval.set_inference_text_cache(cache.detach())
 
@@ -1153,7 +1520,7 @@ def _train_metric_names(stage: str) -> tuple[str, ...]:
 def _stage1_metric_values(breakdown: Stage1LossBreakdown) -> dict[str, float]:
     return {
         "loss": _tensor_metric_value(breakdown.total),
-        "clip_loss": _tensor_metric_value(breakdown.clip_dual),
+        "alignment_loss": _tensor_metric_value(breakdown.alignment),
     }
 
 
@@ -1162,7 +1529,7 @@ def _stage2_metric_values(breakdown: Stage2LossBreakdown) -> dict[str, float]:
         "loss": _tensor_metric_value(breakdown.total),
         "reid_loss": _tensor_metric_value(breakdown.identity),
         "triplet_loss": _tensor_metric_value(breakdown.triplet),
-        "i2t_loss": _tensor_metric_value(breakdown.i2t),
+        "alignment_loss": _tensor_metric_value(breakdown.alignment),
         "tfc_loss": _tensor_metric_value(breakdown.tfc),
     }
 

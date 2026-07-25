@@ -2,12 +2,12 @@ import math
 import unittest
 
 import torch
+import torch.nn.functional as F
 
 from t2c_clip.losses import (
     batch_hard_triplet_loss,
-    bidirectional_contrastive_loss,
-    image_to_text_cross_entropy,
-    supervised_bidirectional_contrastive_loss,
+    siglip_identity_anchor_loss,
+    supervised_siglip_loss,
 )
 from t2c_clip.tfc import TFCCenterBank
 
@@ -29,150 +29,187 @@ class TFCLossTest(unittest.TestCase):
 
         self.assertTrue(torch.allclose(loss, torch.tensor(1.0)))
 
-    def test_bidirectional_contrastive_loss_is_low_for_matching_pairs(self):
-        image = torch.eye(2)
-        text = torch.eye(2)
-        loss = bidirectional_contrastive_loss(image, text, logit_scale=10.0)
-        self.assertLess(float(loss), 0.01)
 
-    def test_batch_hard_triplet_loss_penalizes_close_negative(self):
+class SiglipAlignmentLossTest(unittest.TestCase):
+    def test_native_reduction_matches_hand_computation(self):
+        images = torch.eye(2)
+        texts = torch.eye(2)
+        person_ids = torch.tensor([0, 1])
+
+        loss = supervised_siglip_loss(
+            images,
+            texts,
+            person_ids,
+            logit_scale=1.0,
+            logit_bias=0.0,
+        )
+
+        # Each row has one positive logit 1 and one negative logit 0.
+        expected = F.softplus(torch.tensor(-1.0)) + math.log(2.0)
+        self.assertTrue(torch.allclose(loss, expected, atol=1e-6))
+
+    def test_scale_and_bias_are_applied_before_logsigmoid(self):
+        images = torch.tensor([[1.0, 0.0]])
+        texts = torch.tensor([[1.0, 0.0]])
+
+        loss = supervised_siglip_loss(
+            images,
+            texts,
+            torch.tensor([0]),
+            logit_scale=3.0,
+            logit_bias=-1.0,
+        )
+
+        self.assertTrue(torch.allclose(loss, F.softplus(torch.tensor(-2.0))))
+
+    def test_same_identity_pairs_are_all_positive(self):
+        images = torch.tensor([[1.0, 0.0], [0.0, 1.0]], requires_grad=True)
+        texts = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+
+        loss = supervised_siglip_loss(
+            images,
+            texts,
+            torch.tensor([0, 0]),
+            logit_scale=1.0,
+            logit_bias=0.0,
+        )
+        loss.backward()
+
+        # Moving image 0 toward text 1 lowers the all-positive objective.
+        self.assertLess(float(images.grad[0] @ texts[1]), 0.0)
+
+    def test_pairwise_loss_runs_in_fp32_under_low_precision_inputs(self):
+        loss = supervised_siglip_loss(
+            torch.eye(2, dtype=torch.bfloat16),
+            torch.eye(2, dtype=torch.bfloat16),
+            torch.tensor([0, 1]),
+            logit_scale=2.0,
+            logit_bias=-0.5,
+        )
+        self.assertEqual(loss.dtype, torch.float32)
+
+    def test_pairwise_loss_disables_active_autocast(self):
+        images = torch.eye(2)
+        texts = torch.eye(2)
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            loss = supervised_siglip_loss(
+                images,
+                texts,
+                torch.tensor([0, 1]),
+                logit_scale=2.0,
+                logit_bias=-0.5,
+            )
+
+        reference = supervised_siglip_loss(
+            images,
+            texts,
+            torch.tensor([0, 1]),
+            logit_scale=2.0,
+            logit_bias=-0.5,
+        )
+        self.assertEqual(loss.dtype, torch.float32)
+        self.assertTrue(torch.equal(loss, reference))
+
+    def test_supervised_loss_validates_person_ids(self):
+        with self.assertRaises(ValueError):
+            supervised_siglip_loss(torch.eye(2), torch.eye(2), torch.tensor([0]))
+        with self.assertRaises(ValueError):
+            supervised_siglip_loss(
+                torch.eye(2), torch.eye(2), torch.tensor([0.5, 1.5])
+            )
+
+
+class SiglipIdentityAnchorLossTest(unittest.TestCase):
+    def test_stage2_uses_one_positive_and_all_other_anchors_as_negatives(self):
+        anchors = torch.eye(2)
+        visual = torch.tensor([[2.0, 0.0], [0.0, 3.0]])
+
+        loss = siglip_identity_anchor_loss(
+            visual,
+            anchors,
+            torch.tensor([0, 1]),
+            logit_scale=1.0,
+            logit_bias=0.0,
+        )
+
+        expected = F.softplus(torch.tensor(-1.0)) + math.log(2.0)
+        self.assertTrue(torch.allclose(loss, expected, atol=1e-6))
+
+    def test_correct_anchor_assignment_scores_lower_than_wrong(self):
+        anchors = torch.eye(2)
+        visual = torch.eye(2)
+        correct = siglip_identity_anchor_loss(
+            visual, anchors, torch.tensor([0, 1]), logit_scale=5.0
+        )
+        wrong = siglip_identity_anchor_loss(
+            visual, anchors, torch.tensor([1, 0]), logit_scale=5.0
+        )
+        self.assertLess(float(correct), float(wrong))
+
+    def test_extra_negative_anchor_participates_in_native_sum(self):
+        visual = torch.tensor([[1.0, 0.0]])
+        ids = torch.tensor([0])
+        two = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+        three = torch.tensor([[1.0, 0.0], [0.0, 1.0], [0.9, 0.1]])
+
+        without_extra = siglip_identity_anchor_loss(
+            visual, two, ids, logit_scale=5.0
+        )
+        with_extra = siglip_identity_anchor_loss(
+            visual, three, ids, logit_scale=5.0
+        )
+
+        self.assertGreater(float(with_extra), float(without_extra))
+
+    def test_stage2_alignment_validates_shapes_and_ids(self):
+        with self.assertRaises(ValueError):
+            siglip_identity_anchor_loss(
+                torch.ones(2, 2, 2), torch.eye(2), torch.tensor([0, 1])
+            )
+        with self.assertRaises(ValueError):
+            siglip_identity_anchor_loss(torch.eye(2), torch.ones(2), torch.tensor([0, 1]))
+        with self.assertRaises(ValueError):
+            siglip_identity_anchor_loss(
+                torch.ones(2, 3), torch.ones(4, 2), torch.tensor([0, 1])
+            )
+        with self.assertRaises(ValueError):
+            siglip_identity_anchor_loss(
+                torch.eye(2), torch.eye(2), torch.tensor([0.5, 1.5])
+            )
+        with self.assertRaises(ValueError):
+            siglip_identity_anchor_loss(torch.eye(2), torch.eye(2), torch.tensor([0]))
+        with self.assertRaises(ValueError):
+            siglip_identity_anchor_loss(torch.eye(2), torch.eye(2), torch.tensor([0, 2]))
+
+
+class TripletLossTest(unittest.TestCase):
+    def test_batch_hard_triplet_penalizes_close_negative(self):
         features = torch.tensor([[1.0, 0.0], [0.9, 0.1], [0.8, 0.2]])
         labels = torch.tensor([0, 0, 1])
         loss = batch_hard_triplet_loss(features, labels, margin=0.3)
         self.assertGreater(float(loss), 0.0)
 
-    def test_batch_hard_triplet_loss_defaults_to_euclidean_hand_computed(self):
-        # d(a0,a1)=5, d(a0,a2)=10, d(a1,a2)=5 in raw euclidean space.
-        # anchor0: relu(5 - 10 + 0.3) = 0; anchor1: relu(5 - 5 + 0.3) = 0.3;
-        # anchor2 has no positive -> skipped. mean = 0.15.
+    def test_euclidean_default_is_hand_computed(self):
         features = torch.tensor([[0.0, 0.0], [3.0, 4.0], [6.0, 8.0]])
         labels = torch.tensor([0, 0, 1])
-
         loss = batch_hard_triplet_loss(features, labels, margin=0.3)
-
         self.assertTrue(torch.allclose(loss, torch.tensor(0.15), atol=1e-6))
 
-    def test_batch_hard_triplet_loss_euclidean_ignores_feature_norm_direction(self):
-        # Euclidean must NOT l2-normalize: [3,4] and [6,8] share a direction
-        # (cosine distance 0) but are euclidean distance 5 apart.
+    def test_cosine_and_euclidean_differ_for_scaled_direction(self):
         features = torch.tensor([[3.0, 4.0], [6.0, 8.0], [0.0, 1.0]])
         labels = torch.tensor([0, 0, 1])
-
-        euclidean = batch_hard_triplet_loss(features, labels, margin=0.3, metric="euclidean")
-        cosine = batch_hard_triplet_loss(features, labels, margin=0.3, metric="cosine")
-
-        self.assertGreater(float(euclidean), 0.0)
+        euclidean = batch_hard_triplet_loss(features, labels, metric="euclidean")
+        cosine = batch_hard_triplet_loss(features, labels, metric="cosine")
         self.assertFalse(torch.allclose(euclidean, cosine))
 
-    def test_batch_hard_triplet_loss_cosine_preserves_previous_formula(self):
-        # Old formula: distances = 1 - l2n(f) @ l2n(f).T. For this fixture both
-        # valid anchors contribute 1 - (1 - 2**-0.5) + 0.3 = 0.3 + 2**-0.5.
-        features = torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]])
-        labels = torch.tensor([0, 0, 1])
-
-        loss = batch_hard_triplet_loss(features, labels, margin=0.3, metric="cosine")
-
-        expected = torch.tensor(0.3 + 2 ** -0.5)
-        self.assertTrue(torch.allclose(loss, expected, atol=1e-6))
-
-    def test_batch_hard_triplet_loss_rejects_unknown_metric(self):
-        features = torch.tensor([[1.0, 0.0], [0.9, 0.1], [0.8, 0.2]])
-        labels = torch.tensor([0, 0, 1])
-
+    def test_unknown_triplet_metric_is_rejected(self):
         with self.assertRaises(ValueError):
-            batch_hard_triplet_loss(features, labels, margin=0.3, metric="manhattan")
+            batch_hard_triplet_loss(
+                torch.tensor([[1.0, 0.0], [0.9, 0.1], [0.8, 0.2]]),
+                torch.tensor([0, 0, 1]),
+                metric="manhattan",
+            )
 
 
-    def test_supervised_contrastive_matches_arange_loss_for_unique_ids(self):
-        torch.manual_seed(0)
-        image = torch.randn(4, 3)
-        text = torch.randn(4, 3)
-        ids = torch.tensor([3, 1, 0, 2])
-
-        supervised = supervised_bidirectional_contrastive_loss(image, text, ids, logit_scale=7.0)
-        plain = bidirectional_contrastive_loss(image, text, logit_scale=7.0)
-
-        self.assertTrue(torch.allclose(supervised, plain, atol=1e-6))
-
-    def test_supervised_contrastive_pulls_same_identity_text_toward_image(self):
-        # PK batches always contain same-person pairs. The plain arange loss
-        # pushes image 0 away from the same person's other text row; the
-        # supervised loss must treat it as a positive instead.
-        images = torch.tensor([[1.0, 0.0], [0.0, 1.0]], requires_grad=True)
-        texts = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
-        ids = torch.tensor([0, 0])
-
-        loss = supervised_bidirectional_contrastive_loss(images, texts, ids, logit_scale=1.0)
-        loss.backward()
-
-        # Moving image 0 toward the same-person text 1 must decrease the loss.
-        self.assertLess(float(images.grad[0] @ texts[1]), 0.0)
-
-    def test_supervised_contrastive_validates_person_ids(self):
-        with self.assertRaises(ValueError):
-            supervised_bidirectional_contrastive_loss(torch.eye(2), torch.eye(2), torch.tensor([0]))
-        with self.assertRaises(ValueError):
-            supervised_bidirectional_contrastive_loss(torch.eye(2), torch.eye(2), torch.tensor([0.5, 1.5]))
-
-
-class ImageToTextCrossEntropyTest(unittest.TestCase):
-    def test_i2t_hand_computed_with_orthogonal_anchors(self):
-        # Each row's logits are [1, 0] (or [0, 1]) at logit_scale=1, so the
-        # cross entropy is log(1 + e^-1) for both samples.
-        anchors = torch.eye(2)
-        visual = torch.tensor([[2.0, 0.0], [0.0, 3.0]])  # non-unit: must be L2-normalized inside
-        person_ids = torch.tensor([0, 1])
-
-        loss = image_to_text_cross_entropy(visual, anchors, person_ids, logit_scale=1.0)
-
-        expected = torch.tensor(math.log(1.0 + math.exp(-1.0)))
-        self.assertTrue(torch.allclose(loss, expected, atol=1e-6))
-
-    def test_i2t_correct_target_scores_lower_than_wrong_target(self):
-        anchors = torch.eye(2)
-        visual = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
-
-        correct = image_to_text_cross_entropy(visual, anchors, torch.tensor([0, 1]), logit_scale=5.0)
-        wrong = image_to_text_cross_entropy(visual, anchors, torch.tensor([1, 0]), logit_scale=5.0)
-
-        self.assertLess(float(correct), float(wrong))
-
-    def test_i2t_classifies_against_all_anchor_rows_not_just_batch(self):
-        # Anchor 2 is close to the sample; including it must raise the loss
-        # even though no batch sample carries person id 2.
-        visual = torch.tensor([[1.0, 0.0]])
-        person_ids = torch.tensor([0])
-        two_anchors = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
-        three_anchors = torch.tensor([[1.0, 0.0], [0.0, 1.0], [0.9, 0.1]])
-
-        without_extra = image_to_text_cross_entropy(visual, two_anchors, person_ids, logit_scale=5.0)
-        with_extra = image_to_text_cross_entropy(visual, three_anchors, person_ids, logit_scale=5.0)
-
-        self.assertGreater(float(with_extra), float(without_extra))
-
-    def test_i2t_label_smoothing_raises_separable_loss(self):
-        anchors = torch.eye(2)
-        visual = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
-        person_ids = torch.tensor([0, 1])
-
-        plain = image_to_text_cross_entropy(visual, anchors, person_ids, logit_scale=20.0)
-        smoothed = image_to_text_cross_entropy(
-            visual, anchors, person_ids, logit_scale=20.0, label_smoothing=0.2
-        )
-
-        self.assertLess(float(plain), 0.01)
-        self.assertGreater(float(smoothed), float(plain))
-
-    def test_i2t_validates_shapes_and_person_ids(self):
-        with self.assertRaises(ValueError):
-            image_to_text_cross_entropy(torch.ones(2, 2, 2), torch.eye(2), torch.tensor([0, 1]))
-        with self.assertRaises(ValueError):
-            image_to_text_cross_entropy(torch.eye(2), torch.ones(2), torch.tensor([0, 1]))
-        with self.assertRaises(ValueError):
-            image_to_text_cross_entropy(torch.ones(2, 3), torch.ones(4, 2), torch.tensor([0, 1]))
-        with self.assertRaises(ValueError):
-            image_to_text_cross_entropy(torch.eye(2), torch.eye(2), torch.tensor([0.5, 1.5]))
-        with self.assertRaises(ValueError):
-            image_to_text_cross_entropy(torch.eye(2), torch.eye(2), torch.tensor([0]))
-        with self.assertRaises(ValueError):
-            image_to_text_cross_entropy(torch.eye(2), torch.eye(2), torch.tensor([0, 2]))
+if __name__ == "__main__":
+    unittest.main()

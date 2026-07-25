@@ -1,12 +1,12 @@
-"""Injectable dual-stream T2C-CLIP model wiring.
+"""Injectable dual-stream T2C-SigLIP 2 model wiring.
 
 The model has three explicit forward paths:
 
 - ``forward_stage1``: prompt alignment with identity-aware training text.
 - ``forward_stage2``: ReID training. Discriminative losses act on the image
   feature (``visual_raw``) and its ``feature_head`` (BNNeck) output; the
-  image-to-text term classifies ``visual`` against a precomputed identity
-  anchor matrix, so no per-sample training text is encoded here.
+  supervised SigLIP term scores ``visual`` against the complete precomputed
+  identity-anchor matrix, so no per-sample training text is encoded here.
 - ``encode_retrieval``: validation and inference retrieval with either fused
   global + camera prompts or image-only features, both routed through the
   same ``feature_head``.
@@ -26,7 +26,7 @@ from t2c_clip.prompts import PromptBank, validate_index_tensor
 from t2c_clip.retrieval import FUSED_RETRIEVAL, IMAGE_ONLY_RETRIEVAL, require_retrieval_mode
 
 
-class T2CClipModel(torch.nn.Module):
+class T2CSiglip2Model(torch.nn.Module):
     def __init__(
         self,
         image_encoder: torch.nn.Module,
@@ -108,8 +108,8 @@ class T2CClipModel(torch.nn.Module):
         """Stage-2 ReID training forward.
 
         ``person_ids`` no longer selects per-sample training text: the Stage-2
-        image-to-text loss classifies ``visual`` against the precomputed
-        identity anchor matrix instead. The parameter is kept so both stage
+        supervised SigLIP loss scores ``visual`` against the complete
+        precomputed identity-anchor matrix. The parameter is kept so both stage
         forwards share one signature.
 
         ``bn`` is the feature-head output; with the default ``linear`` head
@@ -126,15 +126,6 @@ class T2CClipModel(torch.nn.Module):
             "visual": l2_normalize(visual_raw),
             "retrieval": retrieval,
         }
-
-    def forward_training(
-        self,
-        images: torch.Tensor,
-        camera_ids: torch.Tensor,
-        person_ids: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
-        """Backwards-compatible alias for Stage-2 training forward."""
-        return self.forward_stage2(images, camera_ids, person_ids)
 
     def encode_text(self, prompts: torch.Tensor) -> torch.Tensor:
         """Encode prompt embeddings through the configured text encoder."""

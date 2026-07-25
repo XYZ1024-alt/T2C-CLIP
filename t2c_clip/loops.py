@@ -161,6 +161,8 @@ def run_training_loop(
     train_metric_logger: TrainMetricLogger | None = None,
     train_step_metric_logger: TrainStepMetricLogger | None = None,
     initial_best_map: float | None = None,
+    checkpoint_metadata: Mapping[str, Any] | None = None,
+    auxiliary_state: Any | None = None,
 ) -> TrainingLoopResult:
     config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
     best_map: float | None = initial_best_map
@@ -195,7 +197,17 @@ def run_training_loop(
                 config, epoch, validation_count, first_validated_map, best_map, sanity_gate_triggered
             )
         _report_metrics(reporter.progress, epoch, train_metrics, metrics, best_map, is_best, metric_logger)
-        _save_epoch_checkpoints(model, optimizer, config, epoch, metrics, best_map, is_best)
+        _save_epoch_checkpoints(
+            model,
+            optimizer,
+            config,
+            epoch,
+            metrics,
+            best_map,
+            is_best,
+            checkpoint_metadata,
+            auxiliary_state,
+        )
         history.append(EpochResult(epoch, metrics, best_map, is_best, train_metrics))
     return TrainingLoopResult(best_map=best_map, history=tuple(history))
 
@@ -424,8 +436,19 @@ def _save_epoch_checkpoints(
     metrics: ReIDMetrics | None,
     best_map: float | None,
     is_best: bool,
+    checkpoint_metadata: Mapping[str, Any] | None = None,
+    auxiliary_state: Any | None = None,
 ) -> None:
-    payload = _checkpoint_payload(model, optimizer, epoch, metrics, best_map, config.stage)
+    payload = _checkpoint_payload(
+        model,
+        optimizer,
+        epoch,
+        metrics,
+        best_map,
+        config.stage,
+        checkpoint_metadata,
+        auxiliary_state,
+    )
     last_name = _prefixed_name(LAST_CHECKPOINT_NAME, config.checkpoint_prefix)
     torch.save(payload, config.checkpoint_dir / last_name)
     if is_best:
@@ -446,6 +469,8 @@ def _checkpoint_payload(
     metrics: ReIDMetrics | None,
     best_map: float | None,
     stage: str,
+    checkpoint_metadata: Mapping[str, Any] | None = None,
+    auxiliary_state: Any | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "stage": stage,
@@ -456,6 +481,13 @@ def _checkpoint_payload(
     }
     if optimizer is not None:
         payload["optimizer_state"] = optimizer.state_dict()
+    if checkpoint_metadata is not None:
+        payload["checkpoint_metadata"] = dict(checkpoint_metadata)
+    if auxiliary_state is not None:
+        state_dict = getattr(auxiliary_state, "state_dict", None)
+        if not callable(state_dict):
+            raise TypeError("auxiliary checkpoint state must expose state_dict()")
+        payload["auxiliary_state"] = state_dict()
     return payload
 
 

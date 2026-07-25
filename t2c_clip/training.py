@@ -1,16 +1,11 @@
-"""Stage-1 and Stage-2 loss wiring for T2C-CLIP.
+"""Stage-1 and Stage-2 loss wiring for T2C-SigLIP 2.
 
-Stage-1 only computes the bidirectional image-text contrastive loss between
-``f_v`` and ``f_t_id`` (training identity prompt).
+Stage-1 aligns image features with identity-aware prompt features using the
+native all-pairs SigLIP sigmoid objective. Stage-2 keeps the ReID identity,
+triplet, and TFC losses and adds the same SigLIP objective against the text
+anchor of every training identity::
 
-Stage-2 total loss is::
-
-    L_total = L_id + L_triplet + clip_weight * L_i2t + tfc_weight * L_TFC
-
-``L_i2t`` is CLIP-ReID's image-to-text cross entropy: the L2-normalized image
-feature is classified against the (detached) identity anchor text matrix over
-ALL train identities, not just the batch's. ``clip_weight`` defaults to 1.0,
-matching CLIP-ReID's weighting of the i2t term.
+    L_total = L_id + L_triplet + alignment_weight * L_alignment + tfc_weight * L_TFC
 """
 
 from __future__ import annotations
@@ -22,17 +17,18 @@ from torch.nn import functional as F
 
 from t2c_clip.losses import (
     batch_hard_triplet_loss,
-    image_to_text_cross_entropy,
-    supervised_bidirectional_contrastive_loss,
+    siglip_identity_anchor_loss,
+    supervised_siglip_loss,
 )
-from t2c_clip.model import T2CClipModel
+from t2c_clip.model import T2CSiglip2Model
 from t2c_clip.tfc import TFCCenterBank
 
 DEFAULT_LOGIT_SCALE = 1.0
+DEFAULT_LOGIT_BIAS = 0.0
 DEFAULT_TRIPLET_MARGIN = 0.3
 DEFAULT_TRIPLET_METRIC = "euclidean"
 DEFAULT_TFC_WEIGHT = 1.0
-DEFAULT_CLIP_WEIGHT = 1.0
+DEFAULT_ALIGNMENT_WEIGHT = 1.0
 DEFAULT_LABEL_SMOOTHING = 0.0
 DEFAULT_ID_LOGIT_SCALE = 1.0
 
@@ -47,15 +43,17 @@ class TrainingBatch:
 @dataclass(frozen=True)
 class Stage1LossConfig:
     logit_scale: float = DEFAULT_LOGIT_SCALE
+    logit_bias: float = DEFAULT_LOGIT_BIAS
 
 
 @dataclass(frozen=True)
 class Stage2LossConfig:
     logit_scale: float = DEFAULT_LOGIT_SCALE
+    logit_bias: float = DEFAULT_LOGIT_BIAS
     triplet_margin: float = DEFAULT_TRIPLET_MARGIN
     triplet_metric: str = DEFAULT_TRIPLET_METRIC
     tfc_weight: float = DEFAULT_TFC_WEIGHT
-    clip_weight: float = DEFAULT_CLIP_WEIGHT
+    alignment_weight: float = DEFAULT_ALIGNMENT_WEIGHT
     label_smoothing: float = DEFAULT_LABEL_SMOOTHING
     id_logit_scale: float = DEFAULT_ID_LOGIT_SCALE
 
@@ -70,34 +68,34 @@ class Stage2LossInputs:
 
 @dataclass(frozen=True)
 class Stage1LossBreakdown:
-    clip_dual: torch.Tensor
+    alignment: torch.Tensor
 
     @property
     def total(self) -> torch.Tensor:
-        return self.clip_dual
+        return self.alignment
 
 
 @dataclass(frozen=True)
 class Stage2LossBreakdown:
-    i2t: torch.Tensor
+    alignment: torch.Tensor
     identity: torch.Tensor
     triplet: torch.Tensor
     tfc: torch.Tensor
     tfc_weight: float
-    clip_weight: float
+    alignment_weight: float
 
     @property
     def total(self) -> torch.Tensor:
         return (
             self.identity
             + self.triplet
-            + self.clip_weight * self.i2t
+            + self.alignment_weight * self.alignment
             + self.tfc_weight * self.tfc
         )
 
 
 def stage1_alignment_loss(
-    model: T2CClipModel,
+    model: T2CSiglip2Model,
     batch: TrainingBatch,
     config: Stage1LossConfig,
 ) -> Stage1LossBreakdown:
@@ -112,58 +110,47 @@ def stage1_alignment_loss(
 
 
 def stage1_alignment_loss_from_visual(
-    model: T2CClipModel,
+    model: T2CSiglip2Model,
     visual: torch.Tensor,
     camera_ids: torch.Tensor,
     person_ids: torch.Tensor,
     config: Stage1LossConfig,
 ) -> Stage1LossBreakdown:
-    """Stage-1 alignment loss from a precomputed L2-normalized image feature.
+    """Stage-1 alignment from a precomputed normalized image feature."""
 
-    Shared by the online path (fresh image forward per batch) and the
-    frozen-tower feature-cache path so the two loss computations cannot drift.
-    """
     text = model.encode_training_text(camera_ids, person_ids)
-    clip_dual = supervised_bidirectional_contrastive_loss(
-        visual, text, person_ids, logit_scale=config.logit_scale
+    alignment = supervised_siglip_loss(
+        visual,
+        text,
+        person_ids,
+        logit_scale=config.logit_scale,
+        logit_bias=config.logit_bias,
     )
-    return Stage1LossBreakdown(clip_dual=clip_dual)
+    return Stage1LossBreakdown(alignment=alignment)
 
 
 def stage2_loss_breakdown(
-    model: T2CClipModel,
+    model: T2CSiglip2Model,
     batch: TrainingBatch,
     inputs: Stage2LossInputs,
 ) -> Stage2LossBreakdown:
-    """Compute the Stage-2 losses from a single forward pass.
+    """Compute Stage-2 losses from one image forward.
 
-    CLIP-ReID-standard discriminative losses act on the image feature: the ID
-    cross-entropy on the BNNeck output (``bn``), the triplet loss on the
-    BN-pre feature (``visual_raw``). The image-to-text cross entropy
-    classifies the L2-normalized image feature (``visual``, pre-BN — the
-    space CLIP pretraining aligned with text) against ``inputs.anchors``, the
-    detached identity anchor matrix over all train identities. The TFC loss
-    keeps acting on the fused retrieval feature. TFC centers are updated
-    (detached, no-grad) from this forward's retrieval feature before scoring,
-    so no separate center-update forward is needed and the BNNeck running
-    stats see each batch exactly once.
-
-    ``id_logit_scale`` is a legacy knob from when the ID logits were cosine
-    similarities on unit-norm features; on the free-scale BNNeck logits it
-    stays at its default of 1.0 (a no-op) and is kept only for CLI
-    compatibility.
+    Label smoothing is deliberately limited to the ReID identity classifier;
+    the alignment term retains SigLIP's native binary targets.
     """
+
     outputs = model.forward_stage2(batch.images, batch.camera_ids, batch.person_ids)
     retrieval = outputs["retrieval"]
     inputs.tfc_bank.update(retrieval, batch.person_ids)
     logits = inputs.classifier(outputs["bn"]) * inputs.config.id_logit_scale
     return Stage2LossBreakdown(
-        i2t=image_to_text_cross_entropy(
+        alignment=siglip_identity_anchor_loss(
             outputs["visual"],
             inputs.anchors,
             batch.person_ids,
             logit_scale=inputs.config.logit_scale,
-            label_smoothing=inputs.config.label_smoothing,
+            logit_bias=inputs.config.logit_bias,
         ),
         identity=F.cross_entropy(
             logits,
@@ -178,5 +165,5 @@ def stage2_loss_breakdown(
         ),
         tfc=inputs.tfc_bank.loss(retrieval, batch.person_ids),
         tfc_weight=inputs.config.tfc_weight,
-        clip_weight=inputs.config.clip_weight,
+        alignment_weight=inputs.config.alignment_weight,
     )

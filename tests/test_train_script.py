@@ -37,6 +37,38 @@ class TrainScriptTest(unittest.TestCase):
         ref = torch.Generator().manual_seed(42).get_state()
         self.assertTrue(torch.equal(RECORDED_RNG_STATE, ref))
 
+    def test_single_stage_resume_rejects_stage1_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            checkpoint_dir = Path(tmp) / "checkpoints"
+            main(
+                [
+                    "--job-builder", f"{__name__}:build_training_job",
+                    "--epochs", "1",
+                    "--validation-interval", "1",
+                    "--checkpoint-dir", str(checkpoint_dir),
+                ],
+                progress_factory=lambda iterable, **kwargs: iterable,
+            )
+            payload = torch.load(
+                checkpoint_dir / "last.pth",
+                map_location="cpu",
+                weights_only=True,
+            )
+            payload["stage"] = "stage1"
+            bad_checkpoint = checkpoint_dir / "stage1.pth"
+            torch.save(payload, bad_checkpoint)
+
+            with self.assertRaisesRegex(ValueError, "only stage2 checkpoints"):
+                main(
+                    [
+                        "--job-builder", f"{__name__}:build_training_job",
+                        "--epochs", "2",
+                        "--checkpoint-dir", str(checkpoint_dir),
+                        "--resume", str(bad_checkpoint),
+                    ],
+                    progress_factory=lambda iterable, **kwargs: iterable,
+                )
+
     def test_resume_restarts_from_saved_checkpoint_epoch(self):
         RECORDED_EPOCHS.clear()
         with tempfile.TemporaryDirectory() as tmp:
@@ -173,14 +205,20 @@ class TrainScriptTest(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(RECORDED_ARGS.dataset, "msmt17")
         self.assertEqual(RECORDED_ARGS.data_root, Path("MSMT17_V1"))
-        self.assertEqual(RECORDED_ARGS.clip_model_name, "openai/clip-vit-base-patch16")
+        self.assertEqual(
+            RECORDED_ARGS.siglip2_model_name,
+            "google/siglip2-so400m-patch14-384",
+        )
         self.assertEqual(RECORDED_ARGS.batch_size, 8)
+        self.assertEqual(RECORDED_ARGS.eval_batch_size, 16)
+        self.assertEqual(RECORDED_ARGS.gradient_accumulation_steps, 4)
+        self.assertEqual(RECORDED_ARGS.precision, "auto")
         self.assertEqual(RECORDED_ARGS.num_workers, 2)
         self.assertEqual(RECORDED_ARGS.lr, 0.001)
         self.assertEqual(RECORDED_ARGS.triplet_metric, "euclidean")
         self.assertEqual(RECORDED_ARGS.device, "cpu")
 
-    def test_default_hyperparameters_follow_clip_reid_recipe(self):
+    def test_default_hyperparameters_follow_siglip2_24gb_recipe(self):
         global RECORDED_ARGS
         RECORDED_ARGS = None
         with tempfile.TemporaryDirectory() as tmp:
@@ -195,10 +233,9 @@ class TrainScriptTest(unittest.TestCase):
                 progress_factory=lambda iterable, **kwargs: iterable,
             )
 
-        # CLIP-ReID ViT recipe: image lr ~5e-6 x (batch/64) and an i2t
-        # alignment weight of 1.0.
-        self.assertEqual(RECORDED_ARGS.image_encoder_lr, 1e-5)
-        self.assertEqual(RECORDED_ARGS.clip_weight, 1.0)
+        self.assertEqual(RECORDED_ARGS.image_encoder_lr, 5e-6)
+        self.assertEqual(RECORDED_ARGS.alignment_weight, 1.0)
+        self.assertTrue(RECORDED_ARGS.gradient_checkpointing)
 
     def test_main_logs_validation_metrics_when_wandb_enabled(self):
         run = FakeWandbRun()
@@ -283,6 +320,32 @@ class TrainScriptTest(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         load_wandb.assert_not_called()
+
+    def test_naflex_model_override_is_rejected(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as context:
+                main(
+                    [
+                        "--job-builder",
+                        f"{__name__}:build_training_job",
+                        "--siglip2-model-name",
+                        "google/siglip2-so400m-patch16-naflex",
+                    ]
+                )
+        self.assertNotEqual(context.exception.code, 0)
+
+    def test_removed_clip_model_flag_is_rejected(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as context:
+                main(
+                    [
+                        "--job-builder",
+                        f"{__name__}:build_training_job",
+                        "--clip-model-name",
+                        "openai/clip-vit-base-patch16",
+                    ]
+                )
+        self.assertNotEqual(context.exception.code, 0)
 
     def test_legacy_tracking_flag_is_rejected(self):
         legacy_flag = "--enable-" + "ml" + "flow"
@@ -369,8 +432,8 @@ def _recording_job_args(checkpoint_dir: Path) -> list[str]:
         "msmt17",
         "--data-root",
         "MSMT17_V1",
-        "--clip-model-name",
-        "openai/clip-vit-base-patch16",
+        "--siglip2-model-name",
+        "google/siglip2-so400m-patch14-384",
         "--batch-size",
         "8",
         "--num-workers",

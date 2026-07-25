@@ -1,4 +1,4 @@
-"""Loss functions used by the T2C-CLIP training design."""
+"""Loss functions used by the T2C-SigLIP 2 training design."""
 
 from __future__ import annotations
 
@@ -8,73 +8,47 @@ from torch.nn import functional as F
 from t2c_clip.features import l2_normalize
 
 DEFAULT_LOGIT_SCALE = 1.0
+DEFAULT_LOGIT_BIAS = 0.0
 DEFAULT_MARGIN = 0.3
 DEFAULT_TRIPLET_METRIC = "euclidean"
 
 
-def bidirectional_contrastive_loss(
-    image_features: torch.Tensor,
-    text_features: torch.Tensor,
-    logit_scale: float = DEFAULT_LOGIT_SCALE,
-) -> torch.Tensor:
-    if image_features.shape != text_features.shape:
-        raise ValueError("image_features and text_features must have identical shapes")
-    image = l2_normalize(image_features)
-    text = l2_normalize(text_features)
-    logits = logit_scale * image @ text.T
-    targets = torch.arange(logits.shape[0], device=logits.device)
-    image_loss = F.cross_entropy(logits, targets)
-    text_loss = F.cross_entropy(logits.T, targets)
-    return (image_loss + text_loss) / 2.0
-
-
-def supervised_bidirectional_contrastive_loss(
+def supervised_siglip_loss(
     image_features: torch.Tensor,
     text_features: torch.Tensor,
     person_ids: torch.Tensor,
     logit_scale: float = DEFAULT_LOGIT_SCALE,
+    logit_bias: float = DEFAULT_LOGIT_BIAS,
 ) -> torch.Tensor:
-    """CLIP-ReID-style multi-positive bidirectional contrastive loss.
+    """Native SigLIP pairwise loss with every same-identity pair positive.
 
-    Identity-balanced PK batches always contain several samples of the same
-    person. The plain ``targets=arange`` InfoNCE treats those rows as
-    negatives and actively pushes same-person pairs apart; here every row
-    sharing a person id is a positive, and the per-anchor loss averages the
-    log-probabilities over all positives (SupCon "out" formulation). With
-    unique ids per batch this reduces exactly to
-    :func:`bidirectional_contrastive_loss`.
+    PK batches repeat identities. The positive matrix therefore uses identity
+    equality instead of the diagonal-only target used during generic SigLIP
+    pretraining.
     """
+
     if image_features.shape != text_features.shape:
         raise ValueError("image_features and text_features must have identical shapes")
     _validate_person_ids(person_ids, image_features.shape[0])
-    image = l2_normalize(image_features)
-    text = l2_normalize(text_features)
-    logits = logit_scale * image @ text.T
-    positives = (person_ids.unsqueeze(0) == person_ids.unsqueeze(1)).to(logits.dtype)
-    image_loss = _multi_positive_cross_entropy(logits, positives)
-    text_loss = _multi_positive_cross_entropy(logits.T, positives)
-    return (image_loss + text_loss) / 2.0
+    positives = person_ids.unsqueeze(0) == person_ids.unsqueeze(1)
+    return _siglip_pairwise_loss(
+        image_features,
+        text_features,
+        positives,
+        logit_scale=logit_scale,
+        logit_bias=logit_bias,
+    )
 
 
-def _multi_positive_cross_entropy(logits: torch.Tensor, positives: torch.Tensor) -> torch.Tensor:
-    log_probs = F.log_softmax(logits, dim=1)
-    positive_log_probs = (log_probs * positives).sum(dim=1) / positives.sum(dim=1)
-    return -positive_log_probs.mean()
-
-
-def image_to_text_cross_entropy(
+def siglip_identity_anchor_loss(
     image_features: torch.Tensor,
     text_anchors: torch.Tensor,
     person_ids: torch.Tensor,
     logit_scale: float = DEFAULT_LOGIT_SCALE,
-    label_smoothing: float = 0.0,
+    logit_bias: float = DEFAULT_LOGIT_BIAS,
 ) -> torch.Tensor:
-    """CLIP-ReID Stage-2 image-to-text cross entropy.
+    """Native SigLIP loss against the text anchors of every train identity."""
 
-    Each image feature is classified against the text anchors of ALL train
-    identities (not just the batch's): ``person_ids`` index rows of
-    ``text_anchors``. Both sides are L2-normalized before the similarity.
-    """
     if image_features.ndim != 2:
         raise ValueError("image_features must be a rank-2 tensor")
     if text_anchors.ndim != 2:
@@ -85,15 +59,45 @@ def image_to_text_cross_entropy(
     num_anchors = text_anchors.shape[0]
     if torch.any(person_ids < 0) or torch.any(person_ids >= num_anchors):
         raise ValueError(f"person_ids contains indices outside [0, {num_anchors})")
-    logits = logit_scale * l2_normalize(image_features) @ l2_normalize(text_anchors).T
-    return F.cross_entropy(logits, person_ids, label_smoothing=label_smoothing)
+    anchor_ids = torch.arange(num_anchors, device=person_ids.device)
+    positives = person_ids.unsqueeze(1) == anchor_ids.unsqueeze(0)
+    return _siglip_pairwise_loss(
+        image_features,
+        text_anchors,
+        positives,
+        logit_scale=logit_scale,
+        logit_bias=logit_bias,
+    )
 
 
-def _validate_person_ids(person_ids: torch.Tensor, batch_size: int) -> None:
-    if person_ids.dtype != torch.long or person_ids.ndim != 1:
-        raise ValueError("person_ids must be a rank-1 torch.long tensor")
-    if person_ids.shape[0] != batch_size:
-        raise ValueError("person_ids must match the contrastive batch size")
+def _siglip_pairwise_loss(
+    image_features: torch.Tensor,
+    text_features: torch.Tensor,
+    positives: torch.Tensor,
+    *,
+    logit_scale: float,
+    logit_bias: float,
+) -> torch.Tensor:
+    if image_features.ndim != 2 or text_features.ndim != 2:
+        raise ValueError("SigLIP features must both be rank-2 tensors")
+    expected_shape = (image_features.shape[0], text_features.shape[0])
+    if tuple(positives.shape) != expected_shape:
+        raise ValueError(f"positive mask must have shape {expected_shape}")
+    if positives.dtype != torch.bool:
+        raise ValueError("positive mask must be boolean")
+
+    # Normalize and score in FP32 even under autocast. This is the numerically
+    # sensitive part of SigLIP's all-pairs logsigmoid objective.
+    with torch.autocast(device_type=image_features.device.type, enabled=False):
+        image = l2_normalize(image_features.float())
+        text = l2_normalize(text_features.float())
+        logits = float(logit_scale) * (image @ text.T) + float(logit_bias)
+        signs = torch.where(
+            positives,
+            torch.ones((), dtype=logits.dtype, device=logits.device),
+            -torch.ones((), dtype=logits.dtype, device=logits.device),
+        )
+        return -F.logsigmoid(signs * logits).sum(dim=1).mean()
 
 
 def batch_hard_triplet_loss(
@@ -131,6 +135,13 @@ def _valid_anchor_losses(distances: torch.Tensor, labels: torch.Tensor, margin: 
             hardest_negative = torch.min(distances[index][negative_mask])
             losses.append(F.relu(hardest_positive - hardest_negative + margin))
     return losses
+
+
+def _validate_person_ids(person_ids: torch.Tensor, batch_size: int) -> None:
+    if person_ids.dtype != torch.long or person_ids.ndim != 1:
+        raise ValueError("person_ids must be a rank-1 torch.long tensor")
+    if person_ids.shape[0] != batch_size:
+        raise ValueError("person_ids must match the feature batch size")
 
 
 def _validate_triplet_inputs(features: torch.Tensor, labels: torch.Tensor) -> None:

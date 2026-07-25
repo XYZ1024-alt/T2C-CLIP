@@ -38,19 +38,25 @@ from t2c_clip.wandb import (
     WandbTracker,
     start_wandb_run,
 )
+from t2c_clip.precision import SUPPORTED_PRECISIONS
 from t2c_clip.retrieval import SUPPORTED_RETRIEVAL_MODES
+from t2c_clip.siglip2_backbone import SIGLIP2_MODEL_ID
+from t2c_clip.transforms import DEFAULT_IMAGE_SIZE
 
 DEFAULT_TOTAL_EPOCHS = 120
 DEFAULT_VALIDATION_INTERVAL = 5
 DEFAULT_STAGE1_EPOCHS = 0
 DEFAULT_CHECKPOINT_DIR = Path("checkpoints")
 DEFAULT_RUN_NAME = "train"
-DEFAULT_CLIP_MODEL_NAME = "openai/clip-vit-base-patch16"
-DEFAULT_BATCH_SIZE = 64
+DEFAULT_SIGLIP2_MODEL_NAME = SIGLIP2_MODEL_ID
+DEFAULT_BATCH_SIZE = 8
+DEFAULT_EVAL_BATCH_SIZE = 16
+DEFAULT_GRADIENT_ACCUMULATION_STEPS = 4
+DEFAULT_PRECISION = "auto"
 DEFAULT_NUM_INSTANCES = 2
 DEFAULT_NUM_WORKERS = 4
 DEFAULT_LEARNING_RATE = 1e-4
-DEFAULT_IMAGE_ENCODER_LR = 1e-5
+DEFAULT_IMAGE_ENCODER_LR = 5e-6
 DEFAULT_BETA_WARMUP_EPOCHS = 0
 DEFAULT_STAGE2_LR_SCHEDULER = "none"
 DEFAULT_STAGE2_WARMUP_EPOCHS = 0
@@ -63,7 +69,7 @@ DEFAULT_TFC_MOMENTUM = 0.5
 DEFAULT_TRIPLET_MARGIN = 0.3
 DEFAULT_TRIPLET_METRIC = "euclidean"
 DEFAULT_TFC_WEIGHT = 1.0
-DEFAULT_CLIP_WEIGHT = 1.0
+DEFAULT_ALIGNMENT_WEIGHT = 1.0
 DEFAULT_ID_LOGIT_SCALE = 1.0
 DEFAULT_RETRIEVAL_MODE = "fused"
 SUPPORTED_DATASETS = ("market1501", "msmt17")
@@ -84,6 +90,8 @@ class TrainingJob:
     train_one_epoch: TrainOneEpoch
     validate: ValidateEpoch
     stage_metadata: StageMetadata | Mapping[str, Any] | None = None
+    checkpoint_metadata: Mapping[str, Any] | None = None
+    auxiliary_state: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -138,9 +146,43 @@ def _load_resume_state(checkpoint: Path | None) -> dict[str, Any] | None:
 
 
 def _restore_job_state(job: TrainingJob, resume_state: dict[str, Any]) -> None:
+    _validate_checkpoint_metadata(job.checkpoint_metadata, resume_state)
+    auxiliary_state = resume_state.get("auxiliary_state")
+    if job.auxiliary_state is not None and not isinstance(auxiliary_state, dict):
+        raise ValueError(
+            "checkpoint is missing SigLIP 2 precision/scaler state; old "
+            "T2C-CLIP checkpoints are incompatible"
+        )
     job.model.load_state_dict(resume_state["model_state"])
     if job.optimizer is not None and "optimizer_state" in resume_state:
         job.optimizer.load_state_dict(resume_state["optimizer_state"])
+    if job.auxiliary_state is not None:
+        job.auxiliary_state.load_state_dict(auxiliary_state)
+
+
+def _validate_checkpoint_metadata(
+    expected: Mapping[str, Any] | None,
+    resume_state: Mapping[str, Any],
+) -> None:
+    if expected is None:
+        return
+    actual = resume_state.get("checkpoint_metadata")
+    if not isinstance(actual, Mapping):
+        raise ValueError(
+            "checkpoint has no SigLIP 2 compatibility metadata; old T2C-CLIP "
+            "checkpoints cannot be resumed"
+        )
+    mismatches = {
+        key: (actual.get(key), value)
+        for key, value in expected.items()
+        if actual.get(key) != value
+    }
+    if mismatches:
+        details = ", ".join(
+            f"{key}: checkpoint={found!r}, run={required!r}"
+            for key, (found, required) in sorted(mismatches.items())
+        )
+        raise ValueError(f"incompatible SigLIP 2 resume checkpoint ({details})")
 
 
 def _resume_best_map(resume_state: dict[str, Any] | None) -> float | None:
@@ -194,9 +236,22 @@ def _build_parser() -> argparse.ArgumentParser:
 def _add_project_training_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dataset", choices=SUPPORTED_DATASETS)
     parser.add_argument("--data-root", type=Path)
-    parser.add_argument("--clip-model-name", default=DEFAULT_CLIP_MODEL_NAME)
-    parser.add_argument("--clip-checkpoint", type=Path)
+    parser.add_argument(
+        "--siglip2-model-name",
+        choices=(DEFAULT_SIGLIP2_MODEL_NAME,),
+        default=DEFAULT_SIGLIP2_MODEL_NAME,
+    )
+    parser.add_argument("--siglip2-checkpoint", type=Path)
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
+    parser.add_argument("--eval-batch-size", type=int, default=DEFAULT_EVAL_BATCH_SIZE)
+    parser.add_argument(
+        "--gradient-accumulation-steps",
+        type=int,
+        default=DEFAULT_GRADIENT_ACCUMULATION_STEPS,
+    )
+    parser.add_argument("--precision", choices=SUPPORTED_PRECISIONS, default=DEFAULT_PRECISION)
+    parser.add_argument("--image-height", type=int, default=DEFAULT_IMAGE_SIZE[0])
+    parser.add_argument("--image-width", type=int, default=DEFAULT_IMAGE_SIZE[1])
     parser.add_argument("--num-instances", type=int, default=DEFAULT_NUM_INSTANCES)
     parser.add_argument("--num-workers", type=int, default=DEFAULT_NUM_WORKERS)
     parser.add_argument("--lr", type=float, default=DEFAULT_LEARNING_RATE)
@@ -212,18 +267,23 @@ def _add_project_training_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--triplet-margin", type=float, default=DEFAULT_TRIPLET_MARGIN)
     parser.add_argument("--triplet-metric", choices=("euclidean", "cosine"), default=DEFAULT_TRIPLET_METRIC)
     parser.add_argument("--tfc-weight", type=float, default=DEFAULT_TFC_WEIGHT)
+    parser.add_argument("--alignment-weight", type=float, default=DEFAULT_ALIGNMENT_WEIGHT)
     parser.add_argument("--stage1-epochs", type=int, default=DEFAULT_STAGE1_EPOCHS)
     parser.add_argument(
         "--stage1-feature-cache",
         action=argparse.BooleanOptionalAction,
         default=True,
     )
-    parser.add_argument("--clip-weight", type=float, default=DEFAULT_CLIP_WEIGHT)
     parser.add_argument("--id-logit-scale", type=float, default=DEFAULT_ID_LOGIT_SCALE)
     parser.add_argument("--label-smoothing", type=float, default=0.0)
     parser.add_argument("--reid-head", choices=("linear", "bnneck"), default="linear")
     parser.add_argument("--retrieval-mode", choices=SUPPORTED_RETRIEVAL_MODES, default=DEFAULT_RETRIEVAL_MODE)
     parser.add_argument("--report-rerank", action="store_true")
+    parser.add_argument(
+        "--gradient-checkpointing",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument(
         "--freeze-prompt-bank-stage2",
         action=argparse.BooleanOptionalAction,
@@ -298,6 +358,8 @@ def _run_two_stage_loop(
             metric_logger=None,
             train_metric_logger=stage1_loggers[0],
             train_step_metric_logger=stage1_loggers[1],
+            checkpoint_metadata=job.stage1.checkpoint_metadata,
+            auxiliary_state=job.stage1.auxiliary_state,
         )
 
     stage2_first_epoch = args.stage1_epochs + completed_stage2_epochs + 1
@@ -323,6 +385,8 @@ def _run_two_stage_loop(
         train_metric_logger=stage2_loggers[0],
         train_step_metric_logger=stage2_loggers[1],
         initial_best_map=_resume_best_map(resume_state),
+        checkpoint_metadata=job.stage2.checkpoint_metadata,
+        auxiliary_state=job.stage2.auxiliary_state,
     )
 
 
@@ -335,6 +399,11 @@ def _run_single_loop(
 ) -> None:
     completed_epochs = 0
     if resume_state is not None:
+        resume_stage = resume_state.get("stage")
+        if resume_stage != "stage2":
+            raise ValueError(
+                f"only stage2 checkpoints can be resumed, got stage: {resume_stage!r}"
+            )
         _restore_job_state(job, resume_state)
         completed_epochs = int(resume_state["epoch"])
     if tracker is not None and job.stage_metadata is not None:
@@ -361,6 +430,8 @@ def _run_single_loop(
         train_metric_logger=loggers[0],
         train_step_metric_logger=loggers[1],
         initial_best_map=_resume_best_map(resume_state),
+        checkpoint_metadata=job.checkpoint_metadata,
+        auxiliary_state=job.auxiliary_state,
     )
 
 

@@ -148,7 +148,7 @@ class WandbTrackerTest(unittest.TestCase):
         self.tracker.log_stage_config(
             {
                 "dataset": "msmt17",
-                "clip_checkpoint": None,
+                "siglip2_checkpoint": None,
                 "checkpoint_dir": Path("checkpoints"),
                 "shape": (256, 128),
                 "mode": ExampleMode.VALUE,
@@ -172,8 +172,8 @@ class WandbTrackerTest(unittest.TestCase):
         stage1_epoch, stage1_step = self.tracker.make_stage_metric_loggers("stage1")
         stage2_epoch, stage2_step = self.tracker.make_stage_metric_loggers("stage2")
 
-        stage1_step(7, {"loss": 0.7, "clip_loss": 0.2, "lr": 0.001})
-        stage1_epoch(3, {"loss": 0.6, "clip_loss": 0.1, "lr": 0.001})
+        stage1_step(7, {"loss": 0.7, "alignment_loss": 0.2, "lr": 0.001})
+        stage1_epoch(3, {"loss": 0.6, "alignment_loss": 0.1, "lr": 0.001})
         stage2_step(1, {"loss": 1.2, "reid_loss": 0.8, "lr": 0.0001})
         stage2_epoch(21, {"loss": 1.0, "reid_loss": 0.7, "lr": 0.0001})
 
@@ -183,13 +183,13 @@ class WandbTrackerTest(unittest.TestCase):
                 {
                     "stage1_train_step": 7,
                     "stage1_train_step_loss": 0.7,
-                    "stage1_train_step_clip_loss": 0.2,
+                    "stage1_train_step_alignment_loss": 0.2,
                     "stage1_train_step_lr": 0.001,
                 },
                 {
                     "stage1_epoch": 3,
                     "stage1_train_loss": 0.6,
-                    "stage1_train_clip_loss": 0.1,
+                    "stage1_train_alignment_loss": 0.1,
                     "stage1_lr": 0.001,
                 },
                 {

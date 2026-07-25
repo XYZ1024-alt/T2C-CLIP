@@ -3,7 +3,7 @@ import unittest
 import torch
 
 from t2c_clip.anchors import IdentityAnchorProvider
-from t2c_clip.model import T2CClipModel
+from t2c_clip.model import T2CSiglip2Model
 from t2c_clip.prompts import PromptBank, PromptConfig
 
 
@@ -109,7 +109,7 @@ class IdentityAnchorProviderTest(unittest.TestCase):
             IdentityAnchorProvider(model, num_train_ids=2, frozen=True, chunk_size=0)
 
 
-def _anchor_model(num_train_ids: int) -> tuple[T2CClipModel, CountingPromptMeanEncoder]:
+def _anchor_model(num_train_ids: int) -> tuple[T2CSiglip2Model, CountingPromptMeanEncoder]:
     bank = PromptBank(
         PromptConfig(num_cameras=2, num_train_ids=num_train_ids, context_length=1, embedding_dim=2)
     )
@@ -119,7 +119,7 @@ def _anchor_model(num_train_ids: int) -> tuple[T2CClipModel, CountingPromptMeanE
         for person_id in range(num_train_ids):
             bank.identity_prompts[person_id] = torch.tensor([[1.0 + person_id, 2.0 - person_id]])
     encoder = CountingPromptMeanEncoder()
-    return T2CClipModel(IdentityEncoder(), encoder, bank, beta=0.0), encoder
+    return T2CSiglip2Model(IdentityEncoder(), encoder, bank, beta=0.0), encoder
 
 
 if __name__ == "__main__":
