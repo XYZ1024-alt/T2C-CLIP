@@ -15,7 +15,7 @@ from t2c_reid.loops import (
 from t2c_reid.model import T2CReIDModel
 from t2c_reid.wandb import WandbConfig, WandbTracker, start_wandb_run
 from t2c_reid.prompts import PromptBank, PromptConfig
-from t2c_reid.tfc import TFCCenterBank
+from t2c_reid.tfc import CameraAwareTFCBank
 from t2c_reid.training import (
     Stage1LossConfig,
     Stage2LossBreakdown,
@@ -38,7 +38,7 @@ __all__ = [
     "Stage2LossConfig",
     "Stage2LossInputs",
     "T2CReIDModel",
-    "TFCCenterBank",
+    "CameraAwareTFCBank",
     "TrainingBatch",
     "TrainingLoopConfig",
     "TrainingLoopResult",

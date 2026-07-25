@@ -82,6 +82,9 @@ class Siglip2ReIDJobTest(unittest.TestCase):
 
         self.assertEqual(len(data.train), 3)
         self.assertEqual(data.num_train_ids, 2)
+        self.assertTrue(torch.equal(data.identity_counts, torch.tensor([2, 1])))
+        self.assertEqual(tuple(data.identity_camera_counts.shape), (2, 3))
+        self.assertTrue(torch.equal(data.identity_camera_counts.sum(dim=1), data.identity_counts))
 
     def test_load_dataset_bundle_uses_train_transform_only_for_train_split(self):
         class ConstantTransform:
@@ -104,6 +107,27 @@ class Siglip2ReIDJobTest(unittest.TestCase):
             self.assertTrue(torch.equal(data.query[0].image, torch.ones(3, 2, 2)))
             self.assertTrue(torch.equal(data.gallery[0].image, torch.ones(3, 2, 2)))
 
+    def test_training_statistics_match_python_and_rust_backends(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            processor = FakeSiglip2ImageProcessor()
+            transforms = TransformBundle(
+                train=Siglip2ImageTransform(processor),
+                eval=Siglip2ImageTransform(processor),
+            )
+
+            python = load_dataset_bundle(
+                JobDataConfig("market1501", root), transforms, backend="python"
+            )
+            rust = load_dataset_bundle(
+                JobDataConfig("market1501", root), transforms, backend="rust"
+            )
+
+        self.assertTrue(torch.equal(python.identity_counts, rust.identity_counts))
+        self.assertTrue(
+            torch.equal(python.identity_camera_counts, rust.identity_camera_counts)
+        )
+
     def test_build_training_job_returns_real_callbacks_with_fake_siglip2(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
@@ -119,6 +143,12 @@ class Siglip2ReIDJobTest(unittest.TestCase):
         self.assertIn("reid_loss", train_metrics)
         self.assertIn("triplet_loss", train_metrics)
         self.assertIn("tfc_loss", train_metrics)
+        self.assertIn("tfc_local_loss", train_metrics)
+        self.assertIn("tfc_global_loss", train_metrics)
+        self.assertIn("tfc_cross_modal_loss", train_metrics)
+        self.assertIn("tfc_cross_camera_loss", train_metrics)
+        self.assertIn("tfc_transfer_reg_loss", train_metrics)
+        self.assertIn("tfc_cross_camera_coverage", train_metrics)
         self.assertIn("lr", train_metrics)
         self.assertIsNotNone(job.stage_metadata)
         self.assertEqual(job.stage_metadata.get("dataset"), "market1501")
@@ -126,6 +156,17 @@ class Siglip2ReIDJobTest(unittest.TestCase):
         self.assertEqual(job.stage_metadata.get("evaluation_backend"), "rust")
         self.assertFalse(job.stage_metadata.get("pin_memory"))
         self.assertFalse(job.stage_metadata.get("persistent_workers"))
+        self.assertEqual(job.checkpoint_metadata["schema_version"], 3)
+        self.assertEqual(
+            job.checkpoint_metadata["tfc_version"],
+            "camera_aware_cross_modal_v1",
+        )
+        self.assertIn("pid_camera_count_fingerprint", job.checkpoint_metadata)
+        self.assertEqual(job.checkpoint_metadata["tfc_weight"], 1.0)
+        self.assertEqual(job.checkpoint_metadata["beta"], 0.1)
+        self.assertEqual(job.checkpoint_metadata["beta_warmup_epochs"], 0)
+        self.assertEqual(job.checkpoint_metadata["stage1_epochs"], 0)
+        self.assertEqual(job.checkpoint_metadata["stage2_first_epoch"], 1)
         self.assertGreaterEqual(metrics.map, 0.0)
         self.assertIn(1, metrics.cmc)
 
@@ -387,8 +428,9 @@ class Siglip2ReIDJobTest(unittest.TestCase):
     def test_stage2_frozen_prompts_encode_text_only_in_first_epoch(self):
         # With the prompt bank frozen in Stage-2 and the text encoder frozen,
         # the first epoch encodes the identity anchors (1 chunk: 2 train ids)
-        # plus the per-camera retrieval text cache (1 call); afterwards the
-        # text tower must never run again.
+        # plus the per-camera retrieval text cache (1 call) and one exact
+        # training-prompt TFC teacher call per micro-batch. Later epochs retain
+        # only the TFC teacher call.
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
             args = _training_args(root)
@@ -404,8 +446,8 @@ class Siglip2ReIDJobTest(unittest.TestCase):
             job.train_one_epoch(2, TrainBatchReporterRecorder())
             second_epoch_calls = encoder.call_count - first_epoch_calls
 
-        self.assertEqual(first_epoch_calls, 2)
-        self.assertEqual(second_epoch_calls, 0)
+        self.assertEqual(first_epoch_calls, 3)
+        self.assertEqual(second_epoch_calls, 1)
 
     def test_stage2_frozen_prompts_with_trainable_text_encoder_recompute_anchors_each_epoch(self):
         # The anchors pass through the text encoder too: with the prompt bank
@@ -428,8 +470,8 @@ class Siglip2ReIDJobTest(unittest.TestCase):
             second_epoch_calls = encoder.call_count - first_epoch_calls
 
         self.assertIsNone(job.model.retrieval_model.inference_text_cache)
-        self.assertEqual(first_epoch_calls, 2)
-        self.assertEqual(second_epoch_calls, 2)
+        self.assertEqual(first_epoch_calls, 3)
+        self.assertEqual(second_epoch_calls, 3)
 
     def test_stage2_unfrozen_prompts_recompute_anchors_each_epoch(self):
         # Unfrozen prompt bank: the anchors act as a slowly-moving teacher and
@@ -449,8 +491,43 @@ class Siglip2ReIDJobTest(unittest.TestCase):
             second_epoch_calls = encoder.call_count - first_epoch_calls
 
         self.assertIsNone(job.model.retrieval_model.inference_text_cache)
+        self.assertEqual(first_epoch_calls, 3)
+        self.assertEqual(second_epoch_calls, 3)
+
+    def test_failed_optimizer_window_rolls_back_tfc_center_updates(self):
+        from t2c_reid.precision import PrecisionController
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            job = build_training_job(_training_args(root), siglip2_loader=_load_fake_siglip2)
+            with mock.patch.object(PrecisionController, "step", return_value=False):
+                job.train_one_epoch(1, TrainBatchReporterRecorder())
+
+        self.assertFalse(bool(job.model.tfc_bank.visual_local_initialized.any()))
+        self.assertFalse(bool(job.model.tfc_bank.text_local_initialized.any()))
+        self.assertFalse(bool(job.model.tfc_bank.visual_global_initialized.any()))
+        self.assertFalse(bool(job.model.tfc_bank.text_global_initialized.any()))
+
+    def test_tfc_weight_zero_skips_training_prompt_teacher_and_center_updates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            args = _training_args(root)
+            args.freeze_prompt_bank_stage2 = True
+            args.freeze_text_encoder = True
+            args.tfc_weight = 0.0
+            args.epochs = 2
+
+            job = build_training_job(args, siglip2_loader=_load_fake_siglip2)
+            encoder = job.model.retrieval_model.image_encoder.siglip2_model.text_model.encoder
+            encoder.call_count = 0
+            job.train_one_epoch(1, TrainBatchReporterRecorder())
+            first_epoch_calls = encoder.call_count
+            job.train_one_epoch(2, TrainBatchReporterRecorder())
+            second_epoch_calls = encoder.call_count - first_epoch_calls
+
         self.assertEqual(first_epoch_calls, 2)
-        self.assertEqual(second_epoch_calls, 2)
+        self.assertEqual(second_epoch_calls, 0)
+        self.assertFalse(bool(job.model.tfc_bank.visual_local_initialized.any()))
 
     def test_stage2_camera_text_cache_matches_online_encoding(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1014,8 +1091,49 @@ class Siglip2ReIDJobTest(unittest.TestCase):
         metadata = _stage_metadata_for(_training_args(Path(".")))
 
         self.assertEqual(metadata.get("image_size"), "392x196")
+        self.assertEqual(metadata.get("checkpoint_schema_version"), 3)
+        self.assertEqual(metadata.get("tfc_version"), "camera_aware_cross_modal_v1")
+        self.assertEqual(metadata.get("tfc_tail_momentum"), 0.9)
+        self.assertEqual(metadata.get("tfc_class_balance_beta"), 0.9999)
         self.assertEqual(metadata.get("prompt_template_prefix"), "a photo of a")
         self.assertEqual(metadata.get("prompt_template_suffix"), "person .")
+
+    def test_stage1_optimizer_excludes_camera_transfer_logits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            args = _training_args(root)
+            args.stage1_epochs = 1
+            job = build_training_job(args, siglip2_loader=_load_fake_siglip2)
+
+        transfer = job.stage1.model.tfc_bank.camera_transfer_logits
+        stage1_parameters = {
+            id(parameter)
+            for group in job.stage1.optimizer.param_groups
+            for parameter in group["params"]
+        }
+        stage2_parameters = {
+            id(parameter)
+            for group in job.stage2.optimizer.param_groups
+            for parameter in group["params"]
+        }
+        self.assertNotIn(id(transfer), stage1_parameters)
+        self.assertIn(id(transfer), stage2_parameters)
+
+    def test_tfc_config_rejects_invalid_momentum_and_empty_main_loss(self):
+        from t2c_reid.jobs.siglip2_reid import _job_config_from_args
+
+        args = _training_args(Path("."))
+        args.tfc_tail_momentum = 0.4
+        with self.assertRaisesRegex(ValueError, "head <= tail"):
+            _job_config_from_args(args)
+
+        args = _training_args(Path("."))
+        args.tfc_local_weight = 0.0
+        args.tfc_global_weight = 0.0
+        args.tfc_cross_modal_weight = 0.0
+        args.tfc_cross_camera_weight = 0.0
+        with self.assertRaisesRegex(ValueError, "at least one positive"):
+            _job_config_from_args(args)
 
     def test_optimizer_uses_no_decay_groups_for_norms_bias_prompts_and_sie(self):
         #  SigLIP 2-ReID-style AdamW grouping: 1-D parameters (norm weights/biases),
@@ -1039,6 +1157,7 @@ class Siglip2ReIDJobTest(unittest.TestCase):
                     parameters_by_name[name].ndim <= 1
                     or name.startswith("retrieval_model.prompt_bank.")
                     or name.startswith("retrieval_model.image_encoder.sie_embedding.")
+                    or name == "tfc_bank.camera_transfer_logits"
                 )
                 if expects_no_decay:
                     self.assertEqual(float(group["weight_decay"]), 0.0, name)
@@ -1272,7 +1391,12 @@ def _stage_metadata_for(args: Namespace):
     config = _job_config_from_args(args)
     loaded = _load_fake_siglip2(config.siglip2_model_name)
     spec = _validate_loaded_siglip2(loaded, config.image_size)
-    return _stage_metadata(config, spec)
+    data = SimpleNamespace(
+        num_train_ids=2,
+        num_cameras=2,
+        identity_camera_counts=torch.ones(2, 2, dtype=torch.long),
+    )
+    return _stage_metadata(config, spec, data)
 
 
 def _trainable_parameter_count(module: torch.nn.Module) -> int:

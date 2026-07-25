@@ -255,8 +255,61 @@ L_total = L_id
 - `L_id`：BNNeck/linear classifier cross entropy。
 - `L_triplet`：BN 前视觉 feature 的 batch-hard triplet。
 - `L_alignment`：全身份文本 anchor SigLIP loss。
-- `L_TFC`：融合检索 feature 的中心约束。
+- `L_TFC`：camera-aware visual/text 双中心约束，定义见 6.3。
 - `label_smoothing` 只作用于 `L_id`。
+
+### 6.3 Camera-aware Cross-modal TFC
+
+训练 split 启动时统计 `count[y]` 与 `count[y,c]`。TFC 在 FP32 buffer 中维护：
+
+```text
+V_local[y,c], T_local[y,c]
+V_global[y],  T_global[y]
+```
+
+每个 micro-batch 只执行一次图像前向。`V_local` 用
+`normalize(FeatureHead(f_v_raw))` 更新；`T_local` 在 text tower eval 模式与
+`no_grad` 下精确编码 `P_global + P_cam[c] + P_id[y]`。该 identity prompt 仅作为
+Stage-2 TFC teacher，query/gallery 仍禁止使用。每个已观测 `(y,c)` 分别做 EMA；更新后
+对该 identity 已初始化的 camera center 等权平均并归一化为 global center。
+
+长尾 ID 使用静态 per-ID momentum。对 `log(count[y])` 做 min-max rarity 归一化，最高频
+ID 使用 `tfc_momentum`，最低频 ID 使用 `tfc_tail_momentum`。所有 ID 等频时统一使用
+head momentum。sample-level TFC 使用 effective-number class weight：
+
+```text
+w_y = (1 - beta_cb) / (1 - beta_cb ^ count[y])
+```
+
+权重归一化到 ID 均值 1，每项按 `sum(w_i * loss_i) / sum(w_i)` reduction。
+
+当前 Stage-2 beta 同时组合局部和全局双中心：
+
+```text
+P_local[y,c] = normalize(V_local[y,c] + beta * T_local[y,c])
+P_global[y]  = normalize(V_global[y]  + beta * T_global[y])
+```
+
+TFC 主项包括 retrieval feature 到 local/global prototype 的 cosine distance、纯视觉
+feature 到 text local center 的 cross-modal distance，以及跨相机多正样本 InfoNCE。
+InfoNCE 以同 ID 异相机已初始化 prototype 为正，不同 ID prototype 为负。
+
+训练相机的 ID 共现数加 Laplace smoothing 形成 off-diagonal prior。可学习
+`camera_transfer_logits[C,C]` 经 diagonal/active-camera mask 和 row softmax 得到有方向
+转移概率；可用正相机子集内重新归一化后作为 InfoNCE numerator 权重。另计算
+`KL(prior || transfer)` 防止退化。无异相机正样本、无负样本或单相机数据返回可反传
+FP32 零值，不产生 NaN。
+
+```text
+L_TFC = (lambda_l * L_local + lambda_g * L_global
+       + lambda_m * L_cross_modal + lambda_c * L_cross_camera)
+        / (lambda_l + lambda_g + lambda_m + lambda_c)
+        + lambda_r * L_transfer_reg
+```
+
+保持 update-before-score；当前 batch 可使用刚初始化的 local/global center。若
+`tfc_weight=0`，完全跳过 teacher 文本前向、center update 和 TFC loss。TFC 只在 Stage-2
+训练使用，推理不读取 center、统计或 transfer matrix。
 
 `logit_scale` 和 `logit_bias` 读取预训练值后永久冻结，不进入 optimizer。归一化、logit、
 bias 和 `logsigmoid` 在 FP32 中计算。
@@ -286,8 +339,8 @@ camera retrieval text：
 AdamW 参数分组：
 
 - `vision_model.*` 使用 `image_encoder_lr`。
-- prompt、classifier、TFC、BNNeck、可训练文本塔使用 `lr`。
-- 一维参数、bias、prompt 和 SIE 不做 weight decay。
+- prompt、classifier、TFC transfer logits、BNNeck、可训练文本塔使用 `lr`。
+- 一维参数、bias、prompt、SIE 和 TFC transfer logits 不做 weight decay。
 - 其他矩阵参数使用 `1e-4` weight decay。
 
 ## 8. 24GB 单卡 precision 与梯度累积
@@ -322,7 +375,8 @@ auto + CPU               -> fp32
 2. 每个 micro-batch loss 除以该窗口的实际长度后 backward。
 3. 每个窗口只执行一次 optimizer/scaler step。
 4. epoch 尾部不足 4 个 micro-batch 时按实际长度归一化。
-5. FP16 overflow 跳过的窗口不计为 W&B optimizer update step。
+5. FP16 overflow 跳过的窗口不计为 W&B optimizer update step，并回滚该窗口触及的
+   TFC local/global center 与 initialized mask。
 
 Stage-1 cache、anchor/camera cache、训练和验证使用同一 precision controller。落到 CPU
 进行 ReID 距离计算的最终 feature 强制转换为 FP32。
@@ -357,7 +411,7 @@ reference 与 Rust 使用同一规则。该实现将常驻内存从稠密 `O(N^2
 
 ## 10. Checkpoint 契约
 
-新 checkpoint schema version 为 2，并保存：
+新 checkpoint schema version 为 3，并保存：
 
 - `backbone_family = siglip2`；
 - Hugging Face model ID；
@@ -365,6 +419,9 @@ reference 与 Rust 使用同一规则。该实现将常驻内存从稠密 `O(N^2
 - image size、patch size、patch count、最大 patch budget、vision input format；
 - text padding side、BOS/padding-mask layout；
 - resolved precision；
+- dataset、训练 ID/camera 数、pid-camera count SHA-256 fingerprint；
+- TFC 版本、全部 TFC 超参数、beta schedule、Stage-2 epoch offset、双中心/mask/统计
+  buffer 与 camera transfer logits；
 - model 和 optimizer state；
 - FP16 GradScaler auxiliary state；
 - epoch、stage、best mAP 和验证指标。
@@ -390,6 +447,12 @@ alignment_loss
 reid_loss
 triplet_loss
 tfc_loss
+tfc_local_loss
+tfc_global_loss
+tfc_cross_modal_loss
+tfc_cross_camera_loss
+tfc_transfer_reg_loss
+tfc_cross_camera_coverage
 lr
 ```
 
@@ -397,8 +460,9 @@ lr
 均值；epoch 指标为所有 micro-batch 的均值。metadata 必须记录 requested/resolved
 precision、micro/effective/eval batch、累积步数、gradient checkpointing、patch 信息、
 `data_backend`、`evaluation_backend`、worker/pin/prefetch/persistent 配置和 evaluation
-chunk size。运行后端字段只作为实验 provenance，不进入 schema 2 checkpoint 兼容性
-校验，因此现有 schema 2 Stage-2 checkpoint 仍可恢复。
+chunk size。运行后端字段只作为实验 provenance；schema 3 另外将 dataset、训练标签
+fingerprint 和全部 TFC 配置纳入 resume 兼容性校验。schema 2 Stage-2 checkpoint 明确
+拒绝恢复，不执行旧 center 迁移。
 
 ## 12. 验收标准
 
@@ -416,14 +480,16 @@ chunk size。运行后端字段只作为实验 provenance，不进入 schema 2 c
 8. `label_smoothing` 不影响 alignment loss。
 9. accumulation 尾窗口梯度不被低估，W&B step 按 optimizer window 计数。
 10. FP16 scaler 和 SigLIP metadata 可 checkpoint/resume。
-11. 推理路径永远不访问 identity prompt。
-12. `uv run cargo test --manifest-path rust/Cargo.toml --locked` 和
+11. 推理路径永远不访问 identity prompt、TFC center、训练统计或 camera transfer matrix。
+12. Camera-aware TFC 的 pid-camera 路由、双中心 EMA、class balance、跨相机 InfoNCE、
+    单相机退化与 schema 3 state round-trip 均有离线测试。
+13. `uv run cargo test --manifest-path rust/Cargo.toml --locked` 和
     `uv run python -m unittest discover -s tests` 全部通过。
-13. Rust/Python 主评估差分在相同 feature 上达到 `1e-12` 聚合一致性；小规模稀疏
+14. Rust/Python 主评估差分在相同 feature 上达到 `1e-12` 聚合一致性；小规模稀疏
     rerank 与稠密 reference 距离/指标误差不超过 `1e-6`。
-14. 原生 eval resize 的 shape/dtype/contiguous 契约一致，fixture 最大误差不超过一个
+15. 原生 eval resize 的 shape/dtype/contiguous 契约一致，fixture 最大误差不超过一个
     8-bit 量化步长对应的归一化值；固定 seed 的 Rust 增强可重放。
-15. `python -m scripts.train --help` 只显示 SigLIP 2 与 Rust backend 公共参数，不显示旧
+16. `python -m scripts.train --help` 只显示 SigLIP 2 与 Rust backend 公共参数，不显示旧
     `--clip-*` 参数。
 
 ## 13. 明确不做

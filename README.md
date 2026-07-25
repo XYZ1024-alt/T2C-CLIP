@@ -13,7 +13,7 @@ The implementation uses a two-stage training pipeline:
 - Stage-1 supervised SigLIP alignment between image features and identity-aware
   prompt features.
 - Stage-2 ReID identity, batch-hard triplet, SigLIP all-identity alignment, and
-  TFC losses.
+  camera-aware cross-modal TFC losses with per-identity/per-camera prototypes.
 - Fused or image-only no-rerank cosine retrieval.
 - Stage-aware Weights & Biases tracking and resumable checkpoints.
 
@@ -150,6 +150,30 @@ L_total = L_id + L_triplet
 `label_smoothing` applies only to `L_id`. The SigLIP loss keeps its native
 binary targets and native row-mean / column-sum reduction.
 
+Camera-aware TFC maintains FP32 visual/text EMA centers for every observed
+`(person_id, camera_id)`. Camera-local centers are aggregated with equal camera
+weight into global identity centers, then fused with the current Stage-2 beta:
+
+```text
+P_local[y,c] = normalize(V_local[y,c] + beta * T_local[y,c])
+P_global[y]  = normalize(V_global[y]  + beta * T_global[y])
+
+L_TFC = weighted_mean(L_local, L_global, L_cross_modal, L_cross_camera)
+      + transfer_reg_weight * KL(camera_prior || camera_transfer)
+```
+
+`L_cross_camera` is multi-positive InfoNCE over initialized prototypes: the
+same identity in other cameras is positive and every different identity is
+negative. A learned directed `C x C` row-stochastic transfer matrix weights the
+available positive cameras. The text center teacher exactly encodes
+`global + camera + identity` under `no_grad`; identity prompts remain absent
+from query/gallery retrieval.
+
+Long-tail identities use higher EMA momentum between `--tfc-momentum` and
+`--tfc-tail-momentum`. Effective-number class weights are applied to every
+sample-level TFC component. Set `--tfc-weight 0` to skip the teacher text
+forward, all center updates, and all TFC losses.
+
 The pretrained `logit_scale` and `logit_bias` are frozen constants:
 
 ```text
@@ -228,6 +252,15 @@ Optimization:
 - `--image-encoder-lr 5e-6`
 - `--alignment-weight 1.0`
 - `--tfc-weight 1.0`
+- `--tfc-momentum 0.5` (highest-frequency identity)
+- `--tfc-tail-momentum 0.9` (lowest-frequency identity)
+- `--tfc-class-balance-beta 0.9999`
+- `--tfc-local-weight 1.0`
+- `--tfc-global-weight 1.0`
+- `--tfc-cross-modal-weight 0.5`
+- `--tfc-cross-camera-weight 0.1`
+- `--tfc-contrast-temperature 0.07`
+- `--tfc-transfer-reg-weight 0.01`
 - `--triplet-margin 0.3`
 - `--triplet-metric euclidean|cosine`
 - `--label-smoothing 0.0`
@@ -249,11 +282,13 @@ Freezing and retrieval:
 ## Checkpoints And Resume
 
 Stage-1 writes `stage1_last.pth`. Stage-2 writes `last.pth` and `best.pth`.
-New checkpoints include:
+New checkpoints use schema version 3 and include:
 
-- schema version and `backbone_family=siglip2`
-- Hugging Face model ID
-- feature dimension
+- `backbone_family=siglip2`, dataset, Hugging Face model ID, and feature dimension
+- training identity/camera counts and a deterministic pid-camera count fingerprint
+- Camera-aware TFC version and every momentum, weight, temperature, class-balance,
+  beta schedule, and Stage-2 epoch-offset setting
+- visual/text local and global prototypes, initialized masks, statistics, and camera transfer logits
 - image size, patch size, patch count, maximum patch budget, and vision input format
 - tokenizer padding/pooling layout
 - resolved precision
@@ -271,10 +306,10 @@ uv run python -m scripts.train \
   --resume checkpoints/siglip2-so400m/last.pth
 ```
 
-This migration intentionally does not support OpenAI CLIP weights or old
-T2C-CLIP training checkpoints. The removed options `--clip-model-name`,
-`--clip-checkpoint`, and `--clip-weight` are argparse errors. Incompatible
-resume metadata fails before model weights are loaded.
+This migration intentionally rejects schema 2 Stage-2 checkpoints, OpenAI CLIP
+weights, and old T2C-CLIP training checkpoints. The removed options
+`--clip-model-name`, `--clip-checkpoint`, and `--clip-weight` are argparse
+errors. Incompatible resume metadata fails before model weights are loaded.
 
 ## Weights & Biases
 
@@ -294,7 +329,10 @@ uv run python -m scripts.train \
 Training metrics include:
 
 - Stage-1: `loss`, `alignment_loss`, `lr`
-- Stage-2: `loss`, `alignment_loss`, `reid_loss`, `triplet_loss`, `tfc_loss`, `lr`
+- Stage-2: `loss`, `alignment_loss`, `reid_loss`, `triplet_loss`, `tfc_loss`,
+  `tfc_local_loss`, `tfc_global_loss`, `tfc_cross_modal_loss`,
+  `tfc_cross_camera_loss`, `tfc_transfer_reg_loss`,
+  `tfc_cross_camera_coverage`, `lr`
 - Validation: `mAP`, `best_mAP`, `rank_1`, `rank_5`, `rank_10`
 
 `stage1_train_step` and `stage2_train_step` count successful optimizer update

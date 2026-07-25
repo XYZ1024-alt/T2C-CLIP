@@ -11,6 +11,7 @@ never touch query/gallery retrieval.
 
 from __future__ import annotations
 
+import hashlib
 import math
 
 from collections.abc import Callable, Iterator, Sequence
@@ -65,7 +66,7 @@ from t2c_reid.model import T2CReIDModel
 from t2c_reid.precision import PrecisionController, PrecisionPolicy, resolve_precision
 from t2c_reid.prompts import PromptBank, PromptConfig
 from t2c_reid.retrieval import FUSED_RETRIEVAL, require_retrieval_mode
-from t2c_reid.tfc import TFCCenterBank
+from t2c_reid.tfc import CameraAwareTFCBank
 from t2c_reid.training import (
     Stage1LossBreakdown,
     Stage1LossConfig,
@@ -95,6 +96,12 @@ STAGE2_TRAIN_LOSS_METRIC_NAMES = (
     "reid_loss",
     "triplet_loss",
     "tfc_loss",
+    "tfc_local_loss",
+    "tfc_global_loss",
+    "tfc_cross_modal_loss",
+    "tfc_cross_camera_loss",
+    "tfc_transfer_reg_loss",
+    "tfc_cross_camera_coverage",
 )
 STAGE1 = "stage1"
 STAGE2 = "stage2"
@@ -161,6 +168,14 @@ class Siglip2ReIDJobConfig:
     beta: float
     context_length: int
     tfc_momentum: float
+    tfc_tail_momentum: float
+    tfc_class_balance_beta: float
+    tfc_local_weight: float
+    tfc_global_weight: float
+    tfc_cross_modal_weight: float
+    tfc_cross_camera_weight: float
+    tfc_contrast_temperature: float
+    tfc_transfer_reg_weight: float
     triplet_margin: float
     triplet_metric: str
     tfc_weight: float
@@ -196,6 +211,8 @@ class DatasetBundle:
     gallery: ReIDImageDataset | ReIDMetadataDataset
     num_train_ids: int
     num_cameras: int
+    identity_counts: torch.Tensor
+    identity_camera_counts: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -392,7 +409,7 @@ class Siglip2ReIDTrainingModel(torch.nn.Module):
         self,
         retrieval_model: T2CReIDModel,
         classifier: torch.nn.Module,
-        tfc_bank: TFCCenterBank,
+        tfc_bank: CameraAwareTFCBank,
     ):
         super().__init__()
         self.retrieval_model = retrieval_model
@@ -483,7 +500,7 @@ def build_training_job(
         precision=precision,
         stage1_feature_cache=_build_stage1_feature_cache(config, data),
     )
-    metadata = _stage_metadata(config, spec)
+    metadata = _stage_metadata(config, spec, data)
     stage2_job = TrainingJob(
         model=shared_model,
         optimizer=optimizer_stage2,
@@ -501,7 +518,7 @@ def build_training_job(
             )
         ),
         stage_metadata=metadata,
-        checkpoint_metadata=_checkpoint_metadata(config, spec),
+        checkpoint_metadata=_checkpoint_metadata(config, spec, data),
         auxiliary_state=precision,
     )
     if config.stage1_epochs <= 0:
@@ -512,7 +529,7 @@ def build_training_job(
         train_one_epoch=_train_one_epoch(stage1_runtime),
         validate=_noop_validate(),
         stage_metadata=metadata,
-        checkpoint_metadata=_checkpoint_metadata(config, spec),
+        checkpoint_metadata=_checkpoint_metadata(config, spec, data),
         auxiliary_state=precision,
     )
     return TwoStageTrainingJob(
@@ -721,6 +738,11 @@ def load_dataset_bundle(
     train_person_map = build_person_id_map(splits.train)
     eval_person_map = build_person_id_map([*splits.query, *splits.gallery])
     bundle = _transform_bundle(transforms)
+    identity_counts, identity_camera_counts = _training_statistics(
+        splits.train,
+        train_person_map,
+        camera_map,
+    )
     return DatasetBundle(
         train=_build_image_dataset(
             splits.train, train_person_map, camera_map, bundle.train, backend
@@ -736,7 +758,24 @@ def load_dataset_bundle(
         ),
         num_train_ids=len(train_person_map),
         num_cameras=len(camera_map),
+        identity_counts=identity_counts,
+        identity_camera_counts=identity_camera_counts,
     )
+
+
+def _training_statistics(
+    samples: Sequence[ReIDSample],
+    person_id_map: dict[int, int],
+    camera_id_map: dict[int, int],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    identity_camera_counts = torch.zeros(
+        (len(person_id_map), len(camera_id_map)), dtype=torch.long
+    )
+    for sample in samples:
+        person_id = person_id_map[sample.person_id]
+        camera_id = camera_id_map[sample.camera_id]
+        identity_camera_counts[person_id, camera_id] += 1
+    return identity_camera_counts.sum(dim=1), identity_camera_counts
 
 
 def _build_image_dataset(
@@ -828,6 +867,28 @@ def _job_config_from_args(args: Any) -> Siglip2ReIDJobConfig:
             f"this training job only supports {SIGLIP2_MODEL_ID!r}, got "
             f"{model_name!r}"
         )
+    tfc_momentum = float(getattr(args, "tfc_momentum", 0.5))
+    tfc_tail_momentum = float(getattr(args, "tfc_tail_momentum", 0.9))
+    tfc_class_balance_beta = float(getattr(args, "tfc_class_balance_beta", 0.9999))
+    tfc_local_weight = float(getattr(args, "tfc_local_weight", 1.0))
+    tfc_global_weight = float(getattr(args, "tfc_global_weight", 1.0))
+    tfc_cross_modal_weight = float(getattr(args, "tfc_cross_modal_weight", 0.5))
+    tfc_cross_camera_weight = float(getattr(args, "tfc_cross_camera_weight", 0.1))
+    tfc_contrast_temperature = float(getattr(args, "tfc_contrast_temperature", 0.07))
+    tfc_transfer_reg_weight = float(getattr(args, "tfc_transfer_reg_weight", 0.01))
+    tfc_weight = float(args.tfc_weight)
+    _validate_tfc_config(
+        tfc_weight=tfc_weight,
+        head_momentum=tfc_momentum,
+        tail_momentum=tfc_tail_momentum,
+        class_balance_beta=tfc_class_balance_beta,
+        local_weight=tfc_local_weight,
+        global_weight=tfc_global_weight,
+        cross_modal_weight=tfc_cross_modal_weight,
+        cross_camera_weight=tfc_cross_camera_weight,
+        contrast_temperature=tfc_contrast_temperature,
+        transfer_reg_weight=tfc_transfer_reg_weight,
+    )
     return Siglip2ReIDJobConfig(
         dataset=args.dataset,
         data_root=args.data_root,
@@ -852,10 +913,18 @@ def _job_config_from_args(args: Any) -> Siglip2ReIDJobConfig:
         image_size=image_size,
         beta=float(args.beta),
         context_length=int(args.context_length),
-        tfc_momentum=float(args.tfc_momentum),
+        tfc_momentum=tfc_momentum,
+        tfc_tail_momentum=tfc_tail_momentum,
+        tfc_class_balance_beta=tfc_class_balance_beta,
+        tfc_local_weight=tfc_local_weight,
+        tfc_global_weight=tfc_global_weight,
+        tfc_cross_modal_weight=tfc_cross_modal_weight,
+        tfc_cross_camera_weight=tfc_cross_camera_weight,
+        tfc_contrast_temperature=tfc_contrast_temperature,
+        tfc_transfer_reg_weight=tfc_transfer_reg_weight,
         triplet_margin=float(args.triplet_margin),
         triplet_metric=str(getattr(args, "triplet_metric", "euclidean")),
-        tfc_weight=float(args.tfc_weight),
+        tfc_weight=tfc_weight,
         alignment_weight=float(getattr(args, "alignment_weight", 1.0)),
         id_logit_scale=float(getattr(args, "id_logit_scale", 1.0)),
         label_smoothing=float(getattr(args, "label_smoothing", 0.0)),
@@ -877,6 +946,38 @@ def _job_config_from_args(args: Any) -> Siglip2ReIDJobConfig:
         sie_coe=float(getattr(args, "sie_coe", 0.0)),
         stage1_feature_cache=stage1_feature_cache,
     )
+
+
+def _validate_tfc_config(
+    *,
+    tfc_weight: float,
+    head_momentum: float,
+    tail_momentum: float,
+    class_balance_beta: float,
+    local_weight: float,
+    global_weight: float,
+    cross_modal_weight: float,
+    cross_camera_weight: float,
+    contrast_temperature: float,
+    transfer_reg_weight: float,
+) -> None:
+    if not math.isfinite(tfc_weight) or tfc_weight < 0.0:
+        raise ValueError("--tfc-weight must be finite and non-negative")
+    if not (
+        math.isfinite(head_momentum)
+        and math.isfinite(tail_momentum)
+        and 0.0 <= head_momentum <= tail_momentum < 1.0
+    ):
+        raise ValueError("TFC momentum must satisfy 0 <= head <= tail < 1")
+    if not math.isfinite(class_balance_beta) or not 0.0 <= class_balance_beta < 1.0:
+        raise ValueError("--tfc-class-balance-beta must satisfy 0 <= beta < 1")
+    weights = (local_weight, global_weight, cross_modal_weight, cross_camera_weight)
+    if any(not math.isfinite(weight) or weight < 0.0 for weight in (*weights, transfer_reg_weight)):
+        raise ValueError("TFC loss weights must be finite and non-negative")
+    if tfc_weight > 0.0 and sum(weights) == 0.0:
+        raise ValueError("positive --tfc-weight requires at least one positive TFC main loss weight")
+    if not math.isfinite(contrast_temperature) or contrast_temperature <= 0.0:
+        raise ValueError("--tfc-contrast-temperature must be finite and positive")
 
 
 def _build_runtimes(
@@ -961,6 +1062,7 @@ def _apply_freezing(model: Siglip2ReIDTrainingModel, config: Siglip2ReIDJobConfi
         # Stage-1 trains the prompt bank, so any precomputed camera text is stale.
         retrieval.set_inference_text_cache(None)
     model.classifier.requires_grad_(stage == STAGE2)
+    model.tfc_bank.requires_grad_(stage == STAGE2)
     retrieval.feature_head.requires_grad_(stage == STAGE2)
     if isinstance(retrieval.feature_head, BNNeck):
         retrieval.feature_head.freeze_bias()
@@ -999,6 +1101,7 @@ WEIGHT_DECAY = 1e-4
 NO_DECAY_PARAMETER_PREFIXES = (
     "retrieval_model.prompt_bank.",
     "retrieval_model.image_encoder.sie_embedding.",
+    "tfc_bank.camera_transfer_logits",
 )
 
 
@@ -1062,6 +1165,14 @@ def _stage2_loss_config(
         alignment_weight=config.alignment_weight,
         id_logit_scale=config.id_logit_scale,
         label_smoothing=config.label_smoothing,
+        tfc_tail_momentum=config.tfc_tail_momentum,
+        tfc_class_balance_beta=config.tfc_class_balance_beta,
+        tfc_local_weight=config.tfc_local_weight,
+        tfc_global_weight=config.tfc_global_weight,
+        tfc_cross_modal_weight=config.tfc_cross_modal_weight,
+        tfc_cross_camera_weight=config.tfc_cross_camera_weight,
+        tfc_contrast_temperature=config.tfc_contrast_temperature,
+        tfc_transfer_reg_weight=config.tfc_transfer_reg_weight,
     )
 
 
@@ -1084,6 +1195,7 @@ def _build_stage2_lr_scheduler(
 def _stage_metadata(
     config: Siglip2ReIDJobConfig,
     spec: Siglip2ModelSpec,
+    data: DatasetBundle,
 ) -> StageMetadata:
     """Bundle two-stage config into the canonical ``StageMetadata`` container.
 
@@ -1094,7 +1206,7 @@ def _stage_metadata(
     """
     return StageMetadata(
         values={
-            "checkpoint_schema_version": 2,
+            "checkpoint_schema_version": 3,
             "backbone_family": "siglip2",
             "dataset": config.dataset,
             "siglip2_model_name": config.siglip2_model_name,
@@ -1131,6 +1243,20 @@ def _stage_metadata(
             "triplet_margin": config.triplet_margin,
             "triplet_metric": config.triplet_metric,
             "tfc_momentum": config.tfc_momentum,
+            "tfc_tail_momentum": config.tfc_tail_momentum,
+            "tfc_class_balance_beta": config.tfc_class_balance_beta,
+            "tfc_local_weight": config.tfc_local_weight,
+            "tfc_global_weight": config.tfc_global_weight,
+            "tfc_cross_modal_weight": config.tfc_cross_modal_weight,
+            "tfc_cross_camera_weight": config.tfc_cross_camera_weight,
+            "tfc_contrast_temperature": config.tfc_contrast_temperature,
+            "tfc_transfer_reg_weight": config.tfc_transfer_reg_weight,
+            "tfc_version": "camera_aware_cross_modal_v1",
+            "num_train_ids": data.num_train_ids,
+            "num_cameras": data.num_cameras,
+            "pid_camera_count_fingerprint": _pid_camera_count_fingerprint(
+                data.identity_camera_counts
+            ),
             "context_length": config.context_length,
             "freeze_image_encoder_stage1": config.freeze_image_encoder_stage1,
             "freeze_image_encoder_stage2": config.freeze_image_encoder_stage2,
@@ -1162,12 +1288,34 @@ def _stage_metadata(
 def _checkpoint_metadata(
     config: Siglip2ReIDJobConfig,
     spec: Siglip2ModelSpec,
+    data: DatasetBundle,
 ) -> dict[str, Any]:
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "backbone_family": "siglip2",
+        "dataset": config.dataset,
         "model_id": config.siglip2_model_name,
         "feature_dim": spec.feature_dim,
+        "num_train_ids": data.num_train_ids,
+        "num_cameras": data.num_cameras,
+        "pid_camera_count_fingerprint": _pid_camera_count_fingerprint(
+            data.identity_camera_counts
+        ),
+        "tfc_version": "camera_aware_cross_modal_v1",
+        "tfc_weight": config.tfc_weight,
+        "beta": config.beta,
+        "beta_warmup_epochs": config.beta_warmup_epochs,
+        "stage1_epochs": config.stage1_epochs,
+        "stage2_first_epoch": config.stage2_first_epoch,
+        "tfc_momentum": config.tfc_momentum,
+        "tfc_tail_momentum": config.tfc_tail_momentum,
+        "tfc_class_balance_beta": config.tfc_class_balance_beta,
+        "tfc_local_weight": config.tfc_local_weight,
+        "tfc_global_weight": config.tfc_global_weight,
+        "tfc_cross_modal_weight": config.tfc_cross_modal_weight,
+        "tfc_cross_camera_weight": config.tfc_cross_camera_weight,
+        "tfc_contrast_temperature": config.tfc_contrast_temperature,
+        "tfc_transfer_reg_weight": config.tfc_transfer_reg_weight,
         "image_size": tuple(config.image_size),
         "patch_size": spec.patch_size,
         "patch_count": spec.patch_count,
@@ -1178,6 +1326,17 @@ def _checkpoint_metadata(
         "mask_text_padding": spec.mask_text_padding,
         "precision": config.precision.resolved,
     }
+
+
+def _pid_camera_count_fingerprint(counts: torch.Tensor) -> str:
+    if counts.dtype != torch.long or counts.ndim != 2:
+        raise ValueError("pid-camera counts must be a rank-2 torch.long tensor")
+    digest = hashlib.sha256()
+    digest.update(int(counts.shape[0]).to_bytes(8, "little", signed=False))
+    digest.update(int(counts.shape[1]).to_bytes(8, "little", signed=False))
+    for value in counts.detach().cpu().contiguous().view(-1).tolist():
+        digest.update(int(value).to_bytes(8, "little", signed=True))
+    return digest.hexdigest()
 
 
 def _load_split_samples(config: JobDataConfig) -> SplitSamples:
@@ -1250,8 +1409,13 @@ def _build_training_model(
         feature_head=_build_feature_head(config.reid_head, spec.feature_dim),
     )
     classifier = torch.nn.Linear(spec.feature_dim, data.num_train_ids, bias=False)
-    tfc_bank = TFCCenterBank(
-        data.num_train_ids, spec.feature_dim, config.tfc_momentum
+    tfc_bank = CameraAwareTFCBank(
+        identity_counts=data.identity_counts,
+        identity_camera_counts=data.identity_camera_counts,
+        feature_dim=spec.feature_dim,
+        head_momentum=config.tfc_momentum,
+        tail_momentum=config.tfc_tail_momentum,
+        class_balance_beta=config.tfc_class_balance_beta,
     )
     return Siglip2ReIDTrainingModel(retrieval, classifier, tfc_bank)
 
@@ -1417,18 +1581,34 @@ def _train_one_epoch(runtime: StageTrainingRuntime):
             runtime.optimizer.zero_grad(set_to_none=True)
             window_totals = {name: 0.0 for name in metric_names}
             window_size = len(window)
-            for batch in window:
-                with runtime.precision.autocast():
-                    breakdown = _micro_batch_breakdown(
-                        runtime, batch, runtime.stage
-                    )
-                values = _breakdown_metric_values(breakdown, runtime.stage)
-                runtime.precision.backward(breakdown.total / window_size)
-                for name in metric_names:
-                    totals[name] += values[name]
-                    window_totals[name] += values[name]
-                micro_batch_count += 1
-            update_succeeded = runtime.precision.step(runtime.optimizer)
+            tfc_transaction = (
+                runtime.stage == STAGE2
+                and float(getattr(runtime.loss_config, "tfc_weight", 0.0)) > 0.0
+            )
+            if tfc_transaction:
+                runtime.model.tfc_bank.begin_update_window()
+            try:
+                for batch in window:
+                    with runtime.precision.autocast():
+                        breakdown = _micro_batch_breakdown(
+                            runtime, batch, runtime.stage
+                        )
+                    values = _breakdown_metric_values(breakdown, runtime.stage)
+                    runtime.precision.backward(breakdown.total / window_size)
+                    for name in metric_names:
+                        totals[name] += values[name]
+                        window_totals[name] += values[name]
+                    micro_batch_count += 1
+                update_succeeded = runtime.precision.step(runtime.optimizer)
+            except Exception:
+                if tfc_transaction:
+                    runtime.model.tfc_bank.rollback_update_window()
+                raise
+            if tfc_transaction:
+                if update_succeeded:
+                    runtime.model.tfc_bank.commit_update_window()
+                else:
+                    runtime.model.tfc_bank.rollback_update_window()
             if update_succeeded:
                 reported = {
                     name: window_totals[name] / window_size for name in metric_names
@@ -1665,6 +1845,16 @@ def _stage2_metric_values(breakdown: Stage2LossBreakdown) -> dict[str, float]:
         "triplet_loss": _tensor_metric_value(breakdown.triplet),
         "alignment_loss": _tensor_metric_value(breakdown.alignment),
         "tfc_loss": _tensor_metric_value(breakdown.tfc),
+        "tfc_local_loss": _tensor_metric_value(breakdown.tfc_local),
+        "tfc_global_loss": _tensor_metric_value(breakdown.tfc_global),
+        "tfc_cross_modal_loss": _tensor_metric_value(breakdown.tfc_cross_modal),
+        "tfc_cross_camera_loss": _tensor_metric_value(breakdown.tfc_cross_camera),
+        "tfc_transfer_reg_loss": _tensor_metric_value(
+            breakdown.tfc_transfer_regularization
+        ),
+        "tfc_cross_camera_coverage": _tensor_metric_value(
+            breakdown.tfc_cross_camera_coverage
+        ),
     }
 
 

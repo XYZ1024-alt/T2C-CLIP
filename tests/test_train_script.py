@@ -8,7 +8,7 @@ from unittest import mock
 
 import torch
 
-from scripts.train import StageMetadata, TrainingJob, main
+from scripts.train import StageMetadata, TrainingJob, _validate_checkpoint_metadata, main
 from t2c_reid.evaluation import ReIDMetrics
 from t2c_reid.wandb import WandbConfig, WandbTracker
 
@@ -20,6 +20,56 @@ RECORDED_OPTIMIZER_STATE_AT_FIRST_EPOCH: dict = {}
 
 
 class TrainScriptTest(unittest.TestCase):
+    def test_schema2_and_tfc_fingerprint_mismatches_are_rejected(self):
+        expected = {
+            "schema_version": 3,
+            "pid_camera_count_fingerprint": "new-fingerprint",
+        }
+        with self.assertRaisesRegex(ValueError, "schema_version"):
+            _validate_checkpoint_metadata(
+                expected,
+                {
+                    "checkpoint_metadata": {
+                        "schema_version": 2,
+                        "pid_camera_count_fingerprint": "new-fingerprint",
+                    }
+                },
+            )
+        with self.assertRaisesRegex(ValueError, "pid_camera_count_fingerprint"):
+            _validate_checkpoint_metadata(
+                expected,
+                {
+                    "checkpoint_metadata": {
+                        "schema_version": 3,
+                        "pid_camera_count_fingerprint": "old-fingerprint",
+                    }
+                },
+            )
+
+        objective_expected = {
+            "schema_version": 3,
+            "tfc_weight": 1.0,
+            "beta": 0.1,
+            "beta_warmup_epochs": 10,
+            "stage1_epochs": 20,
+            "stage2_first_epoch": 21,
+        }
+        for key, changed in (
+            ("tfc_weight", 0.0),
+            ("beta", 0.2),
+            ("beta_warmup_epochs", 0),
+            ("stage1_epochs", 0),
+            ("stage2_first_epoch", 1),
+        ):
+            actual = dict(objective_expected)
+            actual[key] = changed
+            with self.subTest(key=key):
+                with self.assertRaisesRegex(ValueError, key):
+                    _validate_checkpoint_metadata(
+                        objective_expected,
+                        {"checkpoint_metadata": actual},
+                    )
+
     def test_seed_arg_is_accepted_and_seeds_torch(self):
         global RECORDED_ARGS, RECORDED_RNG_STATE
         RECORDED_ARGS = None
@@ -242,6 +292,14 @@ class TrainScriptTest(unittest.TestCase):
 
         self.assertEqual(RECORDED_ARGS.image_encoder_lr, 5e-6)
         self.assertEqual(RECORDED_ARGS.alignment_weight, 1.0)
+        self.assertEqual(RECORDED_ARGS.tfc_tail_momentum, 0.9)
+        self.assertEqual(RECORDED_ARGS.tfc_class_balance_beta, 0.9999)
+        self.assertEqual(RECORDED_ARGS.tfc_local_weight, 1.0)
+        self.assertEqual(RECORDED_ARGS.tfc_global_weight, 1.0)
+        self.assertEqual(RECORDED_ARGS.tfc_cross_modal_weight, 0.5)
+        self.assertEqual(RECORDED_ARGS.tfc_cross_camera_weight, 0.1)
+        self.assertEqual(RECORDED_ARGS.tfc_contrast_temperature, 0.07)
+        self.assertEqual(RECORDED_ARGS.tfc_transfer_reg_weight, 0.01)
         self.assertTrue(RECORDED_ARGS.gradient_checkpointing)
 
     def test_main_logs_validation_metrics_when_wandb_enabled(self):

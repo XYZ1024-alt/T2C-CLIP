@@ -77,6 +77,14 @@ DEFAULT_DEVICE = "cuda"
 DEFAULT_BETA = 0.1
 DEFAULT_CONTEXT_LENGTH = 4
 DEFAULT_TFC_MOMENTUM = 0.5
+DEFAULT_TFC_TAIL_MOMENTUM = 0.9
+DEFAULT_TFC_CLASS_BALANCE_BETA = 0.9999
+DEFAULT_TFC_LOCAL_WEIGHT = 1.0
+DEFAULT_TFC_GLOBAL_WEIGHT = 1.0
+DEFAULT_TFC_CROSS_MODAL_WEIGHT = 0.5
+DEFAULT_TFC_CROSS_CAMERA_WEIGHT = 0.1
+DEFAULT_TFC_CONTRAST_TEMPERATURE = 0.07
+DEFAULT_TFC_TRANSFER_REG_WEIGHT = 0.01
 DEFAULT_TRIPLET_MARGIN = 0.3
 DEFAULT_TRIPLET_METRIC = "euclidean"
 DEFAULT_TFC_WEIGHT = 1.0
@@ -298,6 +306,14 @@ def _add_project_training_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--stage2-warmup-epochs", type=int, default=DEFAULT_STAGE2_WARMUP_EPOCHS)
     parser.add_argument("--context-length", type=int, default=DEFAULT_CONTEXT_LENGTH)
     parser.add_argument("--tfc-momentum", type=float, default=DEFAULT_TFC_MOMENTUM)
+    parser.add_argument("--tfc-tail-momentum", type=float, default=DEFAULT_TFC_TAIL_MOMENTUM)
+    parser.add_argument("--tfc-class-balance-beta", type=float, default=DEFAULT_TFC_CLASS_BALANCE_BETA)
+    parser.add_argument("--tfc-local-weight", type=float, default=DEFAULT_TFC_LOCAL_WEIGHT)
+    parser.add_argument("--tfc-global-weight", type=float, default=DEFAULT_TFC_GLOBAL_WEIGHT)
+    parser.add_argument("--tfc-cross-modal-weight", type=float, default=DEFAULT_TFC_CROSS_MODAL_WEIGHT)
+    parser.add_argument("--tfc-cross-camera-weight", type=float, default=DEFAULT_TFC_CROSS_CAMERA_WEIGHT)
+    parser.add_argument("--tfc-contrast-temperature", type=float, default=DEFAULT_TFC_CONTRAST_TEMPERATURE)
+    parser.add_argument("--tfc-transfer-reg-weight", type=float, default=DEFAULT_TFC_TRANSFER_REG_WEIGHT)
     parser.add_argument("--triplet-margin", type=float, default=DEFAULT_TRIPLET_MARGIN)
     parser.add_argument("--triplet-metric", choices=("euclidean", "cosine"), default=DEFAULT_TRIPLET_METRIC)
     parser.add_argument("--tfc-weight", type=float, default=DEFAULT_TFC_WEIGHT)

@@ -10,7 +10,7 @@ from t2c_reid.losses import (
 )
 from t2c_reid.model import T2CReIDModel
 from t2c_reid.prompts import PromptBank, PromptConfig
-from t2c_reid.tfc import TFCCenterBank
+from t2c_reid.tfc import CameraAwareTFCBank
 from t2c_reid.training import (
     Stage1LossConfig,
     Stage2LossConfig,
@@ -20,6 +20,32 @@ from t2c_reid.training import (
     stage1_alignment_loss_from_visual,
     stage2_loss_breakdown,
 )
+
+
+class TFCCenterBank(CameraAwareTFCBank):
+    """Test adapter for legacy fixtures; production exposes CameraAwareTFCBank only."""
+
+    def __init__(self, num_train_ids: int, feature_dim: int, momentum: float):
+        super().__init__(
+            identity_counts=torch.full((num_train_ids,), 2, dtype=torch.long),
+            identity_camera_counts=torch.ones(num_train_ids, 2, dtype=torch.long),
+            feature_dim=feature_dim,
+            head_momentum=momentum,
+            tail_momentum=momentum,
+        )
+
+    def update(self, features, labels, person_ids=None, camera_ids=None):
+        if person_ids is None or camera_ids is None:
+            return
+        return super().update(features, labels, person_ids, camera_ids)
+
+    @property
+    def centers(self):
+        return self.visual_global_centers
+
+    @property
+    def initialized(self):
+        return self.visual_global_initialized
 
 
 class IdentityEncoder(torch.nn.Module):
@@ -407,7 +433,8 @@ class TrainingLossTest(unittest.TestCase):
             Stage2LossInputs(classifier=classifier, tfc_bank=tfc_bank, anchors=torch.eye(2)),
         )
 
-        self.assertLess(float(breakdown.tfc.detach()), 0.01)
+        self.assertLess(float(breakdown.tfc_local.detach()), 0.01)
+        self.assertGreaterEqual(float(breakdown.tfc.detach()), 0.0)
 
 
 class Stage2ForwardLayoutTest(unittest.TestCase):

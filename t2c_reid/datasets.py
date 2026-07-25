@@ -84,6 +84,13 @@ class ReIDImageDataset(torch.utils.data.Dataset):
     def person_ids(self) -> tuple[int, ...]:
         return tuple(self._mapped_person_id(sample) for sample in self._config.samples)
 
+    @property
+    def camera_ids(self) -> tuple[int, ...]:
+        return tuple(
+            _map_value(self._config.camera_id_map, sample.camera_id, "camera_id")
+            for sample in self._config.samples
+        )
+
     def __getitem__(self, index: int) -> ReIDImageItem:
         sample = self._config.samples[index]
         return ReIDImageItem(
@@ -112,6 +119,13 @@ class ReIDMetadataDataset(torch.utils.data.Dataset):
     @property
     def person_ids(self) -> tuple[int, ...]:
         return tuple(self._mapped_person_id(sample) for sample in self._config.samples)
+
+    @property
+    def camera_ids(self) -> tuple[int, ...]:
+        return tuple(
+            _map_value(self._config.camera_id_map, sample.camera_id, "camera_id")
+            for sample in self._config.samples
+        )
 
     @property
     def transform_config(self) -> ImageTransformConfig:

@@ -15,7 +15,7 @@ f_t = SigLIP2_TextEncoder(prompt)
 f   = normalize(f_v + beta * f_t)
 ```
 
-主创新是 Training-time Feature Centralization（TFC）：训练期在融合特征空间维护 EMA identity center，并用中心化损失降低同一身份在跨摄像头、光照、姿态变化下的特征漂移。推理期保持一次前向，直接用融合特征 `f` 做 cosine 检索。
+主创新是 Camera-aware Cross-modal Training-time Feature Centralization（TFC）：训练期在共享特征空间维护 `(identity, camera)` visual/text 双原型，等权聚合 identity 全局中心，并用可学习相机转移矩阵、多正样本跨相机对比、长尾自适应 momentum 与 class-balanced weighting 降低同一身份在跨摄像头、光照、姿态变化下的特征漂移。推理期保持一次前向，直接用融合特征 `f` 做 cosine 检索。
 
 ## 2. 明确不做的内容
 
@@ -132,23 +132,27 @@ L_reid = L_id + L_triplet
 
 `L_id` 是训练身份分类损失，`L_triplet` 作用于图像侧 BN 前特征。融合特征继续用于最终检索和 TFC；`label_smoothing` 只作用于 `L_id`，不修改 SigLIP binary target。
 
-### 5.3 TFC 中心化损失
+### 5.3 Camera-aware Cross-modal TFC
 
-TFC 为每个训练身份维护 EMA identity center：
-
-```text
-m_y <- alpha * m_y + (1 - alpha) * mean(f_i | y_i = y)
-```
-
-中心化损失降低样本特征与其身份中心的夹角距离：
+TFC 为每个训练身份与相机维护 visual/text EMA prototype，并对该身份已初始化相机做等权聚合：
 
 ```text
-L_TFC = mean(1 - cosine(f_i, stopgrad(m_yi)))
+V_yc <- momentum_y * V_yc + (1 - momentum_y) * mean(f_v | y,c)
+T_yc <- momentum_y * T_yc + (1 - momentum_y) * mean(f_t(global+cam+id) | y,c)
+V_y  = normalize(mean_c(V_yc))
+T_y  = normalize(mean_c(T_yc))
+P_yc = normalize(V_yc + beta * T_yc)
+P_y  = normalize(V_y  + beta * T_y)
 ```
 
-主方法只对融合特征 `f` 施加 TFC。附加消融验证同时对 `f` 与 `f_v` 施加 TFC 是否带来额外收益。
+最低频 identity 使用更高 momentum；sample-level TFC loss 使用 effective-number class weight。TFC 包括 local/global cosine centralization、visual-to-text center alignment 与跨相机多正样本 InfoNCE。后者把同 identity 异相机 prototype 作为正样本、不同 identity prototype 作为负样本，并由可学习的有方向 `C x C` camera transfer probability 对正相机加权。数据共现 prior 通过 `KL(prior || transfer)` 正则 transfer matrix。
 
-TFC 仅用于训练。推理阶段不使用中心、不进行最近邻搜索、不使用 memory bank、不做图传播。
+```text
+L_TFC = weighted_components(L_local, L_global, L_cross_modal, L_cross_camera)
+      + transfer_reg_weight * L_transfer_reg
+```
+
+所有 center 与 TFC 数学使用 FP32。training identity prompt 在 Stage-2 仅作为无梯度 text-center teacher；query/gallery retrieval 仍只使用 global + camera prompt。TFC 仅用于训练，推理阶段不使用中心、相机矩阵、最近邻搜索、memory bank 或图传播。
 
 ## 6. 推理协议
 
@@ -213,14 +217,15 @@ Market-1501 作为辅数据集，按标准 Image-to-Image ReID 协议评测，�
 
 ### 8.3 TFC 消融表
 
-| 变体 | TFC 作用对象 | MSMT17 mAP | MSMT17 Rank-1 |
-|---|---|---:|---:|
-| Without TFC | 无 | 真实实验后填写 | 真实实验后填写 |
-| Main TFC | `f` | 真实实验后填写 | 真实实验后填写 |
-| Visual TFC | `f_v` | 真实实验后填写 | 真实实验后填写 |
-| Dual TFC | `f` 与 `f_v` | 真实实验后填写 | 真实实验后填写 |
+| 变体 | 局部/全局中心 | Text center | Cross-cam InfoNCE | 长尾自适应 | MSMT17 mAP | MSMT17 Rank-1 |
+|---|---:|---:|---:|---:|---:|---:|
+| Without TFC | 否 | 否 | 否 | 否 | 真实实验后填写 | 真实实验后填写 |
+| Global visual center | 仅全局 | 否 | 否 | 否 | 真实实验后填写 | 真实实验后填写 |
+| Camera-aware visual TFC | 是 | 否 | 是 | 否 | 真实实验后填写 | 真实实验后填写 |
+| Cross-modal TFC | 是 | 是 | 否 | 否 | 真实实验后填写 | 真实实验后填写 |
+| Full adaptive TFC | 是 | 是 | 是 | 是 | 真实实验后填写 | 真实实验后填写 |
 
-主报使用 TFC on `f`。`f + f_v` 版本只作为机制验证消融。
+附加消融分别令 local/global/cross-modal/cross-camera 子项权重为 0，并报告 camera transfer matrix 与有效 cross-camera anchor coverage。
 
 ### 8.4 Prompt 设计消融表
 
@@ -282,8 +287,8 @@ Market-1501 作为辅数据集，按标准 Image-to-Image ReID 协议评测，�
 - 图文目标：冻结预训练 scale/bias 的监督式 SigLIP sigmoid loss。
 - 推理特征：`f = normalize(f_v + beta * f_t)`。
 - 推理文本 prompt：global prompt + cam prompt。
-- 训练期 prompt：per-ID prompt 仅用于训练身份对齐。
-- 主 TFC 作用对象：融合特征 `f`。
-- 附加 TFC 消融：`f` 与 `f_v`。
+- 训练期 prompt：per-ID prompt 用于 Stage-1/identity anchor 对齐，并作为 Stage-2 TFC
+  的 no-grad text-center teacher；不进入 query/gallery。
+- 主 TFC：camera-aware visual/text 双中心、跨相机 InfoNCE、相机转移矩阵与长尾自适应。
 - 主指标：无 rerank mAP 与 Rank-1。
 - 结果表：只提供结构，不编造实验数值。

@@ -43,18 +43,20 @@ Stack:
   no BOS in the prompt adapter, and pools the final position (a PAD token)
   through `text_model.head`. Do not replace this with CLIP-style causal masks,
   maximum-token-ID pooling, or EOS-last assumptions.
-- Training identity prompts may be used only for Stage-1 alignment and
-  training-identity anchors. Query/gallery retrieval may use only global +
-  camera prompts.
+- Training identity prompts may be used only for Stage-1 alignment,
+  training-identity anchors, and the no-grad Stage-2 TFC text-prototype teacher.
+  Query/gallery retrieval may use only global + camera prompts.
 - Retrieval applies `FeatureHead` (Identity or BNNeck) to the image feature
   before fusing it with text. Triplet and alignment paths intentionally use
   the documented raw/normalized visual features instead.
 - `logit_scale` and `logit_bias` come from the pretrained checkpoint, remain
   frozen, and never enter an optimizer. SigLIP normalization, logits, bias,
   and `logsigmoid` must run in FP32 even inside an outer autocast context.
-- Checkpoint schema/model/image/feature/text-layout/precision metadata must be
-  validated before loading model state. FP16 GradScaler state is auxiliary
-  checkpoint state. Only Stage-2 checkpoints may be resumed.
+- Checkpoint schema 3 validates model/image/feature/text-layout/precision plus
+  dataset, pid-camera fingerprint, and all TFC configuration before loading
+  model state. Schema 2 Stage-2 checkpoints are intentionally incompatible.
+  FP16 GradScaler state is auxiliary checkpoint state. Only Stage-2
+  checkpoints may be resumed.
 
 ## STRUCTURE
 
@@ -68,7 +70,7 @@ T2C-ReID/
 |   |-- losses.py              Native SigLIP and batch-hard triplet losses
 |   |-- training.py            Stage-1/Stage-2 loss composition
 |   |-- precision.py           Precision policy, autocast, and GradScaler
-|   |-- tfc.py                 EMA identity center bank and TFC loss
+|   |-- tfc.py                 Camera-aware visual/text prototype bank and TFC losses
 |   |-- transforms.py          SigLIP-normalized train/eval image transforms
 |   |-- data.py                Market-1501/MSMT17 parsing
 |   |-- datasets.py            Python reference dataset and Rust batch collator
@@ -163,9 +165,13 @@ frozen.
 
 Stage-2 unfreezes the image tower by default, keeps the text tower frozen, and
 combines identity classification, batch-hard triplet, all-training-identity
-SigLIP anchor alignment, and TFC center loss. Text anchors are camera agnostic.
-Camera retrieval text and identity anchors are cached only when their prompt
-and text dependencies are frozen.
+SigLIP anchor alignment, and camera-aware cross-modal TFC. TFC maintains FP32
+visual/text `(pid, camera)` prototypes, equal-camera global centers, adaptive
+per-ID momentum, effective-number class weights, and a learned directed camera
+transfer matrix for multi-positive cross-camera InfoNCE. Text anchors are
+camera agnostic; the exact global+camera+identity TFC teacher is no-grad and
+training-only. Camera retrieval text and identity anchors are cached only when
+their prompt and text dependencies are frozen.
 
 Primary evaluation is no-rerank cosine retrieval with standard same-ID,
 same-camera gallery exclusion. Torch computes normalized score/distance blocks;
