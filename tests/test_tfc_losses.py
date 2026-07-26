@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 
 from t2c_reid.losses import (
+    _pairwise_distances,
     batch_hard_triplet_loss,
     siglip_identity_anchor_loss,
     supervised_siglip_loss,
@@ -12,6 +13,8 @@ from t2c_reid.losses import (
 from t2c_reid.tfc import (
     CameraAwareTFCBank,
     CameraAwareTFCLossConfig,
+    _fuse_prototypes,
+    _weighted_mean,
 )
 
 
@@ -462,6 +465,201 @@ class TripletLossTest(unittest.TestCase):
                 torch.tensor([0, 0, 1]),
                 metric="manhattan",
             )
+
+    def test_anchors_without_a_positive_or_negative_are_excluded(self):
+        # Identity 2 is a singleton, so it has no positive and must not join
+        # the mean. The masked implementation still produces a value for its
+        # row; only the validity mask keeps it out.
+        features = torch.tensor([[0.0, 0.0], [3.0, 4.0], [6.0, 8.0], [60.0, 80.0]])
+        labels = torch.tensor([0, 0, 1, 2])
+        paired = batch_hard_triplet_loss(features[:3], labels[:3], margin=0.3)
+        with_singleton = batch_hard_triplet_loss(features, labels, margin=0.3)
+        self.assertTrue(torch.isfinite(with_singleton))
+        # Adding a far-away singleton changes the hardest negative for rows 0-2,
+        # but the singleton row itself contributes nothing.
+        self.assertEqual(with_singleton.ndim, paired.ndim)
+
+    def test_every_label_identical_has_no_negative_and_raises(self):
+        with self.assertRaises(ValueError):
+            batch_hard_triplet_loss(
+                torch.tensor([[1.0, 0.0], [0.9, 0.1], [0.8, 0.2]]),
+                torch.tensor([0, 0, 0]),
+            )
+
+    def test_matches_the_per_anchor_reference_including_gradients(self):
+        torch.manual_seed(11)
+        for metric in ("euclidean", "cosine"):
+            with self.subTest(metric=metric):
+                features = torch.randn(16, 12) * 7.0
+                labels = torch.tensor([0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3])
+
+                actual_input = features.clone().requires_grad_(True)
+                actual = batch_hard_triplet_loss(actual_input, labels, 0.3, metric=metric)
+                actual.backward()
+
+                reference_input = features.clone().requires_grad_(True)
+                reference = _reference_batch_hard_triplet(
+                    reference_input, labels, 0.3, metric
+                )
+                reference.backward()
+
+                self.assertTrue(torch.allclose(actual, reference, atol=1e-6))
+                self.assertTrue(
+                    torch.allclose(actual_input.grad, reference_input.grad, atol=1e-6)
+                )
+
+
+class CrossCameraLossVectorizationTest(unittest.TestCase):
+    """The batched cross-camera InfoNCE must equal the per-sample loop it replaced."""
+
+    def test_matches_the_per_sample_reference_including_both_gradient_paths(self):
+        torch.manual_seed(3)
+        counts = torch.tensor([6, 5, 4, 3, 2, 2])
+        per_camera = torch.tensor(
+            [[2, 2, 1, 1], [2, 1, 1, 1], [1, 1, 1, 1], [1, 1, 1, 0], [1, 1, 0, 0], [2, 0, 0, 0]]
+        )
+        for trial in range(3):
+            with self.subTest(trial=trial):
+                bank = CameraAwareTFCBank(
+                    counts, per_camera, feature_dim=8, head_momentum=0.5
+                )
+                bank.camera_transfer_logits.data.normal_(0.0, 0.7)
+                for _ in range(4):
+                    person_ids = torch.randint(0, 6, (10,))
+                    camera_ids = torch.stack(
+                        [torch.multinomial(per_camera[p].float(), 1)[0] for p in person_ids]
+                    )
+                    bank.update(
+                        F.normalize(torch.randn(10, 8), dim=1),
+                        F.normalize(torch.randn(10, 8), dim=1),
+                        person_ids,
+                        camera_ids,
+                    )
+
+                person_ids = torch.randint(0, 6, (12,))
+                camera_ids = torch.stack(
+                    [torch.multinomial(per_camera[p].float(), 1)[0] for p in person_ids]
+                )
+                features = F.normalize(torch.randn(12, 8), dim=1)
+                weights = bank.class_weights[person_ids].float()
+
+                actual_input = features.clone().requires_grad_(True)
+                bank.camera_transfer_logits.grad = None
+                actual, actual_coverage = bank._cross_camera_loss(
+                    actual_input, person_ids, camera_ids, weights, 0.1, 0.07
+                )
+                actual.backward()
+                actual_transfer_grad = bank.camera_transfer_logits.grad.clone()
+
+                reference_input = features.clone().requires_grad_(True)
+                bank.camera_transfer_logits.grad = None
+                reference, reference_coverage = _reference_cross_camera_loss(
+                    bank, reference_input, person_ids, camera_ids, weights, 0.1, 0.07
+                )
+                reference.backward()
+                reference_transfer_grad = bank.camera_transfer_logits.grad.clone()
+
+                self.assertTrue(torch.allclose(actual, reference, atol=1e-6))
+                self.assertTrue(torch.allclose(actual_coverage, reference_coverage))
+                self.assertTrue(
+                    torch.allclose(actual_input.grad, reference_input.grad, atol=1e-6)
+                )
+                self.assertTrue(
+                    torch.allclose(actual_transfer_grad, reference_transfer_grad, atol=1e-6)
+                )
+
+    def test_single_camera_identity_contributes_nothing(self):
+        # Identity 5 only ever appears in camera 0, so it can never have a
+        # cross-camera positive and must be dropped from the coverage count.
+        bank = CameraAwareTFCBank(
+            torch.tensor([4, 2]),
+            torch.tensor([[2, 2], [2, 0]]),
+            feature_dim=4,
+            head_momentum=0.5,
+        )
+        bank.update(
+            F.normalize(torch.randn(3, 4), dim=1),
+            F.normalize(torch.randn(3, 4), dim=1),
+            torch.tensor([0, 0, 1]),
+            torch.tensor([0, 1, 0]),
+        )
+        person_ids = torch.tensor([0, 1])
+        camera_ids = torch.tensor([0, 0])
+        loss, coverage = bank._cross_camera_loss(
+            F.normalize(torch.randn(2, 4), dim=1),
+            person_ids,
+            camera_ids,
+            bank.class_weights[person_ids].float(),
+            0.1,
+            0.07,
+        )
+        self.assertTrue(torch.isfinite(loss))
+        self.assertAlmostEqual(float(coverage), 0.5, places=6)
+
+
+def _reference_cross_camera_loss(
+    bank, retrieval, person_ids, camera_ids, sample_weights, beta, temperature
+):
+    """The original per-sample Python loop, kept as an executable oracle."""
+
+    initialized = bank.visual_local_initialized & bank.text_local_initialized
+    pair_indices = torch.nonzero(initialized, as_tuple=False)
+    zero = retrieval.sum() * 0.0 + bank.camera_transfer_logits.float().sum() * 0.0
+    if pair_indices.shape[0] == 0:
+        return zero, zero.detach()
+    pair_person_ids = pair_indices[:, 0]
+    pair_camera_ids = pair_indices[:, 1]
+    prototypes = _fuse_prototypes(
+        bank.visual_local_centers[initialized].detach(),
+        bank.text_local_centers[initialized].detach(),
+        beta,
+    )
+    transfer_log_probabilities = bank.camera_transfer_log_probabilities()
+    losses: list[torch.Tensor] = []
+    weights: list[torch.Tensor] = []
+    for index in range(retrieval.shape[0]):
+        person_id = person_ids[index]
+        camera_id = camera_ids[index]
+        positives = (pair_person_ids == person_id) & (pair_camera_ids != camera_id)
+        negatives = pair_person_ids != person_id
+        if not bool(torch.any(positives)) or not bool(torch.any(negatives)):
+            continue
+        positive_log_weights = transfer_log_probabilities[
+            camera_id, pair_camera_ids[positives]
+        ]
+        if not bool(torch.all(torch.isfinite(positive_log_weights))):
+            continue
+        positive_log_weights = positive_log_weights - torch.logsumexp(
+            positive_log_weights, dim=0
+        )
+        candidate_mask = positives | negatives
+        logits = (retrieval[index] @ prototypes.T) / float(temperature)
+        numerator = torch.logsumexp(logits[positives] + positive_log_weights, dim=0)
+        denominator = torch.logsumexp(logits[candidate_mask], dim=0)
+        losses.append(denominator - numerator)
+        weights.append(sample_weights[index])
+    if not losses:
+        return zero, zero.detach()
+    coverage = torch.tensor(
+        len(losses) / retrieval.shape[0], dtype=torch.float32, device=retrieval.device
+    )
+    return _weighted_mean(torch.stack(losses), torch.stack(weights)), coverage
+
+
+def _reference_batch_hard_triplet(features, labels, margin, metric):
+    """The original per-anchor Python loop, kept as an executable oracle."""
+
+    distances = _pairwise_distances(features, metric)
+    losses = []
+    for index in range(labels.shape[0]):
+        positive_mask = labels == labels[index]
+        negative_mask = labels != labels[index]
+        positive_mask[index] = False
+        if bool(torch.any(positive_mask)) and bool(torch.any(negative_mask)):
+            hardest_positive = torch.max(distances[index][positive_mask])
+            hardest_negative = torch.min(distances[index][negative_mask])
+            losses.append(torch.relu(hardest_positive - hardest_negative + margin))
+    return torch.stack(losses).mean()
 
 
 if __name__ == "__main__":

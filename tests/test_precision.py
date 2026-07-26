@@ -43,6 +43,50 @@ class PrecisionResolutionTest(unittest.TestCase):
             resolve_precision("tf32", torch.device("cuda"))
 
 
+class GradientClippingTest(unittest.TestCase):
+    """Clipping must work on the scaler-disabled (BF16/FP32) path too."""
+
+    @staticmethod
+    def _model_with_grad(scale: float) -> tuple[torch.nn.Module, torch.optim.Optimizer]:
+        model = torch.nn.Linear(4, 4, bias=False)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        model.weight.grad = torch.full_like(model.weight, scale)
+        return model, optimizer
+
+    def test_clipping_rescales_an_oversized_gradient(self):
+        controller = PrecisionController(PrecisionPolicy("fp32", "fp32", "cpu"))
+        model, optimizer = self._model_with_grad(1.0)
+        # 16 entries of 1.0 -> norm 4.0
+        total_norm = controller.clip_grad_norm(optimizer, model.parameters(), 1.0)
+
+        self.assertAlmostEqual(float(total_norm), 4.0, places=5)
+        self.assertAlmostEqual(float(model.weight.grad.norm()), 1.0, places=5)
+
+    def test_healthy_gradient_is_left_alone(self):
+        controller = PrecisionController(PrecisionPolicy("fp32", "fp32", "cpu"))
+        model, optimizer = self._model_with_grad(0.1)
+        before = model.weight.grad.clone()
+        controller.clip_grad_norm(optimizer, model.parameters(), 5.0)
+
+        self.assertTrue(torch.allclose(model.weight.grad, before))
+
+    def test_non_positive_max_norm_disables_clipping(self):
+        controller = PrecisionController(PrecisionPolicy("fp32", "fp32", "cpu"))
+        model, optimizer = self._model_with_grad(1.0)
+        before = model.weight.grad.clone()
+
+        self.assertIsNone(controller.clip_grad_norm(optimizer, model.parameters(), 0.0))
+        self.assertTrue(torch.allclose(model.weight.grad, before))
+
+    def test_fp16_path_unscales_before_clipping(self):
+        with mock.patch("t2c_reid.precision.torch.amp.GradScaler", _FakeGradScaler):
+            controller = PrecisionController(PrecisionPolicy("fp16", "fp16", "cuda"))
+            model, optimizer = self._model_with_grad(1.0)
+            controller.clip_grad_norm(optimizer, model.parameters(), 1.0)
+
+        self.assertEqual(controller.scaler.unscaled, [optimizer])
+
+
 class PrecisionCheckpointTest(unittest.TestCase):
     def test_fp16_scaler_state_round_trips_through_training_checkpoint(self):
         with mock.patch("t2c_reid.precision.torch.amp.GradScaler", _FakeGradScaler):
@@ -118,12 +162,18 @@ class _FakeGradScaler:
         self.device = device
         self.enabled = enabled
         self.scale_value = 65536.0
+        self.unscaled: list[object] = []
 
     def is_enabled(self):
         return self.enabled
 
     def scale(self, loss):
         return loss
+
+    def unscale_(self, optimizer):
+        if not self.enabled:
+            return
+        self.unscaled.append(optimizer)
 
     def step(self, optimizer):
         optimizer.step()

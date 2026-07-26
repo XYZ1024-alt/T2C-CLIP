@@ -118,15 +118,32 @@ the full unittest suite, compileall, CLI help, and `git diff --check`.
 uv run train
 ```
 
-Important defaults target a 24GB single GPU: MSMT17 at `data/MSMT17_V1`,
-Stage-1 20 epochs, Stage-2 120 epochs, train micro-batch 8, gradient
-accumulation 4, effective optimizer batch 32, eval batch 16, precision `auto`,
-gradient checkpointing enabled, image size `392 x 196`, and image encoder LR
-`5e-6`. Override only the parameters needed for an experiment.
+Important defaults target a 32GB single GPU: MSMT17 at `data/MSMT17_V1`,
+Stage-1 60 epochs, Stage-2 60 epochs, train batch 64 with 4 instances per
+identity (`P=16 x K=4`), gradient accumulation 1, eval batch 128, cosine
+learning rates with a 5-epoch warmup in both stages, BNNeck feature head,
+label smoothing `0.1`, alignment weight `0.1`, gradient-norm clipping at `5.0`,
+precision `auto`, gradient checkpointing enabled, image size `392 x 196`, and
+image encoder LR `5e-6`. Override only the parameters needed for an experiment.
 
 `precision=auto` resolves to BF16 on capable CUDA devices, FP16 + GradScaler on
 other CUDA devices, and FP32 on CPU. Gradient accumulation does not enlarge the
-pairwise SigLIP or triplet-mining scope; both operate on each micro-batch.
+pairwise SigLIP or triplet-mining scope; both operate on each micro-batch, so
+`--batch-size` must be the full PK batch and accumulation stays at 1 unless
+memory forces otherwise.
+
+Two defaults are calibration-sensitive and must be re-derived, not copied, if
+the dataset or feature scale changes:
+
+- `alignment_weight`: the SigLIP anchor term carries the frozen pretrained
+  `t = exp(logit_scale) = 109.89` and `b = -15.93`, so at `cos = 0` its positive
+  anchor contributes `15.93` to the loss and a feature gradient of `t/||f_v||`.
+  The negatives are saturated and contribute almost nothing at initialization.
+- `triplet_margin`: batch-hard triplet runs on **unnormalized** `visual_raw`
+  with a euclidean metric, so a `0.3` margin is meaningful only while
+  `||visual_raw||` is small. Measure the fraction of anchors with a non-zero
+  hinge; if it is near zero the term is inert and `--triplet-metric cosine`
+  (well scaled for a `[0, 2]` distance) is the right correction.
 
 ### Feature Evaluation
 

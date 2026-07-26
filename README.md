@@ -98,7 +98,7 @@ With MSMT17 placed at `data/MSMT17_V1`, start the complete default recipe with:
 uv run train
 ```
 
-The default run uses Stage-1 for 20 epochs, Stage-2 for 120 epochs, validates
+The default run uses Stage-1 for 60 epochs, Stage-2 for 60 epochs, validates
 every 5 Stage-2 epochs, and writes to `checkpoints/msmt17-siglip2-tfc`.
 Only specify values that differ from the baseline recipe. For example:
 
@@ -111,10 +111,26 @@ uv run train \
 ```
 
 The defaults select MSMT17 at `data/MSMT17_V1`, the fixed model, `392x196`
-input, Stage-1 `20`, Stage-2 `120`, batch `8`, accumulation `4`, eval batch
-`16`, automatic precision, and gradient checkpointing. `--job-builder` remains
-available for test fixtures or external jobs but is not required for normal
-T2C-ReID training.
+input, Stage-1 `60`, Stage-2 `60`, batch `64` with `4` instances per identity,
+accumulation `1`, eval batch `128`, cosine learning rates with a `5`-epoch
+warmup in both stages, BNNeck, automatic precision, and gradient checkpointing.
+`--job-builder` remains available for test fixtures or external jobs but is not
+required for normal T2C-ReID training.
+
+### Why The Batch Is 64 And Accumulation Is 1
+
+`--batch-size` is the real triplet and SigLIP mining scope, and gradient
+accumulation does not widen it. At `--batch-size 8 --num-instances 2` the PK
+sampler yields `P=4` identities with `K=2` instances, so every batch-hard
+triplet anchor has exactly **one** positive and six negatives — the mining
+degenerates into "take the only positive". The default is now the standard ReID
+`P=16 x K=4`. MSMT17's rarest training identity has 6 images, so `K=4` drops no
+identities; on Market-1501, 15 of 751 identities have fewer than 4 images and
+are skipped by `IdentityBalancedBatchSampler`.
+
+Since `len(sampler) == len(labels) // batch_size`, a larger batch means
+proportionally fewer iterations over the same images per epoch, so epoch cost is
+roughly unchanged while GEMM efficiency improves.
 
 ### Stage 1
 
@@ -141,6 +157,14 @@ L_total = L_id + L_triplet
 
 `label_smoothing` applies only to `L_id`. The SigLIP loss keeps its native
 binary targets and native row-mean / column-sum reduction.
+
+`alignment_weight` must be read against the frozen pretrained calibration
+`t = exp(logit_scale) = 109.89`, `b = -15.93`. At `cos = 0` the positive anchor
+alone contributes `-logsigmoid(b) = 15.93` to the loss and a feature gradient of
+`t / ||f_v||`, several times the combined ID and triplet gradient, while the
+1040 negative anchors are saturated and contribute almost nothing. The default
+`0.1` puts alignment at roughly a fifth of the ReID signal; retune it whenever
+the training identity count or the feature scale changes.
 
 Camera-aware TFC maintains FP32 visual/text EMA centers for every observed
 `(person_id, camera_id)`. Camera-local centers are aggregated with equal camera
@@ -192,14 +216,22 @@ rejects every other model ID, including NaFlex variants.
 ### Memory Semantics
 
 `--batch-size` is the actual SigLIP pairwise and triplet-mining micro-batch.
-Gradient accumulation does not enlarge either mining scope:
+Gradient accumulation does not enlarge either mining scope, which is why the
+default recipe puts the whole batch in one micro-batch:
 
 ```text
-micro-batch: 8
-accumulation steps: 4
-effective optimizer batch: 32
-alignment/triplet scope: 8
+micro-batch: 64            (P=16 identities x K=4 instances)
+accumulation steps: 1
+effective optimizer batch: 64
+alignment/triplet scope: 64
 ```
+
+Approximate Stage-2 peak on the default recipe: about 13 GB static (all
+parameters in FP32, plus gradients and AdamW moments for the 428M-parameter
+vision tower, the autocast BF16 weight cache, and the TFC prototype buffers) and
+about 40 MB of activations per image with gradient checkpointing on — roughly
+16 GB at batch 64. Do not disable `--gradient-checkpointing`: without it the
+per-image activation cost is over 400 MB.
 
 `--precision auto` resolves as follows:
 
@@ -217,8 +249,8 @@ Run and data defaults:
 - `uv run train`
 - `--dataset msmt17`
 - `--data-root data/MSMT17_V1`
-- `--stage1-epochs 20`
-- `--epochs 120` (Stage-2 epochs)
+- `--stage1-epochs 60`
+- `--epochs 60` (Stage-2 epochs)
 - `--validation-interval 5`
 - `--checkpoint-dir checkpoints/msmt17-siglip2-tfc`
 - `--job-builder t2c_reid.jobs.siglip2_reid:build_training_job`
@@ -234,16 +266,16 @@ Backbone and input:
 
 Batching and memory:
 
-- `--batch-size 8`
-- `--eval-batch-size 16`
-- `--num-instances 2`
-- `--gradient-accumulation-steps 4`
-- `--num-workers 4`
+- `--batch-size 64`
+- `--eval-batch-size 128`
+- `--num-instances 4`
+- `--gradient-accumulation-steps 1`
+- `--num-workers 8`
 - `--data-backend rust|python` (default `rust`; Python is a reference backend)
 - `--prefetch-factor 2`
 - `--pin-memory / --no-pin-memory` (defaults on for CUDA)
 - `--persistent-workers / --no-persistent-workers` (defaults on with workers)
-- `--rust-data-threads 1`
+- `--rust-data-threads 2`
 - `--evaluation-backend rust|python` (default `rust`)
 - `--evaluation-chunk-size 256`
 - `--precision auto|fp32|bf16|fp16`
@@ -253,7 +285,8 @@ Optimization:
 
 - `--lr 1e-4`
 - `--image-encoder-lr 5e-6`
-- `--alignment-weight 1.0`
+- `--grad-clip-norm 5.0` (0 disables)
+- `--alignment-weight 0.1`
 - `--tfc-weight 1.0`
 - `--tfc-momentum 0.5` (highest-frequency identity)
 - `--tfc-tail-momentum 0.9` (lowest-frequency identity)
@@ -266,9 +299,11 @@ Optimization:
 - `--tfc-transfer-reg-weight 0.01`
 - `--triplet-margin 0.3`
 - `--triplet-metric euclidean|cosine`
-- `--label-smoothing 0.0`
-- `--stage2-lr-scheduler none|cosine`
-- `--stage2-warmup-epochs 0`
+- `--label-smoothing 0.1`
+- `--stage1-lr-scheduler none|cosine` (default `cosine`)
+- `--stage1-warmup-epochs 5`
+- `--stage2-lr-scheduler none|cosine` (default `cosine`)
+- `--stage2-warmup-epochs 5`
 - `--beta 0.1`
 - `--beta-warmup-epochs 0`
 
@@ -278,9 +313,12 @@ Freezing and retrieval:
 - `--freeze-image-encoder-stage2 / --no-freeze-image-encoder-stage2`
 - `--freeze-text-encoder / --no-freeze-text-encoder`
 - `--freeze-prompt-bank-stage2 / --no-freeze-prompt-bank-stage2`
-- `--reid-head linear|bnneck`
+- `--reid-head linear|bnneck` (default `bnneck`)
 - `--retrieval-mode fused|image_only`
 - `--report-rerank`
+- `--flip-tta` (off by default; averaging the mirrored view deviates from the
+  protocol of the published baselines this project compares against, so it must
+  be an explicit and disclosed choice)
 
 ## Checkpoints And Resume
 

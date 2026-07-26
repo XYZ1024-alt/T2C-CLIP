@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Callable, ContextManager
@@ -46,6 +47,27 @@ class PrecisionController:
 
     def backward(self, loss: torch.Tensor) -> None:
         self.scaler.scale(loss).backward()
+
+    def clip_grad_norm(
+        self,
+        optimizer: torch.optim.Optimizer,
+        parameters: Iterable[torch.nn.Parameter],
+        max_norm: float,
+    ) -> torch.Tensor | None:
+        """Unscale FP16 gradients in place, then clip the global gradient norm.
+
+        ``GradScaler.unscale_`` returns immediately while the scaler is
+        disabled, so the BF16 and FP32 paths reach ``clip_grad_norm_`` with raw
+        gradients. A later :meth:`step` sees the optimizer already unscaled and
+        skips its own unscale, which is the documented AMP ordering.
+
+        Returns the pre-clip norm, or ``None`` when clipping is disabled.
+        """
+
+        if max_norm <= 0.0:
+            return None
+        self.scaler.unscale_(optimizer)
+        return torch.nn.utils.clip_grad_norm_(parameters, max_norm)
 
     def step(self, optimizer: torch.optim.Optimizer) -> bool:
         """Apply one optimizer update and report whether FP16 overflow skipped it."""
