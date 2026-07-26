@@ -108,10 +108,13 @@ def batch_hard_triplet_loss(
 ) -> torch.Tensor:
     _validate_triplet_inputs(features, labels)
     distances = _pairwise_distances(features, metric)
-    losses = _valid_anchor_losses(distances, labels, margin)
-    if not losses:
+    losses, valid = _anchor_losses(distances, labels, margin)
+    # One host sync per call to honour the documented error. The per-anchor
+    # loop this replaced synced once per sample, which dominated step time at
+    # ReID-sized PK batches.
+    if not bool(torch.any(valid)):
         raise ValueError("batch_hard_triplet_loss requires at least one valid positive and negative")
-    return torch.stack(losses).mean()
+    return losses[valid].mean()
 
 
 def _pairwise_distances(features: torch.Tensor, metric: str) -> torch.Tensor:
@@ -124,17 +127,32 @@ def _pairwise_distances(features: torch.Tensor, metric: str) -> torch.Tensor:
     raise ValueError(f"unsupported triplet metric: {metric!r}")
 
 
-def _valid_anchor_losses(distances: torch.Tensor, labels: torch.Tensor, margin: float) -> list[torch.Tensor]:
-    losses: list[torch.Tensor] = []
-    for index in range(labels.shape[0]):
-        positive_mask = labels == labels[index]
-        negative_mask = labels != labels[index]
-        positive_mask[index] = False
-        if bool(torch.any(positive_mask)) and bool(torch.any(negative_mask)):
-            hardest_positive = torch.max(distances[index][positive_mask])
-            hardest_negative = torch.min(distances[index][negative_mask])
-            losses.append(F.relu(hardest_positive - hardest_negative + margin))
-    return losses
+def _anchor_losses(
+    distances: torch.Tensor,
+    labels: torch.Tensor,
+    margin: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Batch-hard loss per anchor, plus the mask of anchors that have both a positive and a negative.
+
+    Rows without a valid positive or negative still produce a finite entry, so
+    the caller must drop them with the returned mask rather than trusting the
+    value. Sentinels are finite (not +/-inf) so an all-masked row cannot turn
+    into a NaN in the backward pass.
+    """
+
+    same_identity = labels.unsqueeze(0) == labels.unsqueeze(1)
+    self_mask = torch.eye(labels.shape[0], dtype=torch.bool, device=labels.device)
+    positive_mask = same_identity & ~self_mask
+    negative_mask = ~same_identity
+    valid = torch.any(positive_mask, dim=1) & torch.any(negative_mask, dim=1)
+
+    # Quarter of the dtype maximum: far beyond any real distance, yet small
+    # enough that ``hardest_positive - hardest_negative`` cannot overflow to
+    # -inf on an invalid row even in FP16.
+    unreachable = torch.finfo(distances.dtype).max / 4.0
+    hardest_positive = distances.masked_fill(~positive_mask, -unreachable).max(dim=1).values
+    hardest_negative = distances.masked_fill(~negative_mask, unreachable).min(dim=1).values
+    return F.relu(hardest_positive - hardest_negative + margin), valid
 
 
 def _validate_person_ids(person_ids: torch.Tensor, batch_size: int) -> None:

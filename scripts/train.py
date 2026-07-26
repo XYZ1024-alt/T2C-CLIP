@@ -49,31 +49,39 @@ from t2c_reid.retrieval import SUPPORTED_RETRIEVAL_MODES
 from t2c_reid.siglip2_backbone import SIGLIP2_MODEL_ID
 from t2c_reid.transforms import DEFAULT_IMAGE_SIZE
 
-DEFAULT_TOTAL_EPOCHS = 120
+DEFAULT_TOTAL_EPOCHS = 60
 DEFAULT_VALIDATION_INTERVAL = 5
-DEFAULT_STAGE1_EPOCHS = 20
+DEFAULT_STAGE1_EPOCHS = 60
 DEFAULT_JOB_BUILDER = "t2c_reid.jobs.siglip2_reid:build_training_job"
 DEFAULT_DATASET = "msmt17"
 DEFAULT_DATA_ROOT = Path("data/MSMT17_V1")
 DEFAULT_CHECKPOINT_DIR = Path("checkpoints/msmt17-siglip2-tfc")
 DEFAULT_RUN_NAME = "msmt17-siglip2-camera-tfc"
 DEFAULT_SIGLIP2_MODEL_NAME = SIGLIP2_MODEL_ID
-DEFAULT_BATCH_SIZE = 8
-DEFAULT_EVAL_BATCH_SIZE = 16
-DEFAULT_GRADIENT_ACCUMULATION_STEPS = 4
+# P=16 identities x K=4 instances. batch-size is the real triplet/SigLIP mining
+# scope; gradient accumulation does not widen it, so this must be the ReID-sized
+# PK batch rather than a memory-driven micro-batch.
+DEFAULT_BATCH_SIZE = 64
+DEFAULT_EVAL_BATCH_SIZE = 128
+DEFAULT_GRADIENT_ACCUMULATION_STEPS = 1
 DEFAULT_PRECISION = "auto"
-DEFAULT_NUM_INSTANCES = 2
-DEFAULT_NUM_WORKERS = 4
+DEFAULT_NUM_INSTANCES = 4
+DEFAULT_NUM_WORKERS = 8
 DEFAULT_PREFETCH_FACTOR = 2
-DEFAULT_RUST_DATA_THREADS = 1
+DEFAULT_RUST_DATA_THREADS = 2
 DEFAULT_DATA_BACKEND = RUST_DATA_BACKEND
 DEFAULT_EVALUATION_BACKEND = RUST_EVALUATION_BACKEND
 DEFAULT_EVALUATION_CHUNK_SIZE = DEFAULT_QUERY_CHUNK_SIZE
 DEFAULT_LEARNING_RATE = 1e-4
 DEFAULT_IMAGE_ENCODER_LR = 5e-6
 DEFAULT_BETA_WARMUP_EPOCHS = 0
-DEFAULT_STAGE2_LR_SCHEDULER = "none"
-DEFAULT_STAGE2_WARMUP_EPOCHS = 0
+DEFAULT_STAGE1_LR_SCHEDULER = "cosine"
+DEFAULT_STAGE1_WARMUP_EPOCHS = 5
+DEFAULT_STAGE2_LR_SCHEDULER = "cosine"
+DEFAULT_STAGE2_WARMUP_EPOCHS = 5
+# Insurance against a loss spike killing a multi-hour run. Large enough that a
+# healthy step is never rescaled.
+DEFAULT_GRAD_CLIP_NORM = 5.0
 DEFAULT_SANITY_GATE_EPOCHS = 0
 DEFAULT_SANITY_GATE_FACTOR = 1.5
 DEFAULT_DEVICE = "cuda"
@@ -91,8 +99,16 @@ DEFAULT_TFC_TRANSFER_REG_WEIGHT = 0.01
 DEFAULT_TRIPLET_MARGIN = 0.3
 DEFAULT_TRIPLET_METRIC = "euclidean"
 DEFAULT_TFC_WEIGHT = 1.0
-DEFAULT_ALIGNMENT_WEIGHT = 1.0
+# The SigLIP anchor term carries the frozen pretrained calibration
+# t = exp(logit_scale) = 109.89, b = -15.93, so at cos = 0 its positive anchor
+# contributes a loss of -logsigmoid(b) = 15.93 and a feature gradient of
+# t / ||f_v||, several times the combined ID + triplet gradient. 0.1 puts it at
+# roughly a fifth of the ReID signal; sweep {0.5, 0.1, 0.02} against the
+# measured ratio.
+DEFAULT_ALIGNMENT_WEIGHT = 0.1
 DEFAULT_ID_LOGIT_SCALE = 1.0
+DEFAULT_LABEL_SMOOTHING = 0.1
+DEFAULT_REID_HEAD = "bnneck"
 DEFAULT_RETRIEVAL_MODE = "fused"
 SUPPORTED_DATASETS = ("market1501", "msmt17")
 
@@ -305,8 +321,11 @@ def _add_project_training_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--device", default=DEFAULT_DEVICE)
     parser.add_argument("--beta", type=float, default=DEFAULT_BETA)
     parser.add_argument("--beta-warmup-epochs", type=int, default=DEFAULT_BETA_WARMUP_EPOCHS)
+    parser.add_argument("--stage1-lr-scheduler", choices=("none", "cosine"), default=DEFAULT_STAGE1_LR_SCHEDULER)
+    parser.add_argument("--stage1-warmup-epochs", type=int, default=DEFAULT_STAGE1_WARMUP_EPOCHS)
     parser.add_argument("--stage2-lr-scheduler", choices=("none", "cosine"), default=DEFAULT_STAGE2_LR_SCHEDULER)
     parser.add_argument("--stage2-warmup-epochs", type=int, default=DEFAULT_STAGE2_WARMUP_EPOCHS)
+    parser.add_argument("--grad-clip-norm", type=float, default=DEFAULT_GRAD_CLIP_NORM)
     parser.add_argument("--context-length", type=int, default=DEFAULT_CONTEXT_LENGTH)
     parser.add_argument("--tfc-momentum", type=float, default=DEFAULT_TFC_MOMENTUM)
     parser.add_argument("--tfc-tail-momentum", type=float, default=DEFAULT_TFC_TAIL_MOMENTUM)
@@ -328,10 +347,14 @@ def _add_project_training_args(parser: argparse.ArgumentParser) -> None:
         default=True,
     )
     parser.add_argument("--id-logit-scale", type=float, default=DEFAULT_ID_LOGIT_SCALE)
-    parser.add_argument("--label-smoothing", type=float, default=0.0)
-    parser.add_argument("--reid-head", choices=("linear", "bnneck"), default="linear")
+    parser.add_argument("--label-smoothing", type=float, default=DEFAULT_LABEL_SMOOTHING)
+    parser.add_argument("--reid-head", choices=("linear", "bnneck"), default=DEFAULT_REID_HEAD)
     parser.add_argument("--retrieval-mode", choices=SUPPORTED_RETRIEVAL_MODES, default=DEFAULT_RETRIEVAL_MODE)
     parser.add_argument("--report-rerank", action="store_true")
+    # Off by default: averaging the flipped view is a protocol deviation from
+    # the published Image-to-Image baselines this project compares against, so
+    # it must be an explicit, disclosed choice rather than a silent default.
+    parser.add_argument("--flip-tta", action="store_true")
     parser.add_argument(
         "--gradient-checkpointing",
         action=argparse.BooleanOptionalAction,

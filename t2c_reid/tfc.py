@@ -361,40 +361,52 @@ class CameraAwareTFCBank(torch.nn.Module):
             beta,
         )
         transfer_log_probabilities = self.camera_transfer_log_probabilities()
-        losses: list[torch.Tensor] = []
-        weights: list[torch.Tensor] = []
-        for index in range(retrieval.shape[0]):
-            person_id = person_ids[index]
-            camera_id = camera_ids[index]
-            positives = (pair_person_ids == person_id) & (pair_camera_ids != camera_id)
-            negatives = pair_person_ids != person_id
-            if not bool(torch.any(positives)) or not bool(torch.any(negatives)):
-                continue
-            positive_cameras = pair_camera_ids[positives]
-            positive_log_weights = transfer_log_probabilities[camera_id, positive_cameras]
-            if not bool(torch.all(torch.isfinite(positive_log_weights))):
-                continue
-            positive_log_weights = positive_log_weights - torch.logsumexp(
-                positive_log_weights, dim=0
-            )
-            candidate_mask = positives | negatives
-            logits = (retrieval[index] @ prototypes.T) / float(temperature)
-            numerator = torch.logsumexp(
-                logits[positives] + positive_log_weights, dim=0
-            )
-            denominator = torch.logsumexp(logits[candidate_mask], dim=0)
-            losses.append(denominator - numerator)
-            weights.append(sample_weights[index])
-        if not losses:
+
+        # Membership masks for the whole micro-batch at once: [B, num_prototypes].
+        # These are integer comparisons outside the autograd graph.
+        same_identity = pair_person_ids.unsqueeze(0) == person_ids.unsqueeze(1)
+        positive_mask = same_identity & (
+            pair_camera_ids.unsqueeze(0) != camera_ids.unsqueeze(1)
+        )
+        negative_mask = ~same_identity
+        # Directed transfer weight of every candidate camera as seen from this
+        # sample's own camera. Keeps the gradient path into camera_transfer_logits.
+        log_weights = transfer_log_probabilities[camera_ids][:, pair_camera_ids]
+
+        # A sample contributes only with at least one cross-camera positive, at
+        # least one negative, and finite transfer weights on all its positives.
+        usable = (
+            torch.any(positive_mask, dim=1)
+            & torch.any(negative_mask, dim=1)
+            & torch.all(torch.isfinite(log_weights) | ~positive_mask, dim=1)
+        )
+        # Select before scoring so degenerate rows never enter an autograd op;
+        # -inf rows would otherwise produce NaN gradients even after masking.
+        # torch.nonzero costs one host sync per batch, replacing the per-sample
+        # syncs this loop used to pay.
+        rows = torch.nonzero(usable, as_tuple=False).squeeze(1)
+        if rows.numel() == 0:
             return zero, zero.detach()
-        loss_tensor = torch.stack(losses)
-        weight_tensor = torch.stack(weights)
+
+        positive_mask = positive_mask[rows]
+        candidate_mask = positive_mask | negative_mask[rows]
+        logits = (retrieval[rows] @ prototypes.T) / float(temperature)
+        log_weights = log_weights[rows]
+        log_weights = log_weights - torch.logsumexp(
+            log_weights.masked_fill(~positive_mask, -torch.inf), dim=1, keepdim=True
+        )
+        numerator = torch.logsumexp(
+            (logits + log_weights).masked_fill(~positive_mask, -torch.inf), dim=1
+        )
+        denominator = torch.logsumexp(
+            logits.masked_fill(~candidate_mask, -torch.inf), dim=1
+        )
         coverage = torch.tensor(
-            len(losses) / retrieval.shape[0],
+            rows.numel() / retrieval.shape[0],
             dtype=torch.float32,
             device=retrieval.device,
         )
-        return _weighted_mean(loss_tensor, weight_tensor), coverage
+        return _weighted_mean(denominator - numerator, sample_weights[rows]), coverage
 
     @staticmethod
     def _update_local_center(

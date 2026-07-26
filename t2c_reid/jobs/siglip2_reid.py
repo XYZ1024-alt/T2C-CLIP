@@ -194,11 +194,15 @@ class Siglip2ReIDJobConfig:
     retrieval_mode: str = "fused"
     beta_warmup_epochs: int = 0
     report_rerank: bool = False
+    stage1_lr_scheduler: str = "none"
+    stage1_warmup_epochs: int = 0
     stage2_lr_scheduler: str = "none"
     stage2_warmup_epochs: int = 0
     num_instances: int = DEFAULT_INSTANCES_PER_IDENTITY
     sie_coe: float = 0.0
     stage1_feature_cache: bool = True
+    grad_clip_norm: float = 0.0
+    flip_tta: bool = False
 
 
 @dataclass(frozen=True)
@@ -326,6 +330,7 @@ class StageTrainingRuntime:
     feature_cache: Stage1FeatureCache | None = None
     precision: PrecisionController | None = None
     gradient_accumulation_steps: int = 1
+    grad_clip_norm: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -940,12 +945,22 @@ def _job_config_from_args(args: Any) -> Siglip2ReIDJobConfig:
         retrieval_mode=require_retrieval_mode(str(getattr(args, "retrieval_mode", "fused"))),
         beta_warmup_epochs=int(getattr(args, "beta_warmup_epochs", 0)),
         report_rerank=bool(getattr(args, "report_rerank", False)),
+        stage1_lr_scheduler=str(getattr(args, "stage1_lr_scheduler", "none")),
+        stage1_warmup_epochs=int(getattr(args, "stage1_warmup_epochs", 0)),
         stage2_lr_scheduler=str(getattr(args, "stage2_lr_scheduler", "none")),
         stage2_warmup_epochs=int(getattr(args, "stage2_warmup_epochs", 0)),
         num_instances=int(getattr(args, "num_instances", DEFAULT_INSTANCES_PER_IDENTITY)),
         sie_coe=float(getattr(args, "sie_coe", 0.0)),
         stage1_feature_cache=stage1_feature_cache,
+        grad_clip_norm=_validated_grad_clip_norm(float(getattr(args, "grad_clip_norm", 0.0))),
+        flip_tta=bool(getattr(args, "flip_tta", False)),
     )
+
+
+def _validated_grad_clip_norm(value: float) -> float:
+    if not math.isfinite(value) or value < 0.0:
+        raise ValueError("--grad-clip-norm must be finite and non-negative (0 disables clipping)")
+    return value
 
 
 def _validate_tfc_config(
@@ -1001,9 +1016,11 @@ def _build_runtimes(
         model=model, loaders=loaders, optimizer=optimizer_stage1, stage=STAGE1,
         loss_config=_stage1_loss_config(siglip2_model), device=config.device,
         freeze_config=config,
+        lr_scheduler=_build_stage1_lr_scheduler(optimizer_stage1, config),
         feature_cache=stage1_feature_cache,
         precision=precision,
         gradient_accumulation_steps=config.gradient_accumulation_steps,
+        grad_clip_norm=config.grad_clip_norm,
     )
     _apply_freezing(model, config, stage=STAGE2)
     optimizer_stage2 = _build_optimizer(model, config)
@@ -1029,6 +1046,7 @@ def _build_runtimes(
         anchor_provider=stage2_anchor_provider,
         precision=precision,
         gradient_accumulation_steps=config.gradient_accumulation_steps,
+        grad_clip_norm=config.grad_clip_norm,
     )
     return stage1_runtime, stage2_runtime, optimizer_stage1, optimizer_stage2, stage2_beta_schedule
 
@@ -1176,19 +1194,54 @@ def _stage2_loss_config(
     )
 
 
+def _build_stage1_lr_scheduler(
+    optimizer: torch.optim.Optimizer,
+    config: Siglip2ReIDJobConfig,
+) -> "StageLRScheduler | None":
+    """Stage-1 shares :class:`StageLRScheduler`; Stage-1 epochs are already 1-based."""
+
+    return _build_stage_lr_scheduler(
+        optimizer,
+        name=config.stage1_lr_scheduler,
+        option="stage1_lr_scheduler",
+        total_epochs=config.stage1_epochs,
+        warmup_epochs=config.stage1_warmup_epochs,
+        first_epoch=1,
+    )
+
+
 def _build_stage2_lr_scheduler(
     optimizer: torch.optim.Optimizer,
     config: Siglip2ReIDJobConfig,
 ) -> "StageLRScheduler | None":
-    if config.stage2_lr_scheduler == "none":
-        return None
-    if config.stage2_lr_scheduler != "cosine":
-        raise ValueError(f"unsupported stage2_lr_scheduler: {config.stage2_lr_scheduler!r}")
-    return StageLRScheduler(
-        base_lrs=tuple(float(group["lr"]) for group in optimizer.param_groups),
+    return _build_stage_lr_scheduler(
+        optimizer,
+        name=config.stage2_lr_scheduler,
+        option="stage2_lr_scheduler",
         total_epochs=config.stage2_epochs,
         warmup_epochs=config.stage2_warmup_epochs,
         first_epoch=config.stage2_first_epoch,
+    )
+
+
+def _build_stage_lr_scheduler(
+    optimizer: torch.optim.Optimizer,
+    *,
+    name: str,
+    option: str,
+    total_epochs: int,
+    warmup_epochs: int,
+    first_epoch: int,
+) -> "StageLRScheduler | None":
+    if name == "none":
+        return None
+    if name != "cosine":
+        raise ValueError(f"unsupported {option}: {name!r}")
+    return StageLRScheduler(
+        base_lrs=tuple(float(group["lr"]) for group in optimizer.param_groups),
+        total_epochs=total_epochs,
+        warmup_epochs=warmup_epochs,
+        first_epoch=first_epoch,
     )
 
 
@@ -1599,6 +1652,11 @@ def _train_one_epoch(runtime: StageTrainingRuntime):
                         totals[name] += values[name]
                         window_totals[name] += values[name]
                     micro_batch_count += 1
+                runtime.precision.clip_grad_norm(
+                    runtime.optimizer,
+                    runtime.model.parameters(),
+                    runtime.grad_clip_norm,
+                )
                 update_succeeded = runtime.precision.step(runtime.optimizer)
             except Exception:
                 if tfc_transaction:
@@ -1665,6 +1723,7 @@ def _validate(runtime: ValidationRuntime):
             runtime.device,
             runtime.retrieval_mode,
             runtime.precision,
+            flip_tta=runtime.model_config.flip_tta,
         )
         gallery = _extract_features(
             runtime.model,
@@ -1672,6 +1731,7 @@ def _validate(runtime: ValidationRuntime):
             runtime.device,
             runtime.retrieval_mode,
             runtime.precision,
+            flip_tta=runtime.model_config.flip_tta,
         )
         metrics = evaluate_reid(
             query.features,
@@ -1722,6 +1782,7 @@ def _extract_features(
     device: torch.device,
     retrieval_mode: str,
     precision: PrecisionController | None = None,
+    flip_tta: bool = False,
 ) -> FeatureSet:
     if precision is None:
         precision = PrecisionController(
@@ -1735,6 +1796,14 @@ def _extract_features(
             images = batch.images.to(device, non_blocking=True)
             cameras = batch.camera_ids.to(device, non_blocking=True)
             features = model.encode_retrieval(images, cameras, retrieval_mode=retrieval_mode)
+            if flip_tta:
+                # Both views already come back L2-normalized, so summing them
+                # and renormalizing averages the two directions. Doubles eval
+                # cost; training is untouched.
+                flipped = model.encode_retrieval(
+                    torch.flip(images, dims=(3,)), cameras, retrieval_mode=retrieval_mode
+                )
+                features = l2_normalize((features.float() + flipped.float()))
             feature_parts.append(features.float().cpu())
             person_ids.extend(batch.original_person_ids)
             camera_ids.extend(batch.original_camera_ids)

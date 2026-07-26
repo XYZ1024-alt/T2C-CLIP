@@ -243,6 +243,12 @@ Y_iy = +1, y == person_id[i]
 loss 采用 SigLIP 原生 reduction：按 anchor 维求和，再按 image row 求均值。其数值会随
 训练身份数变化，这是有意行为，`alignment_weight` 需要通过真实实验调优。
 
+标定：冻结的预训练值为 `t = exp(logit_scale) = 109.89`、`b = -15.93`。`cos = 0` 时
+正 anchor 单独贡献 `-logsigmoid(b) = 15.93`，对特征的梯度量级为 `t / ||f_v||`，是
+`L_id + L_triplet` 合计梯度的数倍；1040 个负 anchor 因 bias 极负而饱和，初始几乎不
+贡献。默认 `alignment_weight = 0.1` 使该项约占 ReID 信号的五分之一。reduction 本身
+不改，量纲只通过 `alignment_weight` 调节。
+
 Stage-2 总损失：
 
 ```text
@@ -326,6 +332,10 @@ Stage-2 prompt bank: trainable
 logit_scale / logit_bias: frozen
 ```
 
+两个 stage 都使用同一个 `StageLRScheduler`：线性 warmup 后 cosine 衰减，按 epoch 缩放
+每个 param group 的 base lr，保持 backbone / new 的比例。默认两阶段都是 `cosine` +
+5 epoch warmup。Stage-1 的 stage epoch 从 1 起算，Stage-2 从 `stage2_first_epoch` 起算。
+
 文本身份 anchor：
 
 - prompt bank 和 text tower 都冻结：全 Stage-2 只编码一次。
@@ -348,16 +358,28 @@ AdamW 参数分组：
 默认：
 
 ```text
-micro batch = 8
-gradient accumulation = 4
-effective optimizer batch = 32
-eval batch = 16
+micro batch = 64            (P = 16 identities x K = 4 instances)
+gradient accumulation = 1
+effective optimizer batch = 64
+eval batch = 128
 gradient checkpointing = on
 precision = auto
+grad clip norm = 5.0
 ```
 
-`batch-size` 是真实 pairwise / triplet mining 范围。累积 4 次不会把 SigLIP matrix 或
-hard mining 扩展到 32。
+`batch-size` 是真实 pairwise / triplet mining 范围，梯度累积不会扩展它。因此默认
+recipe 把整个 PK batch 放进单个 micro-batch，累积固定为 1。`batch-size 8` 且
+`num-instances 2` 时每个 batch-hard anchor 只有 1 个正样本和 6 个负样本，挖掘退化，
+这是必须避免的配置。MSMT17 最少的训练身份有 6 张图，`K=4` 不丢身份；Market-1501 有
+15/751 个身份不足 4 张，会被 `IdentityBalancedBatchSampler` 跳过。
+
+Stage-2 显存量级（默认 recipe）：静态约 13GB（全部参数 FP32、视觉塔的梯度与 AdamW
+双状态、autocast BF16 权重缓存、TFC prototype buffer），梯度检查点下每张图激活约
+40MB，batch 64 合计约 16GB。禁用 gradient checkpointing 会把每图激活推到 400MB 以上。
+
+梯度裁剪在 optimizer step 之前执行：FP16 路径先 `GradScaler.unscale_`，BF16/FP32
+路径该调用是 no-op，两条路径都对未缩放梯度做 `clip_grad_norm_`。`grad_clip_norm = 0`
+关闭裁剪。
 
 precision 解析：
 
@@ -394,6 +416,10 @@ Stage-1 cache、anchor/camera cache、训练和验证使用同一 precision cont
 
 标准协议排除同身份同 camera gallery。主指标始终是无 rerank mAP/CMC；rerank 只能作为
 额外报告，不能覆盖主指标。
+
+`flip_tta` 默认关闭。开启时对每张 query/gallery 图像额外前向一次水平镜像视图，把两个
+已归一化特征相加后重新归一化，评估成本翻倍。这相对本项目主结果表所对比的公开
+Image-to-Image 基线是协议偏移，必须显式开启并在结果中声明，不能作为默认主指标。
 
 默认评估 backend 为 Rust：Torch 保留 L2 normalization 与矩阵乘法，按 query chunk
 生成完整 gallery 分数；Rust 对每个 query 执行确定性排序、同身份同 camera 过滤和

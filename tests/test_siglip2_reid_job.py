@@ -318,6 +318,46 @@ class Siglip2ReIDJobTest(unittest.TestCase):
         self.assertEqual(features.camera_ids, (1, 2))
         self.assertEqual(tuple(features.features.shape), (2, 4))
 
+    def test_flip_tta_is_off_by_default_and_runs_one_forward_per_batch(self):
+        model = RetrievalModeRecorder()
+        batch = _asymmetric_batch()
+
+        _extract_features(model, [batch], torch.device("cpu"), IMAGE_ONLY_RETRIEVAL)
+
+        self.assertEqual(len(model.retrieval_modes), 1)
+
+    def test_flip_tta_averages_the_image_and_its_mirror(self):
+        model = RetrievalModeRecorder()
+        batch = _asymmetric_batch()
+
+        _extract_features(
+            model, [batch], torch.device("cpu"), IMAGE_ONLY_RETRIEVAL, flip_tta=True
+        )
+
+        self.assertEqual(len(model.seen_images), 2)
+        original, flipped = model.seen_images
+        self.assertTrue(torch.equal(flipped, torch.flip(original, dims=(3,))))
+
+    def test_flip_tta_feature_is_the_renormalized_mean_of_both_views(self):
+        model = DirectionalRetrievalStub()
+        batch = _asymmetric_batch()
+
+        plain = _extract_features(
+            model, [batch], torch.device("cpu"), IMAGE_ONLY_RETRIEVAL
+        )
+        averaged = _extract_features(
+            model, [batch], torch.device("cpu"), IMAGE_ONLY_RETRIEVAL, flip_tta=True
+        )
+
+        # A left-right asymmetric image and its mirror give opposite directions,
+        # so the flip average must differ from either view and stay normalized.
+        self.assertFalse(torch.allclose(plain.features, averaged.features))
+        self.assertTrue(
+            torch.allclose(
+                averaged.features.norm(dim=1), torch.ones(averaged.features.shape[0]), atol=1e-6
+            )
+        )
+
     def test_validation_reports_rerank_metrics_when_requested(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
@@ -398,6 +438,46 @@ class Siglip2ReIDJobTest(unittest.TestCase):
 
         siglip2_model = job.stage1.model.retrieval_model.image_encoder.siglip2_model
         self.assertEqual(_trainable_parameter_count(siglip2_model.vision_model), 0)
+
+    def test_stage1_learning_rate_follows_its_own_warmup_and_cosine(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            args = _training_args(root)
+            args.stage1_epochs = 4
+            args.stage1_lr_scheduler = "cosine"
+            args.stage1_warmup_epochs = 2
+            job = build_training_job(args, siglip2_loader=_load_fake_siglip2)
+            reporter = TrainBatchReporterRecorder()
+
+            observed = []
+            for epoch in (1, 2, 3, 4):
+                job.stage1.train_one_epoch(epoch, reporter)
+                observed.append(job.stage1.optimizer.param_groups[0]["lr"])
+
+        base = args.lr
+        # Stage-1 epochs are 1-based, so epoch 1 is the first warmup step and
+        # the cosine restarts from scale 1.0 on the first post-warmup epoch.
+        self.assertAlmostEqual(observed[0], base * 0.5)
+        self.assertAlmostEqual(observed[1], base)
+        self.assertAlmostEqual(observed[2], base)
+        self.assertAlmostEqual(observed[3], base * 0.5)
+
+    def test_stage1_scheduler_is_absent_when_not_requested(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = _build_market_fixture(Path(tmp))
+            args = _training_args(root)
+            args.stage1_epochs = 2
+            args.stage1_lr_scheduler = "none"
+            job = build_training_job(args, siglip2_loader=_load_fake_siglip2)
+            reporter = TrainBatchReporterRecorder()
+
+            job.stage1.train_one_epoch(1, reporter)
+            first = job.stage1.optimizer.param_groups[0]["lr"]
+            job.stage1.train_one_epoch(2, reporter)
+            second = job.stage1.optimizer.param_groups[0]["lr"]
+
+        self.assertEqual(first, args.lr)
+        self.assertEqual(second, args.lr)
 
     def test_no_freeze_image_encoder_stage2_works_without_stage1_epochs(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1447,6 +1527,7 @@ class RetrievalModeRecorder(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.retrieval_modes: list[str] = []
+        self.seen_images: list[torch.Tensor] = []
 
     def encode_retrieval(
         self,
@@ -1455,7 +1536,45 @@ class RetrievalModeRecorder(torch.nn.Module):
         retrieval_mode: str = "fused",
     ) -> torch.Tensor:
         self.retrieval_modes.append(retrieval_mode)
+        self.seen_images.append(images.clone())
         return torch.ones(images.shape[0], 4)
+
+
+class DirectionalRetrievalStub(torch.nn.Module):
+    """Returns a unit feature whose direction depends on which half is brighter.
+
+    Lets a flip-TTA test observe that the two views were actually averaged
+    rather than one of them being silently dropped.
+    """
+
+    def forward(self, images: torch.Tensor) -> torch.Tensor:  # pragma: no cover
+        raise NotImplementedError
+
+    def encode_retrieval(
+        self,
+        images: torch.Tensor,
+        camera_ids: torch.Tensor,
+        retrieval_mode: str = "fused",
+    ) -> torch.Tensor:
+        width = images.shape[3]
+        left = images[:, :, :, : width // 2].mean(dim=(1, 2, 3))
+        right = images[:, :, :, width // 2 :].mean(dim=(1, 2, 3))
+        features = torch.stack([left, right], dim=1)
+        return torch.nn.functional.normalize(features, dim=1)
+
+
+def _asymmetric_batch() -> ReIDImageBatch:
+    """A batch whose images differ left-to-right, so a mirror is observable."""
+
+    images = torch.zeros(2, 3, 2, 4)
+    images[:, :, :, :2] = 1.0
+    return ReIDImageBatch(
+        images=images,
+        person_ids=torch.tensor([0, 1]),
+        camera_ids=torch.tensor([1, 2]),
+        original_person_ids=(10, 20),
+        original_camera_ids=(1, 2),
+    )
 
 
 def _training_args(root: Path) -> Namespace:

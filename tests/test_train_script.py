@@ -226,8 +226,8 @@ class TrainScriptTest(unittest.TestCase):
         )
         self.assertEqual(args.dataset, "msmt17")
         self.assertEqual(args.data_root, Path("data/MSMT17_V1"))
-        self.assertEqual(args.stage1_epochs, 20)
-        self.assertEqual(args.epochs, 120)
+        self.assertEqual(args.stage1_epochs, 60)
+        self.assertEqual(args.epochs, 60)
         self.assertEqual(
             args.checkpoint_dir,
             Path("checkpoints/msmt17-siglip2-tfc"),
@@ -276,22 +276,22 @@ class TrainScriptTest(unittest.TestCase):
             "google/siglip2-so400m-patch14-384",
         )
         self.assertEqual(RECORDED_ARGS.batch_size, 8)
-        self.assertEqual(RECORDED_ARGS.eval_batch_size, 16)
-        self.assertEqual(RECORDED_ARGS.gradient_accumulation_steps, 4)
+        self.assertEqual(RECORDED_ARGS.eval_batch_size, 128)
+        self.assertEqual(RECORDED_ARGS.gradient_accumulation_steps, 1)
         self.assertEqual(RECORDED_ARGS.precision, "auto")
         self.assertEqual(RECORDED_ARGS.num_workers, 2)
         self.assertEqual(RECORDED_ARGS.data_backend, "rust")
         self.assertEqual(RECORDED_ARGS.prefetch_factor, 2)
         self.assertIsNone(RECORDED_ARGS.pin_memory)
         self.assertIsNone(RECORDED_ARGS.persistent_workers)
-        self.assertEqual(RECORDED_ARGS.rust_data_threads, 1)
+        self.assertEqual(RECORDED_ARGS.rust_data_threads, 2)
         self.assertEqual(RECORDED_ARGS.evaluation_backend, "rust")
         self.assertEqual(RECORDED_ARGS.evaluation_chunk_size, 256)
         self.assertEqual(RECORDED_ARGS.lr, 0.001)
         self.assertEqual(RECORDED_ARGS.triplet_metric, "euclidean")
         self.assertEqual(RECORDED_ARGS.device, "cpu")
 
-    def test_default_hyperparameters_follow_siglip2_24gb_recipe(self):
+    def test_default_hyperparameters_follow_siglip2_32gb_recipe(self):
         global RECORDED_ARGS
         RECORDED_ARGS = None
         with tempfile.TemporaryDirectory() as tmp:
@@ -307,10 +307,24 @@ class TrainScriptTest(unittest.TestCase):
             )
 
         self.assertEqual(RECORDED_ARGS.image_encoder_lr, 5e-6)
-        self.assertEqual(RECORDED_ARGS.stage1_epochs, 20)
+        self.assertEqual(RECORDED_ARGS.stage1_epochs, 60)
         self.assertEqual(RECORDED_ARGS.dataset, "msmt17")
         self.assertEqual(RECORDED_ARGS.data_root, Path("data/MSMT17_V1"))
-        self.assertEqual(RECORDED_ARGS.alignment_weight, 1.0)
+        # P=16 x K=4: batch-size is the real triplet/SigLIP mining scope and
+        # gradient accumulation does not widen it, so accumulation is 1.
+        self.assertEqual(RECORDED_ARGS.batch_size, 64)
+        self.assertEqual(RECORDED_ARGS.num_instances, 4)
+        self.assertEqual(RECORDED_ARGS.gradient_accumulation_steps, 1)
+        self.assertEqual(RECORDED_ARGS.stage1_lr_scheduler, "cosine")
+        self.assertEqual(RECORDED_ARGS.stage1_warmup_epochs, 5)
+        self.assertEqual(RECORDED_ARGS.stage2_lr_scheduler, "cosine")
+        self.assertEqual(RECORDED_ARGS.stage2_warmup_epochs, 5)
+        self.assertEqual(RECORDED_ARGS.reid_head, "bnneck")
+        self.assertEqual(RECORDED_ARGS.label_smoothing, 0.1)
+        self.assertEqual(RECORDED_ARGS.grad_clip_norm, 5.0)
+        self.assertFalse(RECORDED_ARGS.flip_tta)
+        # Balanced against the frozen SigLIP calibration t=109.89, b=-15.93.
+        self.assertEqual(RECORDED_ARGS.alignment_weight, 0.1)
         self.assertEqual(RECORDED_ARGS.tfc_tail_momentum, 0.9)
         self.assertEqual(RECORDED_ARGS.tfc_class_balance_beta, 0.9999)
         self.assertEqual(RECORDED_ARGS.tfc_local_weight, 1.0)
