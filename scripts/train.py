@@ -10,111 +10,41 @@ Stage-2 metrics.
 
 from __future__ import annotations
 
-import argparse
-from collections.abc import Callable, Iterable, Mapping
+import importlib
+import random
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-import importlib
 from pathlib import Path
-import random
-from typing import Any, Sequence
+from typing import Any
 
+import hydra
 import torch
+from omegaconf import DictConfig
 
-from t2c_reid.evaluation import (
-    DEFAULT_QUERY_CHUNK_SIZE,
-    ReIDMetrics,
-    RUST_EVALUATION_BACKEND,
-    SUPPORTED_EVALUATION_BACKENDS,
+from t2c_reid.configuration import (
+    TrainingConfig,
+    compose_training_config,
+    training_config_from_dict_config,
 )
-from t2c_reid.datasets import RUST_DATA_BACKEND, SUPPORTED_DATA_BACKENDS
+from t2c_reid.evaluation import ReIDMetrics
 from t2c_reid.loops import (
     MetricLogger,
-    TrainMetricLogger,
-    TrainStepMetricLogger,
     TrainingEpochReporter,
     TrainingLoopConfig,
+    TrainMetricLogger,
+    TrainStepMetricLogger,
     run_training_loop,
 )
 from t2c_reid.wandb import (
-    DEFAULT_WANDB_MODE,
-    DEFAULT_WANDB_PROJECT,
-    WANDB_MODES,
     WandbConfig,
     WandbTracker,
     start_wandb_run,
 )
-from t2c_reid.precision import SUPPORTED_PRECISIONS
-from t2c_reid.retrieval import SUPPORTED_RETRIEVAL_MODES
-from t2c_reid.siglip2_backbone import SIGLIP2_MODEL_ID
-from t2c_reid.transforms import DEFAULT_IMAGE_SIZE
-
-DEFAULT_TOTAL_EPOCHS = 60
-DEFAULT_VALIDATION_INTERVAL = 5
-DEFAULT_STAGE1_EPOCHS = 60
-DEFAULT_JOB_BUILDER = "t2c_reid.jobs.siglip2_reid:build_training_job"
-DEFAULT_DATASET = "msmt17"
-DEFAULT_DATA_ROOT = Path("data/MSMT17_V1")
-DEFAULT_CHECKPOINT_DIR = Path("checkpoints/msmt17-siglip2-tfc")
-DEFAULT_RUN_NAME = "msmt17-siglip2-camera-tfc"
-DEFAULT_SIGLIP2_MODEL_NAME = SIGLIP2_MODEL_ID
-# P=16 identities x K=4 instances. batch-size is the real triplet/SigLIP mining
-# scope; gradient accumulation does not widen it, so this must be the ReID-sized
-# PK batch rather than a memory-driven micro-batch.
-DEFAULT_BATCH_SIZE = 64
-DEFAULT_EVAL_BATCH_SIZE = 128
-DEFAULT_GRADIENT_ACCUMULATION_STEPS = 1
-DEFAULT_PRECISION = "auto"
-DEFAULT_NUM_INSTANCES = 4
-DEFAULT_NUM_WORKERS = 8
-DEFAULT_PREFETCH_FACTOR = 2
-DEFAULT_RUST_DATA_THREADS = 2
-DEFAULT_DATA_BACKEND = RUST_DATA_BACKEND
-DEFAULT_EVALUATION_BACKEND = RUST_EVALUATION_BACKEND
-DEFAULT_EVALUATION_CHUNK_SIZE = DEFAULT_QUERY_CHUNK_SIZE
-DEFAULT_LEARNING_RATE = 1e-4
-DEFAULT_IMAGE_ENCODER_LR = 5e-6
-DEFAULT_BETA_WARMUP_EPOCHS = 0
-DEFAULT_STAGE1_LR_SCHEDULER = "cosine"
-DEFAULT_STAGE1_WARMUP_EPOCHS = 5
-DEFAULT_STAGE2_LR_SCHEDULER = "cosine"
-DEFAULT_STAGE2_WARMUP_EPOCHS = 5
-# Insurance against a loss spike killing a multi-hour run. Large enough that a
-# healthy step is never rescaled.
-DEFAULT_GRAD_CLIP_NORM = 5.0
-DEFAULT_SANITY_GATE_EPOCHS = 0
-DEFAULT_SANITY_GATE_FACTOR = 1.5
-DEFAULT_DEVICE = "cuda"
-DEFAULT_BETA = 0.1
-DEFAULT_CONTEXT_LENGTH = 4
-DEFAULT_TFC_MOMENTUM = 0.5
-DEFAULT_TFC_TAIL_MOMENTUM = 0.9
-DEFAULT_TFC_CLASS_BALANCE_BETA = 0.9999
-DEFAULT_TFC_LOCAL_WEIGHT = 1.0
-DEFAULT_TFC_GLOBAL_WEIGHT = 1.0
-DEFAULT_TFC_CROSS_MODAL_WEIGHT = 0.5
-DEFAULT_TFC_CROSS_CAMERA_WEIGHT = 0.1
-DEFAULT_TFC_CONTRAST_TEMPERATURE = 0.07
-DEFAULT_TFC_TRANSFER_REG_WEIGHT = 0.01
-DEFAULT_TRIPLET_MARGIN = 0.3
-DEFAULT_TRIPLET_METRIC = "euclidean"
-DEFAULT_TFC_WEIGHT = 1.0
-# The SigLIP anchor term carries the frozen pretrained calibration
-# t = exp(logit_scale) = 109.89, b = -15.93, so at cos = 0 its positive anchor
-# contributes a loss of -logsigmoid(b) = 15.93 and a feature gradient of
-# t / ||f_v||, several times the combined ID + triplet gradient. 0.1 puts it at
-# roughly a fifth of the ReID signal; sweep {0.5, 0.1, 0.02} against the
-# measured ratio.
-DEFAULT_ALIGNMENT_WEIGHT = 0.1
-DEFAULT_ID_LOGIT_SCALE = 1.0
-DEFAULT_LABEL_SMOOTHING = 0.1
-DEFAULT_REID_HEAD = "bnneck"
-DEFAULT_RETRIEVAL_MODE = "fused"
-SUPPORTED_DATASETS = ("market1501", "msmt17")
 
 TrainOneEpoch = Callable[[int, TrainingEpochReporter], dict[str, float] | None]
 ValidateEpoch = Callable[[int], ReIDMetrics]
-JobBuilder = Callable[[argparse.Namespace], "TrainingJob"]
+JobBuilder = Callable[[TrainingConfig], "TrainingJob"]
 ProgressFactory = Callable[[Iterable[int]], Iterable[int]]
 
 # Stage-1 never performs mAP validation; setting a huge value disables validation.
@@ -147,13 +77,31 @@ class TwoStageTrainingJob:
     stage_metadata: StageMetadata | None = None
 
 
-def main(argv: Sequence[str] | None = None, progress_factory: ProgressFactory | None = None) -> int:
-    args = _build_parser().parse_args(argv)
-    args.stage2_first_epoch = args.stage1_epochs + 1
-    _seed_random_generators(args.seed)
-    with _wandb_context_if_requested(args) as tracker:
-        job = _load_job_builder(args.job_builder)(args)
-        resume_state = _load_resume_state(args.resume)
+def main(
+    overrides: Sequence[str] | None = None,
+    progress_factory: ProgressFactory | None = None,
+) -> int | None:
+    """Run through Hydra, or compose explicit overrides for programmatic callers."""
+
+    if overrides is None and progress_factory is None:
+        return _hydra_main()
+    config = compose_training_config(() if overrides is None else overrides)
+    return _run_training(config, progress_factory)
+
+
+@hydra.main(config_path="../t2c_reid/configs/training", config_name="train")
+def _hydra_main(config: DictConfig) -> int:
+    return _run_training(training_config_from_dict_config(config))
+
+
+def _run_training(
+    config: TrainingConfig,
+    progress_factory: ProgressFactory | None = None,
+) -> int:
+    _seed_random_generators(config.seed)
+    with _wandb_context_if_requested(config) as tracker:
+        job = _load_job_builder(config.job_builder)(config)
+        resume_state = _load_resume_state(config.resume)
         # Use a structural check rather than ``isinstance(job, TwoStageTrainingJob)``.
         # Under ``python -m scripts.train`` the entry module is loaded twice (once
         # as ``__main__`` and once as ``scripts.train``), so the ``TwoStageTrainingJob``
@@ -162,9 +110,9 @@ def main(argv: Sequence[str] | None = None, progress_factory: ProgressFactory | 
         # False and the two-stage job would be wrongly dispatched to the single
         # loop. Duck-typing on the public stage attributes sidesteps that.
         if _is_two_stage_job(job):
-            _run_two_stage_loop(job, args, progress_factory, resume_state, tracker)
+            _run_two_stage_loop(job, config, progress_factory, resume_state, tracker)
         else:
-            _run_single_loop(job, args, progress_factory, resume_state, tracker)
+            _run_single_loop(job, config, progress_factory, resume_state, tracker)
     return 0
 
 
@@ -206,7 +154,7 @@ def _validate_checkpoint_metadata(
         return
     actual = resume_state.get("checkpoint_metadata")
     if not isinstance(actual, Mapping):
-        raise ValueError(
+        raise ValueError(  # noqa: TRY004 - malformed checkpoint content
             "checkpoint has no SigLIP 2 compatibility metadata; old T2C-CLIP "
             "checkpoints cannot be resumed"
         )
@@ -230,7 +178,9 @@ def _resume_best_map(resume_state: dict[str, Any] | None) -> float | None:
 
 
 def _is_two_stage_job(job: Any) -> bool:
-    return hasattr(job, "stage1") and hasattr(job, "stage2") and not hasattr(job, "model")
+    return (
+        hasattr(job, "stage1") and hasattr(job, "stage2") and not hasattr(job, "model")
+    )
 
 
 def _stage_metadata_values(metadata: Any) -> dict[str, Any]:
@@ -253,152 +203,21 @@ def _stage_metadata_values(metadata: Any) -> dict[str, Any]:
     )
 
 
-def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train T2C-ReID with the default SigLIP 2 recipe.")
-    parser.add_argument("--job-builder", default=DEFAULT_JOB_BUILDER)
-    parser.add_argument("--epochs", type=int, default=DEFAULT_TOTAL_EPOCHS)
-    parser.add_argument("--validation-interval", type=int, default=DEFAULT_VALIDATION_INTERVAL)
-    parser.add_argument("--checkpoint-dir", type=Path, default=DEFAULT_CHECKPOINT_DIR)
-    parser.add_argument("--resume", type=Path)
-    parser.add_argument("--seed", type=int)
-    parser.add_argument("--enable-wandb", action="store_true")
-    parser.add_argument("--wandb-project", default=DEFAULT_WANDB_PROJECT)
-    parser.add_argument("--wandb-entity")
-    parser.add_argument("--wandb-mode", choices=WANDB_MODES, default=DEFAULT_WANDB_MODE)
-    parser.add_argument("--wandb-dir", type=Path)
-    parser.add_argument("--run-name", default=DEFAULT_RUN_NAME)
-    _add_project_training_args(parser)
-    return parser
-
-
-def _add_project_training_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--dataset", choices=SUPPORTED_DATASETS, default=DEFAULT_DATASET)
-    parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)
-    parser.add_argument(
-        "--siglip2-model-name",
-        choices=(DEFAULT_SIGLIP2_MODEL_NAME,),
-        default=DEFAULT_SIGLIP2_MODEL_NAME,
-    )
-    parser.add_argument("--siglip2-checkpoint", type=Path)
-    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
-    parser.add_argument("--eval-batch-size", type=int, default=DEFAULT_EVAL_BATCH_SIZE)
-    parser.add_argument(
-        "--gradient-accumulation-steps",
-        type=int,
-        default=DEFAULT_GRADIENT_ACCUMULATION_STEPS,
-    )
-    parser.add_argument("--precision", choices=SUPPORTED_PRECISIONS, default=DEFAULT_PRECISION)
-    parser.add_argument("--image-height", type=int, default=DEFAULT_IMAGE_SIZE[0])
-    parser.add_argument("--image-width", type=int, default=DEFAULT_IMAGE_SIZE[1])
-    parser.add_argument("--num-instances", type=int, default=DEFAULT_NUM_INSTANCES)
-    parser.add_argument("--num-workers", type=int, default=DEFAULT_NUM_WORKERS)
-    parser.add_argument("--data-backend", choices=SUPPORTED_DATA_BACKENDS, default=DEFAULT_DATA_BACKEND)
-    parser.add_argument("--prefetch-factor", type=int, default=DEFAULT_PREFETCH_FACTOR)
-    parser.add_argument(
-        "--pin-memory",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-    )
-    parser.add_argument(
-        "--persistent-workers",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-    )
-    parser.add_argument("--rust-data-threads", type=int, default=DEFAULT_RUST_DATA_THREADS)
-    parser.add_argument(
-        "--evaluation-backend",
-        choices=SUPPORTED_EVALUATION_BACKENDS,
-        default=DEFAULT_EVALUATION_BACKEND,
-    )
-    parser.add_argument(
-        "--evaluation-chunk-size",
-        type=int,
-        default=DEFAULT_EVALUATION_CHUNK_SIZE,
-    )
-    parser.add_argument("--lr", type=float, default=DEFAULT_LEARNING_RATE)
-    parser.add_argument("--image-encoder-lr", type=float, default=DEFAULT_IMAGE_ENCODER_LR)
-    parser.add_argument("--sie-coe", type=float, default=0.0)
-    parser.add_argument("--device", default=DEFAULT_DEVICE)
-    parser.add_argument("--beta", type=float, default=DEFAULT_BETA)
-    parser.add_argument("--beta-warmup-epochs", type=int, default=DEFAULT_BETA_WARMUP_EPOCHS)
-    parser.add_argument("--stage1-lr-scheduler", choices=("none", "cosine"), default=DEFAULT_STAGE1_LR_SCHEDULER)
-    parser.add_argument("--stage1-warmup-epochs", type=int, default=DEFAULT_STAGE1_WARMUP_EPOCHS)
-    parser.add_argument("--stage2-lr-scheduler", choices=("none", "cosine"), default=DEFAULT_STAGE2_LR_SCHEDULER)
-    parser.add_argument("--stage2-warmup-epochs", type=int, default=DEFAULT_STAGE2_WARMUP_EPOCHS)
-    parser.add_argument("--grad-clip-norm", type=float, default=DEFAULT_GRAD_CLIP_NORM)
-    parser.add_argument("--context-length", type=int, default=DEFAULT_CONTEXT_LENGTH)
-    parser.add_argument("--tfc-momentum", type=float, default=DEFAULT_TFC_MOMENTUM)
-    parser.add_argument("--tfc-tail-momentum", type=float, default=DEFAULT_TFC_TAIL_MOMENTUM)
-    parser.add_argument("--tfc-class-balance-beta", type=float, default=DEFAULT_TFC_CLASS_BALANCE_BETA)
-    parser.add_argument("--tfc-local-weight", type=float, default=DEFAULT_TFC_LOCAL_WEIGHT)
-    parser.add_argument("--tfc-global-weight", type=float, default=DEFAULT_TFC_GLOBAL_WEIGHT)
-    parser.add_argument("--tfc-cross-modal-weight", type=float, default=DEFAULT_TFC_CROSS_MODAL_WEIGHT)
-    parser.add_argument("--tfc-cross-camera-weight", type=float, default=DEFAULT_TFC_CROSS_CAMERA_WEIGHT)
-    parser.add_argument("--tfc-contrast-temperature", type=float, default=DEFAULT_TFC_CONTRAST_TEMPERATURE)
-    parser.add_argument("--tfc-transfer-reg-weight", type=float, default=DEFAULT_TFC_TRANSFER_REG_WEIGHT)
-    parser.add_argument("--triplet-margin", type=float, default=DEFAULT_TRIPLET_MARGIN)
-    parser.add_argument("--triplet-metric", choices=("euclidean", "cosine"), default=DEFAULT_TRIPLET_METRIC)
-    parser.add_argument("--tfc-weight", type=float, default=DEFAULT_TFC_WEIGHT)
-    parser.add_argument("--alignment-weight", type=float, default=DEFAULT_ALIGNMENT_WEIGHT)
-    parser.add_argument("--stage1-epochs", type=int, default=DEFAULT_STAGE1_EPOCHS)
-    parser.add_argument(
-        "--stage1-feature-cache",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
-    parser.add_argument("--id-logit-scale", type=float, default=DEFAULT_ID_LOGIT_SCALE)
-    parser.add_argument("--label-smoothing", type=float, default=DEFAULT_LABEL_SMOOTHING)
-    parser.add_argument("--reid-head", choices=("linear", "bnneck"), default=DEFAULT_REID_HEAD)
-    parser.add_argument("--retrieval-mode", choices=SUPPORTED_RETRIEVAL_MODES, default=DEFAULT_RETRIEVAL_MODE)
-    parser.add_argument("--report-rerank", action="store_true")
-    # Off by default: averaging the flipped view is a protocol deviation from
-    # the published Image-to-Image baselines this project compares against, so
-    # it must be an explicit, disclosed choice rather than a silent default.
-    parser.add_argument("--flip-tta", action="store_true")
-    parser.add_argument(
-        "--gradient-checkpointing",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
-    parser.add_argument(
-        "--freeze-prompt-bank-stage2",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-    )
-    parser.add_argument(
-        "--freeze-image-encoder-stage1",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
-    parser.add_argument(
-        "--freeze-image-encoder-stage2",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-    )
-    parser.add_argument(
-        "--freeze-text-encoder",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
-    parser.add_argument("--sanity-gate-epochs", type=int, default=DEFAULT_SANITY_GATE_EPOCHS)
-    parser.add_argument("--sanity-gate-factor", type=float, default=DEFAULT_SANITY_GATE_FACTOR)
-
-
-def _wandb_context_if_requested(args: argparse.Namespace):
-    if not args.enable_wandb:
+def _wandb_context_if_requested(config: TrainingConfig):
+    if not config.enable_wandb:
         return nullcontext(None)
-    config = WandbConfig(
-        project=args.wandb_project,
-        entity=args.wandb_entity,
-        mode=args.wandb_mode,
-        directory=args.wandb_dir,
+    wandb_config = WandbConfig(
+        project=config.wandb_project,
+        entity=config.wandb_entity,
+        mode=config.wandb_mode,
+        directory=config.wandb_dir,
     )
-    return start_wandb_run(config, run_name=args.run_name)
+    return start_wandb_run(wandb_config, run_name=config.run_name)
 
 
 def _run_two_stage_loop(
     job: TwoStageTrainingJob,
-    args: argparse.Namespace,
+    config: TrainingConfig,
     progress_factory: ProgressFactory | None,
     resume_state: dict[str, Any] | None = None,
     tracker: WandbTracker | None = None,
@@ -407,23 +226,25 @@ def _run_two_stage_loop(
     if resume_state is not None:
         resume_stage = resume_state.get("stage")
         if resume_stage != "stage2":
-            raise ValueError(f"only stage2 checkpoints can be resumed, got stage: {resume_stage!r}")
+            raise ValueError(
+                f"only stage2 checkpoints can be resumed, got stage: {resume_stage!r}"
+            )
         _restore_job_state(job.stage2, resume_state)
-        completed_stage2_epochs = int(resume_state["epoch"]) - args.stage1_epochs
+        completed_stage2_epochs = int(resume_state["epoch"]) - config.stage1_epochs
     if tracker is not None and job.stage_metadata is not None:
         tracker.log_stage_config(_stage_metadata_values(job.stage_metadata))
     stage1_loggers = _stage_metric_loggers_for("stage1", tracker)
     stage2_loggers = _stage_metric_loggers_for("stage2", tracker)
     stage1_config = TrainingLoopConfig(
-        total_epochs=args.stage1_epochs,
+        total_epochs=config.stage1_epochs,
         validation_interval=STAGE1_DISABLE_VALIDATION_INTERVAL,
-        checkpoint_dir=args.checkpoint_dir,
+        checkpoint_dir=config.checkpoint_dir,
         progress_description="stage1",
         checkpoint_prefix="stage1",
         stage="stage1",
         validate_final_epoch=False,
     )
-    if args.stage1_epochs > 0 and resume_state is None:
+    if config.stage1_epochs > 0 and resume_state is None:
         run_training_loop(
             model=job.stage1.model,
             optimizer=job.stage1.optimizer,
@@ -438,17 +259,17 @@ def _run_two_stage_loop(
             auxiliary_state=job.stage1.auxiliary_state,
         )
 
-    stage2_first_epoch = args.stage1_epochs + completed_stage2_epochs + 1
+    stage2_first_epoch = config.stage1_epochs + completed_stage2_epochs + 1
     stage2_config = TrainingLoopConfig(
-        total_epochs=args.epochs - completed_stage2_epochs,
-        validation_interval=args.validation_interval,
-        checkpoint_dir=args.checkpoint_dir,
+        total_epochs=config.epochs - completed_stage2_epochs,
+        validation_interval=config.validation_interval,
+        checkpoint_dir=config.checkpoint_dir,
         first_epoch=stage2_first_epoch,
         progress_description="stage2",
         checkpoint_prefix="",
         stage="stage2",
-        sanity_check_offset=int(getattr(args, "sanity_gate_epochs", 0)),
-        sanity_improvement_factor=float(getattr(args, "sanity_gate_factor", 1.5)),
+        sanity_check_offset=config.sanity_gate_epochs,
+        sanity_improvement_factor=config.sanity_gate_factor,
     )
     run_training_loop(
         model=job.stage2.model,
@@ -468,7 +289,7 @@ def _run_two_stage_loop(
 
 def _run_single_loop(
     job: TrainingJob,
-    args: argparse.Namespace,
+    config: TrainingConfig,
     progress_factory: ProgressFactory | None,
     resume_state: dict[str, Any] | None = None,
     tracker: WandbTracker | None = None,
@@ -485,20 +306,20 @@ def _run_single_loop(
     if tracker is not None and job.stage_metadata is not None:
         tracker.log_stage_config(_stage_metadata_values(job.stage_metadata))
     loggers = _stage_metric_loggers_for("stage2", tracker)
-    config = TrainingLoopConfig(
-        total_epochs=args.epochs - completed_epochs,
-        validation_interval=args.validation_interval,
-        checkpoint_dir=args.checkpoint_dir,
+    loop_config = TrainingLoopConfig(
+        total_epochs=config.epochs - completed_epochs,
+        validation_interval=config.validation_interval,
+        checkpoint_dir=config.checkpoint_dir,
         first_epoch=completed_epochs + 1,
         progress_description="stage2",
         stage="stage2",
-        sanity_check_offset=int(getattr(args, "sanity_gate_epochs", 0)),
-        sanity_improvement_factor=float(getattr(args, "sanity_gate_factor", 1.5)),
+        sanity_check_offset=config.sanity_gate_epochs,
+        sanity_improvement_factor=config.sanity_gate_factor,
     )
     run_training_loop(
         model=job.model,
         optimizer=job.optimizer,
-        config=config,
+        config=loop_config,
         train_one_epoch=job.train_one_epoch,
         validate=job.validate,
         progress_factory=_progress(progress_factory),
@@ -512,7 +333,9 @@ def _run_single_loop(
 
 
 def _progress(progress_factory: ProgressFactory | None) -> ProgressFactory:
-    return progress_factory if progress_factory is not None else _default_progress_factory
+    return (
+        progress_factory if progress_factory is not None else _default_progress_factory
+    )
 
 
 def _default_progress_factory(iterable: Iterable[int], **kwargs) -> Iterable[int]:

@@ -243,6 +243,18 @@ wheels = [
 ]
 
 [[package]]
+name = "hydra-core"
+version = "1.4.0.dev8"
+source = { registry = "https://mirrors.ustc.edu.cn/pypi/simple" }
+dependencies = [
+    { name = "omegaconf" },
+]
+sdist = { url = "https://mirrors.ustc.edu.cn/pypi/packages/d6/46/9199eaa04d6fe996eeaefcca670cfa6fcd47f7fd8620afe6ea50bd9baa9e/hydra_core-1.4.0.dev8.tar.gz", hash = "sha256:e2f38387824ed84fb1772535ee9839d3b033b3b0163570e38f849dd405520c82", size = 3300487, upload-time = "2026-08-04T20:05:33.757Z" }
+wheels = [
+    { url = "https://mirrors.ustc.edu.cn/pypi/packages/90/11/bbd9784865ca70f3841cbf7bf93c6ee44a1e33f7391fb194255a14e6f072/hydra_core-1.4.0.dev8-py3-none-any.whl", hash = "sha256:99c7471c902b2b1e68e073a1c093e46f5103996547cf2c70c6983022dcd94026", size = 158154, upload-time = "2026-08-04T20:05:24.15Z" },
+]
+
+[[package]]
 name = "idna"
 version = "3.4"
 source = { registry = "https://mirrors.nju.edu.cn/pytorch/whl/cu132" }
@@ -494,6 +506,18 @@ source = { registry = "https://mirrors.nju.edu.cn/pytorch/whl/cu132" }
 wheels = [
     { url = "https://pypi.nvidia.com/nvidia-nvtx/nvidia_nvtx-13.2.75-py3-none-manylinux1_x86_64.manylinux_2_5_x86_64.whl", hash = "sha256:2d7c24fc582d841493c6dc2cf017c25e4428cf583a3bd9e9325a65f0ecc65f73" },
     { url = "https://pypi.nvidia.com/nvidia-nvtx/nvidia_nvtx-13.2.75-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:d8e1c4a14a21d6dd4bc2fc59eb1e3f42447db40edf5d0f580c0eba5f9abb606c" },
+]
+
+[[package]]
+name = "omegaconf"
+version = "2.4.0.dev15"
+source = { registry = "https://mirrors.ustc.edu.cn/pypi/simple" }
+dependencies = [
+    { name = "pyyaml" },
+]
+sdist = { url = "https://mirrors.ustc.edu.cn/pypi/packages/62/8a/92db36ac7659bb9cb24ab108971ce3a2c78d467f815adf21f8d68ef3bb30/omegaconf-2.4.0.dev15.tar.gz", hash = "sha256:36b707ea4f0dd4289d004dee804dbd7c66c07fe7217cbcf039500e5cc9316a0a", size = 3495480, upload-time = "2026-08-07T21:23:16.201Z" }
+wheels = [
+    { url = "https://mirrors.ustc.edu.cn/pypi/packages/36/ed/4f24634c3925b5262a1626e76b08a13dd00f1e743f1da2501580758dc027/omegaconf-2.4.0.dev15-py3-none-any.whl", hash = "sha256:2f2c12201d15230888d6e82ad0f3540bdf889d011c35f7f472b0e9286ce737af", size = 246202, upload-time = "2026-08-07T21:23:12.133Z" },
 ]
 
 [[package]]
@@ -791,6 +815,7 @@ name = "t2c-reid"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "hydra-core" },
     { name = "numpy" },
     { name = "torch" },
     { name = "torchvision" },
@@ -801,6 +826,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "hydra-core", specifier = ">=1.4.0.dev3,<1.5" },
     { name = "numpy", specifier = ">=2.4.0" },
     { name = "torch", specifier = ">=2.13.0" },
     { name = "torchvision", specifier = ">=0.28.0" },

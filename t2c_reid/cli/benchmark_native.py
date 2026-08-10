@@ -2,16 +2,12 @@
 
 from __future__ import annotations
 
-import argparse
-from collections.abc import Callable, Sequence
-from contextlib import nullcontext
 import ctypes
 import gc
 import hashlib
 import json
 import math
 import os
-from pathlib import Path
 import platform
 import statistics
 import subprocess
@@ -19,13 +15,23 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Any
+from collections.abc import Callable, Sequence
+from contextlib import nullcontext
+from pathlib import Path
+from typing import Any, Self
 
+import hydra
 import numpy as np
-from PIL import Image
 import torch
+from omegaconf import DictConfig
+from PIL import Image
 from torch.utils.data import DataLoader
 
+from t2c_reid.configuration import (
+    BenchmarkConfig,
+    benchmark_config_from_dict_config,
+    compose_benchmark_config,
+)
 from t2c_reid.data import ReIDSample, load_market_split, load_msmt17_manifest
 from t2c_reid.datasets import (
     ReIDImageDataset,
@@ -57,10 +63,10 @@ class _RssSampler:
         self._stop = threading.Event()
         self._baseline = _current_rss_bytes()
         self._peak = self._baseline
-        self._error: BaseException | None = None
+        self._error: Exception | None = None
         self._thread = threading.Thread(target=self._sample, daemon=True)
 
-    def __enter__(self) -> "_RssSampler":
+    def __enter__(self) -> Self:
         self._thread.start()
         return self
 
@@ -68,7 +74,9 @@ class _RssSampler:
         self._stop.set()
         self._thread.join()
         if self._error is not None and exc_type is None:
-            raise RuntimeError("RSS sampling failed in the background thread") from self._error
+            raise RuntimeError(
+                "RSS sampling failed in the background thread"
+            ) from self._error
         self._peak = max(self._peak, _current_rss_bytes())
 
     @property
@@ -79,23 +87,33 @@ class _RssSampler:
         try:
             while not self._stop.wait(0.005):
                 self._peak = max(self._peak, _current_rss_bytes())
-        except BaseException as exc:
+        except Exception as exc:  # noqa: BLE001 - propagate thread failures on exit
             self._error = exc
             self._stop.set()
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    args = _build_parser().parse_args(argv)
-    if args.rss_worker_backend is not None:
-        return _run_rerank_rss_worker(args)
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
+def main(overrides: Sequence[str] | None = None) -> int | None:
+    if overrides is None:
+        return _hydra_main()
+    return _run_benchmark(compose_benchmark_config(overrides))
+
+
+@hydra.main(config_path="../configs/benchmark", config_name="benchmark")
+def _hydra_main(config: DictConfig) -> int:
+    return _run_benchmark(benchmark_config_from_dict_config(config))
+
+
+def _run_benchmark(config: BenchmarkConfig) -> int:
+    if config.rss_worker_backend is not None:
+        return _run_rerank_rss_worker(config)
+    torch.manual_seed(config.seed)
+    np.random.seed(config.seed)
     payload: dict[str, Any] = {
         "settings": {
-            "mode": args.mode,
-            "runs": args.runs,
-            "warmup_runs": args.warmup_runs,
-            "seed": args.seed,
+            "mode": config.mode,
+            "runs": config.runs,
+            "warmup_runs": config.warmup_runs,
+            "seed": config.seed,
             "platform": platform.platform(),
             "processor": platform.processor(),
             "python_version": platform.python_version(),
@@ -104,78 +122,53 @@ def main(argv: Sequence[str] | None = None) -> int:
             "git_commit": _git_commit(),
             "git_dirty": _git_dirty(),
             "git_diff_sha256": _git_diff_sha256(),
-            "dataset": args.dataset,
-            "data_source": "real" if args.data_root is not None else "synthetic",
-            "data_root": str(args.data_root) if args.data_root is not None else None,
-            "data_samples": args.data_samples,
-            "batch_size": args.batch_size,
-            "num_workers": args.num_workers,
-            "rust_data_threads": args.rust_data_threads,
-            "image_size": [args.image_height, args.image_width],
-            "query_count": args.query_count,
-            "gallery_count": args.gallery_count,
-            "rerank_query_count": args.rerank_query_count,
-            "rerank_gallery_count": args.rerank_gallery_count,
-            "feature_dim": args.feature_dim,
-            "chunk_size": args.chunk_size,
+            "dataset": config.dataset,
+            "data_source": "real" if config.data_root is not None else "synthetic",
+            "data_root": str(config.data_root)
+            if config.data_root is not None
+            else None,
+            "data_samples": config.data_samples,
+            "batch_size": config.batch_size,
+            "num_workers": config.num_workers,
+            "rust_data_threads": config.rust_data_threads,
+            "image_size": [config.image_height, config.image_width],
+            "query_count": config.query_count,
+            "gallery_count": config.gallery_count,
+            "rerank_query_count": config.rerank_query_count,
+            "rerank_gallery_count": config.rerank_gallery_count,
+            "feature_dim": config.feature_dim,
+            "chunk_size": config.chunk_size,
         }
     }
     data_context = (
-        nullcontext(_load_real_samples(args.dataset, args.data_root, args.data_samples))
-        if args.data_root is not None
-        else _synthetic_samples(args.data_samples, args.seed)
+        nullcontext(
+            _load_real_samples(config.dataset, config.data_root, config.data_samples)
+        )
+        if config.data_root is not None
+        else _synthetic_samples(config.data_samples, config.seed)
     )
     with data_context as samples:
-        if args.mode in {"all", "data"}:
-            payload["data"] = _benchmark_data(samples, args)
-    if args.mode in {"all", "evaluation"}:
-        payload["evaluation"] = _benchmark_evaluation(args)
-    if args.mode in {"all", "rerank"}:
-        payload["rerank"] = _benchmark_rerank(args)
+        if config.mode in {"all", "data"}:
+            payload["data"] = _benchmark_data(samples, config)
+    if config.mode in {"all", "evaluation"}:
+        payload["evaluation"] = _benchmark_evaluation(config)
+    if config.mode in {"all", "rerank"}:
+        payload["rerank"] = _benchmark_rerank(config)
 
     text = json.dumps(payload, indent=2, sort_keys=True)
-    if args.output is None:
+    if config.output is None:
         print(text)
     else:
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(text + "\n", encoding="utf-8")
+        config.output.parent.mkdir(parents=True, exist_ok=True)
+        config.output.write_text(text + "\n", encoding="utf-8")
     return 0
 
 
-def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Benchmark Rust data loading, ReID evaluation, and sparse reranking."
-    )
-    parser.add_argument("--mode", choices=("all", "data", "evaluation", "rerank"), default="all")
-    parser.add_argument("--dataset", choices=("market1501", "msmt17"), default="market1501")
-    parser.add_argument("--data-root", type=Path)
-    parser.add_argument("--data-samples", type=int, default=256)
-    parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--rust-data-threads", type=int, default=2)
-    parser.add_argument("--image-height", type=int, default=392)
-    parser.add_argument("--image-width", type=int, default=196)
-    parser.add_argument("--query-count", type=int, default=256)
-    parser.add_argument("--gallery-count", type=int, default=2048)
-    parser.add_argument("--feature-dim", type=int, default=256)
-    parser.add_argument("--rerank-query-count", type=int, default=256)
-    parser.add_argument("--rerank-gallery-count", type=int, default=2048)
-    parser.add_argument("--chunk-size", type=int, default=128)
-    parser.add_argument("--runs", type=int, default=5)
-    parser.add_argument("--warmup-runs", type=int, default=1)
-    parser.add_argument("--seed", type=int, default=7)
-    parser.add_argument("--output", type=Path)
-    parser.add_argument(
-        "--rss-worker-backend",
-        choices=("python", "rust"),
-        help=argparse.SUPPRESS,
-    )
-    return parser
-
-
-def _benchmark_data(samples: list[ReIDSample], args: argparse.Namespace) -> dict[str, Any]:
+def _benchmark_data(
+    samples: list[ReIDSample], config: BenchmarkConfig
+) -> dict[str, Any]:
     transform = Siglip2TrainImageTransform(
-        _Processor(), image_size=(args.image_height, args.image_width)
+        _Processor(), image_size=(config.image_height, config.image_width)
     )
     person_map = build_person_id_map(samples)
     camera_map = build_camera_id_map(samples)
@@ -183,19 +176,21 @@ def _benchmark_data(samples: list[ReIDSample], args: argparse.Namespace) -> dict
         ReIDImageDatasetConfig(samples, person_map, camera_map, transform)
     )
     rust_dataset = ReIDMetadataDataset(
-        ReIDMetadataDatasetConfig(samples, person_map, camera_map, transform.native_config)
+        ReIDMetadataDatasetConfig(
+            samples, person_map, camera_map, transform.native_config
+        )
     )
     python_loader = _benchmark_loader(
         python_dataset,
         collate_reid_batches,
-        args.batch_size,
-        args.num_workers,
+        config.batch_size,
+        config.num_workers,
     )
     rust_loader = _benchmark_loader(
         rust_dataset,
-        RustReIDBatchCollator(transform.native_config, args.rust_data_threads),
-        args.batch_size,
-        args.num_workers,
+        RustReIDBatchCollator(transform.native_config, config.rust_data_threads),
+        config.batch_size,
+        config.num_workers,
     )
 
     def consume(loader: DataLoader) -> int:
@@ -205,10 +200,10 @@ def _benchmark_data(samples: list[ReIDSample], args: argparse.Namespace) -> dict
         return count
 
     python_result = _measure(
-        lambda: consume(python_loader), args.warmup_runs, args.runs, len(samples)
+        lambda: consume(python_loader), config.warmup_runs, config.runs, len(samples)
     )
     rust_result = _measure(
-        lambda: consume(rust_loader), args.warmup_runs, args.runs, len(samples)
+        lambda: consume(rust_loader), config.warmup_runs, config.runs, len(samples)
     )
     speedup = python_result["median_seconds"] / rust_result["median_seconds"]
     return {
@@ -220,7 +215,9 @@ def _benchmark_data(samples: list[ReIDSample], args: argparse.Namespace) -> dict
     }
 
 
-def _benchmark_loader(dataset, collate_fn, batch_size: int, num_workers: int) -> DataLoader:
+def _benchmark_loader(
+    dataset, collate_fn, batch_size: int, num_workers: int
+) -> DataLoader:
     options: dict[str, Any] = {
         "batch_size": batch_size,
         "shuffle": False,
@@ -233,9 +230,9 @@ def _benchmark_loader(dataset, collate_fn, batch_size: int, num_workers: int) ->
     return DataLoader(dataset, **options)
 
 
-def _benchmark_evaluation(args: argparse.Namespace) -> dict[str, Any]:
+def _benchmark_evaluation(config: BenchmarkConfig) -> dict[str, Any]:
     query, gallery, metadata = _feature_fixture(
-        args.query_count, args.gallery_count, args.feature_dim, args.seed
+        config.query_count, config.gallery_count, config.feature_dim, config.seed
     )
 
     def run(backend: str):
@@ -244,13 +241,17 @@ def _benchmark_evaluation(args: argparse.Namespace) -> dict[str, Any]:
             gallery,
             **metadata,
             backend=backend,
-            query_chunk_size=args.chunk_size,
+            query_chunk_size=config.chunk_size,
         )
 
     python_metrics = run("python")
     rust_metrics = run("rust")
-    python_result = _measure(lambda: run("python"), args.warmup_runs, args.runs, args.query_count)
-    rust_result = _measure(lambda: run("rust"), args.warmup_runs, args.runs, args.query_count)
+    python_result = _measure(
+        lambda: run("python"), config.warmup_runs, config.runs, config.query_count
+    )
+    rust_result = _measure(
+        lambda: run("rust"), config.warmup_runs, config.runs, config.query_count
+    )
     speedup = python_result["median_seconds"] / rust_result["median_seconds"]
     return {
         "python": python_result,
@@ -262,31 +263,35 @@ def _benchmark_evaluation(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def _benchmark_rerank(args: argparse.Namespace) -> dict[str, Any]:
+def _benchmark_rerank(config: BenchmarkConfig) -> dict[str, Any]:
     query, gallery, metadata = _feature_fixture(
-        args.rerank_query_count,
-        args.rerank_gallery_count,
-        args.feature_dim,
-        args.seed + 1,
+        config.rerank_query_count,
+        config.rerank_gallery_count,
+        config.feature_dim,
+        config.seed + 1,
     )
-    config = RerankConfig()
+    rerank_config = RerankConfig()
 
     def run(backend: str):
         return evaluate_reid_with_rerank(
             query,
             gallery,
             **metadata,
-            config=config,
+            config=rerank_config,
             backend=backend,
-            query_chunk_size=args.chunk_size,
+            query_chunk_size=config.chunk_size,
         )
 
     python_metrics = run("python")
     rust_metrics = run("rust")
-    python_result = _measure(lambda: run("python"), args.warmup_runs, args.runs, len(query))
-    rust_result = _measure(lambda: run("rust"), args.warmup_runs, args.runs, len(query))
-    python_result["peak_rss_delta_bytes"] = _isolated_rerank_rss(args, "python")
-    rust_result["peak_rss_delta_bytes"] = _isolated_rerank_rss(args, "rust")
+    python_result = _measure(
+        lambda: run("python"), config.warmup_runs, config.runs, len(query)
+    )
+    rust_result = _measure(
+        lambda: run("rust"), config.warmup_runs, config.runs, len(query)
+    )
+    python_result["peak_rss_delta_bytes"] = _isolated_rerank_rss(config, "python")
+    rust_result["peak_rss_delta_bytes"] = _isolated_rerank_rss(config, "rust")
     speedup = python_result["median_seconds"] / rust_result["median_seconds"]
     python_rss = max(1, int(python_result["peak_rss_delta_bytes"]))
     rss_ratio = int(rust_result["peak_rss_delta_bytes"]) / python_rss
@@ -306,41 +311,34 @@ def _benchmark_rerank(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def _isolated_rerank_rss(args: argparse.Namespace, backend: str) -> int:
+def _isolated_rerank_rss(config: BenchmarkConfig, backend: str) -> int:
     with tempfile.TemporaryDirectory() as tmp:
         output = Path(tmp) / "rss.json"
         command = [
             sys.executable,
             "-m",
             "t2c_reid.cli.benchmark_native",
-            "--mode",
-            "rerank",
-            "--rss-worker-backend",
-            backend,
-            "--rerank-query-count",
-            str(args.rerank_query_count),
-            "--rerank-gallery-count",
-            str(args.rerank_gallery_count),
-            "--feature-dim",
-            str(args.feature_dim),
-            "--chunk-size",
-            str(args.chunk_size),
-            "--seed",
-            str(args.seed),
-            "--output",
-            str(output),
+            "mode=rerank",
+            f"rss_worker_backend={backend}",
+            f"rerank_query_count={config.rerank_query_count}",
+            f"rerank_gallery_count={config.rerank_gallery_count}",
+            f"feature_dim={config.feature_dim}",
+            f"chunk_size={config.chunk_size}",
+            f"seed={config.seed}",
+            f"output={output.as_posix()}",
+            f"hydra.run.dir={(Path(tmp) / 'hydra').as_posix()}",
         ]
         subprocess.run(command, check=True, capture_output=True, text=True)
         payload = json.loads(output.read_text(encoding="utf-8"))
         return int(payload["peak_rss_delta_bytes"])
 
 
-def _run_rerank_rss_worker(args: argparse.Namespace) -> int:
+def _run_rerank_rss_worker(config: BenchmarkConfig) -> int:
     query, gallery, metadata = _feature_fixture(
-        args.rerank_query_count,
-        args.rerank_gallery_count,
-        args.feature_dim,
-        args.seed + 1,
+        config.rerank_query_count,
+        config.rerank_gallery_count,
+        config.feature_dim,
+        config.seed + 1,
     )
     gc.collect()
     with _RssSampler() as sampler:
@@ -349,15 +347,15 @@ def _run_rerank_rss_worker(args: argparse.Namespace) -> int:
             gallery,
             **metadata,
             config=RerankConfig(),
-            backend=args.rss_worker_backend,
-            query_chunk_size=args.chunk_size,
+            backend=config.rss_worker_backend,
+            query_chunk_size=config.chunk_size,
         )
     payload = {"peak_rss_delta_bytes": sampler.peak_delta_bytes}
     text = json.dumps(payload, indent=2, sort_keys=True)
-    if args.output is None:
+    if config.output is None:
         print(text)
     else:
-        args.output.write_text(text + "\n", encoding="utf-8")
+        config.output.write_text(text + "\n", encoding="utf-8")
     return 0
 
 
@@ -401,12 +399,16 @@ def _feature_fixture(
     identity_count = max(1, min(query_count, gallery_count) // 2)
     query_ids = [index % identity_count for index in range(query_count)]
     gallery_ids = [index % identity_count for index in range(gallery_count)]
-    return query, gallery, {
-        "query_ids": query_ids,
-        "gallery_ids": gallery_ids,
-        "query_cams": [0] * query_count,
-        "gallery_cams": [1 + index % 2 for index in range(gallery_count)],
-    }
+    return (
+        query,
+        gallery,
+        {
+            "query_ids": query_ids,
+            "gallery_ids": gallery_ids,
+            "query_cams": [0] * query_count,
+            "gallery_cams": [1 + index % 2 for index in range(gallery_count)],
+        },
+    )
 
 
 def _synthetic_samples(count: int, seed: int):
@@ -422,7 +424,11 @@ def _synthetic_samples(count: int, seed: int):
         pixels = rng.integers(0, 256, size=(height, width, 3), dtype=np.uint8)
         path = root / f"{index:06d}.jpg"
         Image.fromarray(pixels).save(path, quality=90)
-        samples.append(ReIDSample(path, index % max(2, count // 4), index % 4, "synthetic", "train"))
+        samples.append(
+            ReIDSample(
+                path, index % max(2, count // 4), index % 4, "synthetic", "train"
+            )
+        )
 
     class _Context:
         def __enter__(self):
@@ -525,7 +531,9 @@ def _current_rss_bytes() -> int:
         ):
             return int(counters.WorkingSetSize)
         error_code = ctypes.get_last_error()
-        raise RuntimeError(f"GetProcessMemoryInfo failed with Windows error {error_code}")
+        raise RuntimeError(
+            f"GetProcessMemoryInfo failed with Windows error {error_code}"
+        )
     try:
         fields = Path("/proc/self/statm").read_text(encoding="ascii").split()
         return int(fields[1]) * int(os.sysconf("SC_PAGE_SIZE"))

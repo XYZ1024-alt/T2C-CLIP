@@ -26,9 +26,9 @@ Primary and reranked mAP/CMC matched their Python references. The rerank cold
 process peak RSS delta was 153.6 MB for the dense Python reference and 38.5 MB
 for Rust sparse rerank, a ratio of 0.250 against the <=0.4 gate.
 
-The production training CLI intentionally retains the conservative
-`--rust-data-threads 1` default. On this machine, an earlier one-thread-per-worker
-synthetic data result was 1.27x; setting `--rust-data-threads 2` cleared the
+Production training uses `rust_data_threads=2`. On this machine, an earlier
+one-thread-per-worker synthetic data result was 1.27x; setting
+`rust_data_threads=2` cleared the
 throughput gate without changing DataLoader worker count. Exact timings vary
 with filesystem cache and concurrent system load.
 
@@ -36,33 +36,33 @@ with filesystem cache and concurrent system load.
 
 ```bash
 uv run python -m t2c_reid.cli.benchmark_native \
-  --mode data \
-  --data-samples 256 \
-  --batch-size 16 \
-  --num-workers 4 \
-  --rust-data-threads 2 \
-  --image-height 392 \
-  --image-width 196 \
-  --runs 5 \
-  --warmup-runs 1
+  mode=data \
+  data_samples=256 \
+  batch_size=16 \
+  num_workers=4 \
+  rust_data_threads=2 \
+  image_height=392 \
+  image_width=196 \
+  runs=5 \
+  warmup_runs=1
 
 uv run python -m t2c_reid.cli.benchmark_native \
-  --mode evaluation \
-  --query-count 512 \
-  --gallery-count 4096 \
-  --feature-dim 256 \
-  --chunk-size 128 \
-  --runs 5 \
-  --warmup-runs 1
+  mode=evaluation \
+  query_count=512 \
+  gallery_count=4096 \
+  feature_dim=256 \
+  chunk_size=128 \
+  runs=5 \
+  warmup_runs=1
 
 uv run python -m t2c_reid.cli.benchmark_native \
-  --mode rerank \
-  --rerank-query-count 256 \
-  --rerank-gallery-count 2048 \
-  --feature-dim 128 \
-  --chunk-size 128 \
-  --runs 3 \
-  --warmup-runs 1
+  mode=rerank \
+  rerank_query_count=256 \
+  rerank_gallery_count=2048 \
+  feature_dim=128 \
+  chunk_size=128 \
+  runs=3 \
+  warmup_runs=1
 ```
 
 ## Remaining Validation
@@ -72,12 +72,12 @@ real dataset root and the same storage/cache conditions:
 
 ```bash
 uv run python -m t2c_reid.cli.benchmark_native \
-  --mode data \
-  --dataset market1501 \
-  --data-root path/to/Market-1501-v15.09.15 \
-  --rust-data-threads 2 \
-  --output output/market1501-native-benchmark.json
+  mode=data \
+  dataset=market1501 \
+  data_root=path/to/Market-1501-v15.09.15 \
+  rust_data_threads=2 \
+  output=output/market1501-native-benchmark.json
 ```
 
-Repeat with `--dataset msmt17`. Record disk type, CPU model, worker/thread
+Repeat with `dataset=msmt17`. Record disk type, CPU model, worker/thread
 settings, and whether the filesystem cache was warm before comparing results.

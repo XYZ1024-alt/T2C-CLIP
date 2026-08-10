@@ -1,24 +1,24 @@
-from pathlib import Path
 import contextlib
 import copy
-import io
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import torch
+from hydra.errors import HydraException
 
 from scripts.train import (
     StageMetadata,
     TrainingJob,
-    _build_parser,
     _validate_checkpoint_metadata,
     main,
 )
+from t2c_reid.configuration import compose_training_config
 from t2c_reid.evaluation import ReIDMetrics
 from t2c_reid.wandb import WandbConfig, WandbTracker
 
-RECORDED_ARGS = None
+RECORDED_CONFIG = None
 RECORDED_RNG_STATE = None
 RECORDED_EPOCHS: list[int] = []
 RECORDED_MODEL_STATE_AT_FIRST_EPOCH: dict = {}
@@ -69,25 +69,24 @@ class TrainScriptTest(unittest.TestCase):
         ):
             actual = dict(objective_expected)
             actual[key] = changed
-            with self.subTest(key=key):
-                with self.assertRaisesRegex(ValueError, key):
-                    _validate_checkpoint_metadata(
-                        objective_expected,
-                        {"checkpoint_metadata": actual},
-                    )
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, key):
+                _validate_checkpoint_metadata(
+                    objective_expected,
+                    {"checkpoint_metadata": actual},
+                )
 
-    def test_seed_arg_is_accepted_and_seeds_torch(self):
-        global RECORDED_ARGS, RECORDED_RNG_STATE
-        RECORDED_ARGS = None
+    def test_seed_override_is_accepted_and_seeds_torch(self):
+        global RECORDED_CONFIG, RECORDED_RNG_STATE
+        RECORDED_CONFIG = None
         RECORDED_RNG_STATE = None
         with tempfile.TemporaryDirectory() as tmp:
             checkpoint_dir = Path(tmp) / "checkpoints"
             main(
-                _recording_job_args(checkpoint_dir) + ["--seed", "42"],
+                _recording_job_overrides(checkpoint_dir) + ["seed=42"],
                 progress_factory=lambda iterable, **kwargs: iterable,
             )
 
-        self.assertEqual(RECORDED_ARGS.seed, 42)
+        self.assertEqual(RECORDED_CONFIG.seed, 42)
         # main() must seed torch before calling the job builder, so the RNG
         # state observed inside the builder matches a freshly-seeded generator.
         ref = torch.Generator().manual_seed(42).get_state()
@@ -97,12 +96,7 @@ class TrainScriptTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             checkpoint_dir = Path(tmp) / "checkpoints"
             main(
-                [
-                    "--job-builder", f"{__name__}:build_training_job",
-                    "--epochs", "1",
-                    "--validation-interval", "1",
-                    "--checkpoint-dir", str(checkpoint_dir),
-                ],
+                _job_overrides(checkpoint_dir),
                 progress_factory=lambda iterable, **kwargs: iterable,
             )
             payload = torch.load(
@@ -116,12 +110,11 @@ class TrainScriptTest(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "only stage2 checkpoints"):
                 main(
-                    [
-                        "--job-builder", f"{__name__}:build_training_job",
-                        "--epochs", "2",
-                        "--checkpoint-dir", str(checkpoint_dir),
-                        "--resume", str(bad_checkpoint),
-                    ],
+                    _job_overrides(
+                        checkpoint_dir,
+                        epochs=2,
+                        resume=bad_checkpoint,
+                    ),
                     progress_factory=lambda iterable, **kwargs: iterable,
                 )
 
@@ -131,23 +124,17 @@ class TrainScriptTest(unittest.TestCase):
             checkpoint_dir = Path(tmp) / "checkpoints"
             # Run 2 epochs to produce a last.pth
             main(
-                [
-                    "--job-builder", f"{__name__}:build_training_job",
-                    "--epochs", "2",
-                    "--validation-interval", "1",
-                    "--checkpoint-dir", str(checkpoint_dir),
-                ],
+                _job_overrides(checkpoint_dir, epochs=2),
                 progress_factory=lambda iterable, **kwargs: iterable,
             )
 
             exit_code = main(
-                [
-                    "--job-builder", f"{__name__}:recording_epoch_builder",
-                    "--epochs", "4",
-                    "--validation-interval", "1",
-                    "--checkpoint-dir", str(checkpoint_dir),
-                    "--resume", str(checkpoint_dir / "last.pth"),
-                ],
+                _job_overrides(
+                    checkpoint_dir,
+                    builder=f"{__name__}:recording_epoch_builder",
+                    epochs=4,
+                    resume=checkpoint_dir / "last.pth",
+                ),
                 progress_factory=lambda iterable, **kwargs: iterable,
             )
 
@@ -161,31 +148,31 @@ class TrainScriptTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             checkpoint_dir = Path(tmp) / "checkpoints"
             main(
-                [
-                    "--job-builder", f"{__name__}:build_training_job",
-                    "--epochs", "2",
-                    "--validation-interval", "1",
-                    "--checkpoint-dir", str(checkpoint_dir),
-                ],
+                _job_overrides(checkpoint_dir, epochs=2),
                 progress_factory=lambda iterable, **kwargs: iterable,
             )
-            saved = torch.load(checkpoint_dir / "last.pth", map_location="cpu", weights_only=True)
+            saved = torch.load(
+                checkpoint_dir / "last.pth", map_location="cpu", weights_only=True
+            )
 
             main(
-                [
-                    "--job-builder", f"{__name__}:recording_epoch_builder",
-                    "--epochs", "3",
-                    "--validation-interval", "1",
-                    "--checkpoint-dir", str(checkpoint_dir),
-                    "--resume", str(checkpoint_dir / "last.pth"),
-                ],
+                _job_overrides(
+                    checkpoint_dir,
+                    builder=f"{__name__}:recording_epoch_builder",
+                    epochs=3,
+                    resume=checkpoint_dir / "last.pth",
+                ),
                 progress_factory=lambda iterable, **kwargs: iterable,
             )
 
         for key, value in saved["model_state"].items():
-            self.assertTrue(torch.equal(RECORDED_MODEL_STATE_AT_FIRST_EPOCH[key], value))
+            self.assertTrue(
+                torch.equal(RECORDED_MODEL_STATE_AT_FIRST_EPOCH[key], value)
+            )
         saved_momentum = saved["optimizer_state"]["state"][0]["momentum_buffer"]
-        recorded_momentum = RECORDED_OPTIMIZER_STATE_AT_FIRST_EPOCH["state"][0]["momentum_buffer"]
+        recorded_momentum = RECORDED_OPTIMIZER_STATE_AT_FIRST_EPOCH["state"][0][
+            "momentum_buffer"
+        ]
         self.assertTrue(torch.equal(recorded_momentum, saved_momentum))
 
     def test_resume_preserves_best_checkpoint_from_previous_run(self):
@@ -193,65 +180,71 @@ class TrainScriptTest(unittest.TestCase):
             checkpoint_dir = Path(tmp) / "checkpoints"
             # declining mAP: epoch 1 scores 0.9 and stays the all-time best.
             main(
-                [
-                    "--job-builder", f"{__name__}:declining_map_builder",
-                    "--epochs", "2",
-                    "--validation-interval", "1",
-                    "--checkpoint-dir", str(checkpoint_dir),
-                ],
+                _job_overrides(
+                    checkpoint_dir,
+                    builder=f"{__name__}:declining_map_builder",
+                    epochs=2,
+                ),
                 progress_factory=lambda iterable, **kwargs: iterable,
             )
 
             main(
-                [
-                    "--job-builder", f"{__name__}:declining_map_builder",
-                    "--epochs", "3",
-                    "--validation-interval", "1",
-                    "--checkpoint-dir", str(checkpoint_dir),
-                    "--resume", str(checkpoint_dir / "last.pth"),
-                ],
+                _job_overrides(
+                    checkpoint_dir,
+                    builder=f"{__name__}:declining_map_builder",
+                    epochs=3,
+                    resume=checkpoint_dir / "last.pth",
+                ),
                 progress_factory=lambda iterable, **kwargs: iterable,
             )
-            best = torch.load(checkpoint_dir / "best.pth", map_location="cpu", weights_only=True)
+            best = torch.load(
+                checkpoint_dir / "best.pth", map_location="cpu", weights_only=True
+            )
 
         self.assertEqual(best["epoch"], 1)
         self.assertEqual(best["metrics"]["mAP"], 0.9)
 
-    def test_parser_defaults_to_the_project_training_recipe(self):
-        args = _build_parser().parse_args([])
+    def test_hydra_defaults_follow_the_project_training_recipe(self):
+        config = compose_training_config()
 
         self.assertEqual(
-            args.job_builder,
+            config.job_builder,
             "t2c_reid.jobs.siglip2_reid:build_training_job",
         )
-        self.assertEqual(args.dataset, "msmt17")
-        self.assertEqual(args.data_root, Path("data/MSMT17_V1"))
-        self.assertEqual(args.stage1_epochs, 60)
-        self.assertEqual(args.epochs, 60)
+        self.assertEqual(config.dataset, "msmt17")
+        self.assertEqual(config.data_root, Path("data/MSMT17_V1"))
+        self.assertEqual(config.stage1_epochs, 60)
+        self.assertEqual(config.epochs, 60)
         self.assertEqual(
-            args.checkpoint_dir,
+            config.checkpoint_dir,
             Path("checkpoints/msmt17-siglip2-tfc"),
         )
-        self.assertEqual(args.run_name, "msmt17-siglip2-camera-tfc")
+        self.assertEqual(config.run_name, "msmt17-siglip2-camera-tfc")
+
+    def test_dataset_config_group_updates_related_paths(self):
+        config = compose_training_config(["dataset=market1501"])
+
+        self.assertEqual(config.dataset, "market1501")
+        self.assertEqual(config.data_root, Path("data/Market-1501-v15.09.15"))
+        self.assertEqual(
+            config.checkpoint_dir,
+            Path("checkpoints/market1501-siglip2-tfc"),
+        )
+        self.assertEqual(config.run_name, "market1501-siglip2-camera-tfc")
 
     def test_main_runs_builder_training_job_and_saves_checkpoints(self):
         with tempfile.TemporaryDirectory() as tmp:
             checkpoint_dir = Path(tmp) / "checkpoints"
             exit_code = main(
-                [
-                    "--job-builder",
-                    f"{__name__}:build_training_job",
-                    "--epochs",
-                    "2",
-                    "--validation-interval",
-                    "1",
-                    "--checkpoint-dir",
-                    str(checkpoint_dir),
-                ],
+                _job_overrides(checkpoint_dir, epochs=2),
                 progress_factory=lambda iterable, **kwargs: iterable,
             )
-            best_payload = torch.load(checkpoint_dir / "best.pth", map_location="cpu", weights_only=True)
-            last_payload = torch.load(checkpoint_dir / "last.pth", map_location="cpu", weights_only=True)
+            best_payload = torch.load(
+                checkpoint_dir / "best.pth", map_location="cpu", weights_only=True
+            )
+            last_payload = torch.load(
+                checkpoint_dir / "last.pth", map_location="cpu", weights_only=True
+            )
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(best_payload["epoch"], 2)
@@ -259,81 +252,79 @@ class TrainScriptTest(unittest.TestCase):
         self.assertEqual(last_payload["metrics"]["mAP"], 0.2)
 
     def test_main_passes_project_training_args_to_builder(self):
-        global RECORDED_ARGS
-        RECORDED_ARGS = None
+        global RECORDED_CONFIG
+        RECORDED_CONFIG = None
         with tempfile.TemporaryDirectory() as tmp:
             checkpoint_dir = Path(tmp) / "checkpoints"
             exit_code = main(
-                _recording_job_args(checkpoint_dir),
+                _recording_job_overrides(checkpoint_dir),
                 progress_factory=lambda iterable, **kwargs: iterable,
             )
 
         self.assertEqual(exit_code, 0)
-        self.assertEqual(RECORDED_ARGS.dataset, "msmt17")
-        self.assertEqual(RECORDED_ARGS.data_root, Path("MSMT17_V1"))
+        self.assertEqual(RECORDED_CONFIG.dataset, "msmt17")
+        self.assertEqual(RECORDED_CONFIG.data_root, Path("MSMT17_V1"))
         self.assertEqual(
-            RECORDED_ARGS.siglip2_model_name,
+            RECORDED_CONFIG.siglip2_model_name,
             "google/siglip2-so400m-patch14-384",
         )
-        self.assertEqual(RECORDED_ARGS.batch_size, 8)
-        self.assertEqual(RECORDED_ARGS.eval_batch_size, 128)
-        self.assertEqual(RECORDED_ARGS.gradient_accumulation_steps, 1)
-        self.assertEqual(RECORDED_ARGS.precision, "auto")
-        self.assertEqual(RECORDED_ARGS.num_workers, 2)
-        self.assertEqual(RECORDED_ARGS.data_backend, "rust")
-        self.assertEqual(RECORDED_ARGS.prefetch_factor, 2)
-        self.assertIsNone(RECORDED_ARGS.pin_memory)
-        self.assertIsNone(RECORDED_ARGS.persistent_workers)
-        self.assertEqual(RECORDED_ARGS.rust_data_threads, 2)
-        self.assertEqual(RECORDED_ARGS.evaluation_backend, "rust")
-        self.assertEqual(RECORDED_ARGS.evaluation_chunk_size, 256)
-        self.assertEqual(RECORDED_ARGS.lr, 0.001)
-        self.assertEqual(RECORDED_ARGS.triplet_metric, "euclidean")
-        self.assertEqual(RECORDED_ARGS.device, "cpu")
+        self.assertEqual(RECORDED_CONFIG.batch_size, 8)
+        self.assertEqual(RECORDED_CONFIG.eval_batch_size, 128)
+        self.assertEqual(RECORDED_CONFIG.gradient_accumulation_steps, 1)
+        self.assertEqual(RECORDED_CONFIG.precision, "auto")
+        self.assertEqual(RECORDED_CONFIG.num_workers, 2)
+        self.assertEqual(RECORDED_CONFIG.data_backend, "rust")
+        self.assertEqual(RECORDED_CONFIG.prefetch_factor, 2)
+        self.assertIsNone(RECORDED_CONFIG.pin_memory)
+        self.assertIsNone(RECORDED_CONFIG.persistent_workers)
+        self.assertEqual(RECORDED_CONFIG.rust_data_threads, 2)
+        self.assertEqual(RECORDED_CONFIG.evaluation_backend, "rust")
+        self.assertEqual(RECORDED_CONFIG.evaluation_chunk_size, 256)
+        self.assertEqual(RECORDED_CONFIG.lr, 0.001)
+        self.assertEqual(RECORDED_CONFIG.triplet_metric, "euclidean")
+        self.assertEqual(RECORDED_CONFIG.device, "cpu")
 
     def test_default_hyperparameters_follow_siglip2_32gb_recipe(self):
-        global RECORDED_ARGS
-        RECORDED_ARGS = None
+        global RECORDED_CONFIG
+        RECORDED_CONFIG = None
         with tempfile.TemporaryDirectory() as tmp:
             checkpoint_dir = Path(tmp) / "checkpoints"
             main(
-                [
-                    "--job-builder", f"{__name__}:recording_training_job",
-                    "--epochs", "1",
-                    "--validation-interval", "1",
-                    "--checkpoint-dir", str(checkpoint_dir),
-                ],
+                _job_overrides(
+                    checkpoint_dir,
+                    builder=f"{__name__}:recording_training_job",
+                ),
                 progress_factory=lambda iterable, **kwargs: iterable,
             )
 
-        self.assertEqual(RECORDED_ARGS.image_encoder_lr, 5e-6)
-        self.assertEqual(RECORDED_ARGS.stage1_epochs, 60)
-        self.assertEqual(RECORDED_ARGS.dataset, "msmt17")
-        self.assertEqual(RECORDED_ARGS.data_root, Path("data/MSMT17_V1"))
+        self.assertEqual(RECORDED_CONFIG.image_encoder_lr, 5e-6)
+        self.assertEqual(RECORDED_CONFIG.stage1_epochs, 60)
+        self.assertEqual(RECORDED_CONFIG.dataset, "msmt17")
+        self.assertEqual(RECORDED_CONFIG.data_root, Path("data/MSMT17_V1"))
         # P=16 x K=4: batch-size is the real triplet/SigLIP mining scope and
         # gradient accumulation does not widen it, so accumulation is 1.
-        self.assertEqual(RECORDED_ARGS.batch_size, 64)
-        self.assertEqual(RECORDED_ARGS.num_instances, 4)
-        self.assertEqual(RECORDED_ARGS.gradient_accumulation_steps, 1)
-        self.assertEqual(RECORDED_ARGS.stage1_lr_scheduler, "cosine")
-        self.assertEqual(RECORDED_ARGS.stage1_warmup_epochs, 5)
-        self.assertEqual(RECORDED_ARGS.stage2_lr_scheduler, "cosine")
-        self.assertEqual(RECORDED_ARGS.stage2_warmup_epochs, 5)
-        self.assertEqual(RECORDED_ARGS.reid_head, "bnneck")
-        self.assertEqual(RECORDED_ARGS.label_smoothing, 0.1)
-        self.assertEqual(RECORDED_ARGS.grad_clip_norm, 5.0)
-        self.assertFalse(RECORDED_ARGS.flip_tta)
+        self.assertEqual(RECORDED_CONFIG.batch_size, 64)
+        self.assertEqual(RECORDED_CONFIG.num_instances, 4)
+        self.assertEqual(RECORDED_CONFIG.gradient_accumulation_steps, 1)
+        self.assertEqual(RECORDED_CONFIG.stage1_lr_scheduler, "cosine")
+        self.assertEqual(RECORDED_CONFIG.stage1_warmup_epochs, 5)
+        self.assertEqual(RECORDED_CONFIG.stage2_lr_scheduler, "cosine")
+        self.assertEqual(RECORDED_CONFIG.stage2_warmup_epochs, 5)
+        self.assertEqual(RECORDED_CONFIG.reid_head, "bnneck")
+        self.assertEqual(RECORDED_CONFIG.label_smoothing, 0.1)
+        self.assertEqual(RECORDED_CONFIG.grad_clip_norm, 5.0)
+        self.assertFalse(RECORDED_CONFIG.flip_tta)
         # Balanced against the frozen SigLIP calibration t=109.89, b=-15.93.
-        self.assertEqual(RECORDED_ARGS.alignment_weight, 0.1)
-        self.assertEqual(RECORDED_ARGS.tfc_tail_momentum, 0.9)
-        self.assertEqual(RECORDED_ARGS.tfc_class_balance_beta, 0.9999)
-        self.assertEqual(RECORDED_ARGS.tfc_local_weight, 1.0)
-        self.assertEqual(RECORDED_ARGS.tfc_global_weight, 1.0)
-        self.assertEqual(RECORDED_ARGS.tfc_cross_modal_weight, 0.5)
-        self.assertEqual(RECORDED_ARGS.tfc_cross_camera_weight, 0.1)
-        self.assertEqual(RECORDED_ARGS.tfc_contrast_temperature, 0.07)
-        self.assertEqual(RECORDED_ARGS.tfc_transfer_reg_weight, 0.01)
-        self.assertTrue(RECORDED_ARGS.gradient_checkpointing)
+        self.assertEqual(RECORDED_CONFIG.alignment_weight, 0.1)
+        self.assertEqual(RECORDED_CONFIG.tfc_tail_momentum, 0.9)
+        self.assertEqual(RECORDED_CONFIG.tfc_class_balance_beta, 0.9999)
+        self.assertEqual(RECORDED_CONFIG.tfc_local_weight, 1.0)
+        self.assertEqual(RECORDED_CONFIG.tfc_global_weight, 1.0)
+        self.assertEqual(RECORDED_CONFIG.tfc_cross_modal_weight, 0.5)
+        self.assertEqual(RECORDED_CONFIG.tfc_cross_camera_weight, 0.1)
+        self.assertEqual(RECORDED_CONFIG.tfc_contrast_temperature, 0.07)
+        self.assertEqual(RECORDED_CONFIG.tfc_transfer_reg_weight, 0.01)
+        self.assertTrue(RECORDED_CONFIG.gradient_checkpointing)
 
     def test_main_logs_validation_metrics_when_wandb_enabled(self):
         run = FakeWandbRun()
@@ -349,33 +340,25 @@ class TrainScriptTest(unittest.TestCase):
             checkpoint_dir = Path(tmp) / "checkpoints"
             with mock.patch("scripts.train.start_wandb_run", new=fake_start_wandb_run):
                 exit_code = main(
-                    [
-                        "--job-builder",
-                        f"{__name__}:build_training_job",
-                        "--epochs",
-                        "1",
-                        "--validation-interval",
-                        "1",
-                        "--checkpoint-dir",
-                        str(checkpoint_dir),
-                        "--enable-wandb",
-                        "--wandb-project",
-                        "T2C-ReID-TrainScript-Test",
-                        "--wandb-entity",
-                        "test-team",
-                        "--wandb-mode",
-                        "offline",
-                        "--wandb-dir",
-                        str(wandb_dir),
-                        "--run-name",
-                        "train-script-test",
+                    _job_overrides(checkpoint_dir)
+                    + [
+                        "enable_wandb=true",
+                        "wandb_project=T2C-ReID-TrainScript-Test",
+                        "wandb_entity=test-team",
+                        "wandb_mode=offline",
+                        f"wandb_dir={wandb_dir.as_posix()}",
+                        "run_name=train-script-test",
                     ],
                     progress_factory=lambda iterable, **kwargs: iterable,
                 )
 
-        step_history = [payload for payload in run.logged if "stage2_train_step" in payload]
+        step_history = [
+            payload for payload in run.logged if "stage2_train_step" in payload
+        ]
         epoch_history = [payload for payload in run.logged if "stage2_epoch" in payload]
-        validation_history = [payload for payload in run.logged if "validation_epoch" in payload]
+        validation_history = [
+            payload for payload in run.logged if "validation_epoch" in payload
+        ]
         self.assertEqual(exit_code, 0)
         self.assertEqual(
             captured,
@@ -391,8 +374,12 @@ class TrainScriptTest(unittest.TestCase):
                 )
             ],
         )
-        self.assertEqual([payload["stage2_train_step"] for payload in step_history], [1, 2])
-        self.assertEqual([payload["stage2_train_step_loss"] for payload in step_history], [1.1, 1.2])
+        self.assertEqual(
+            [payload["stage2_train_step"] for payload in step_history], [1, 2]
+        )
+        self.assertEqual(
+            [payload["stage2_train_step_loss"] for payload in step_history], [1.1, 1.2]
+        )
         self.assertEqual(epoch_history[0]["stage2_train_loss"], 1.0)
         self.assertEqual(epoch_history[0]["stage2_lr"], 0.1)
         self.assertEqual(validation_history[0]["mAP"], 0.1)
@@ -400,67 +387,33 @@ class TrainScriptTest(unittest.TestCase):
         self.assertEqual(run.config["dataset"], "fixture")
 
     def test_tracking_disabled_does_not_load_wandb(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            with mock.patch("t2c_reid.wandb._load_wandb") as load_wandb:
-                exit_code = main(
-                    [
-                        "--job-builder",
-                        f"{__name__}:build_training_job",
-                        "--epochs",
-                        "1",
-                        "--validation-interval",
-                        "1",
-                        "--checkpoint-dir",
-                        str(Path(tmp) / "checkpoints"),
-                    ],
-                    progress_factory=lambda iterable, **kwargs: iterable,
-                )
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch("t2c_reid.wandb._load_wandb") as load_wandb,
+        ):
+            exit_code = main(
+                _job_overrides(Path(tmp) / "checkpoints"),
+                progress_factory=lambda iterable, **kwargs: iterable,
+            )
 
         self.assertEqual(exit_code, 0)
         load_wandb.assert_not_called()
 
     def test_naflex_model_override_is_rejected(self):
-        with contextlib.redirect_stderr(io.StringIO()):
-            with self.assertRaises(SystemExit) as context:
-                main(
-                    [
-                        "--job-builder",
-                        f"{__name__}:build_training_job",
-                        "--siglip2-model-name",
-                        "google/siglip2-so400m-patch16-naflex",
-                    ]
-                )
-        self.assertNotEqual(context.exception.code, 0)
+        with self.assertRaisesRegex(ValueError, "siglip2_model_name"):
+            main(["siglip2_model_name=google/siglip2-so400m-patch16-naflex"])
 
-    def test_removed_clip_model_flag_is_rejected(self):
-        with contextlib.redirect_stderr(io.StringIO()):
-            with self.assertRaises(SystemExit) as context:
-                main(
-                    [
-                        "--job-builder",
-                        f"{__name__}:build_training_job",
-                        "--clip-model-name",
-                        "openai/clip-vit-base-patch16",
-                    ]
-                )
-        self.assertNotEqual(context.exception.code, 0)
+    def test_removed_clip_model_config_is_rejected(self):
+        with self.assertRaises(HydraException):
+            main(["clip_model_name=openai/clip-vit-base-patch16"])
 
-    def test_legacy_tracking_flag_is_rejected(self):
-        legacy_flag = "--enable-" + "ml" + "flow"
-        with contextlib.redirect_stderr(io.StringIO()):
-            with self.assertRaises(SystemExit) as context:
-                main(
-                    [
-                        "--job-builder",
-                        f"{__name__}:build_training_job",
-                        legacy_flag,
-                    ]
-                )
-
-        self.assertNotEqual(context.exception.code, 0)
+    def test_legacy_tracking_config_is_rejected(self):
+        legacy_field = "enable_" + "ml" + "flow"
+        with self.assertRaises(HydraException):
+            main([f"{legacy_field}=true"])
 
 
-def build_training_job(args) -> TrainingJob:
+def build_training_job(config) -> TrainingJob:
     model = torch.nn.Linear(2, 2)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9)
 
@@ -485,30 +438,32 @@ def build_training_job(args) -> TrainingJob:
     )
 
 
-def recording_training_job(args) -> TrainingJob:
-    global RECORDED_ARGS, RECORDED_RNG_STATE
-    RECORDED_ARGS = args
+def recording_training_job(config) -> TrainingJob:
+    global RECORDED_CONFIG, RECORDED_RNG_STATE
+    RECORDED_CONFIG = config
     RECORDED_RNG_STATE = torch.get_rng_state()
-    return build_training_job(args)
+    return build_training_job(config)
 
 
-def recording_epoch_builder(args) -> TrainingJob:
-    job = build_training_job(args)
+def recording_epoch_builder(config) -> TrainingJob:
+    job = build_training_job(config)
 
     def train_one_epoch(epoch: int, reporter) -> dict[str, float]:
         if not RECORDED_EPOCHS:
             RECORDED_MODEL_STATE_AT_FIRST_EPOCH.update(
                 {key: value.clone() for key, value in job.model.state_dict().items()}
             )
-            RECORDED_OPTIMIZER_STATE_AT_FIRST_EPOCH.update(copy.deepcopy(job.optimizer.state_dict()))
+            RECORDED_OPTIMIZER_STATE_AT_FIRST_EPOCH.update(
+                copy.deepcopy(job.optimizer.state_dict())
+            )
         RECORDED_EPOCHS.append(epoch)
         return job.train_one_epoch(epoch, reporter)
 
     return TrainingJob(job.model, job.optimizer, train_one_epoch, job.validate)
 
 
-def declining_map_builder(args) -> TrainingJob:
-    job = build_training_job(args)
+def declining_map_builder(config) -> TrainingJob:
+    job = build_training_job(config)
 
     def validate(epoch: int) -> ReIDMetrics:
         return ReIDMetrics(map=1.0 - epoch / 10.0, cmc={1: 0.5})
@@ -516,31 +471,39 @@ def declining_map_builder(args) -> TrainingJob:
     return TrainingJob(job.model, job.optimizer, job.train_one_epoch, validate)
 
 
-def _recording_job_args(checkpoint_dir: Path) -> list[str]:
+def _recording_job_overrides(checkpoint_dir: Path) -> list[str]:
     return [
-        "--job-builder",
-        f"{__name__}:recording_training_job",
-        "--epochs",
-        "1",
-        "--validation-interval",
-        "1",
-        "--checkpoint-dir",
-        str(checkpoint_dir),
-        "--dataset",
-        "msmt17",
-        "--data-root",
-        "MSMT17_V1",
-        "--siglip2-model-name",
-        "google/siglip2-so400m-patch14-384",
-        "--batch-size",
-        "8",
-        "--num-workers",
-        "2",
-        "--lr",
-        "0.001",
-        "--device",
-        "cpu",
+        *_job_overrides(
+            checkpoint_dir,
+            builder=f"{__name__}:recording_training_job",
+        ),
+        "dataset=msmt17",
+        "data_root=MSMT17_V1",
+        "siglip2_model_name=google/siglip2-so400m-patch14-384",
+        "batch_size=8",
+        "num_workers=2",
+        "lr=0.001",
+        "device=cpu",
     ]
+
+
+def _job_overrides(
+    checkpoint_dir: Path,
+    *,
+    builder: str | None = None,
+    epochs: int = 1,
+    validation_interval: int = 1,
+    resume: Path | None = None,
+) -> list[str]:
+    overrides = [
+        f"job_builder={builder or f'{__name__}:build_training_job'}",
+        f"epochs={epochs}",
+        f"validation_interval={validation_interval}",
+        f"checkpoint_dir={checkpoint_dir.as_posix()}",
+    ]
+    if resume is not None:
+        overrides.append(f"resume={resume.as_posix()}")
+    return overrides
 
 
 class FakeWandbConfig(dict):

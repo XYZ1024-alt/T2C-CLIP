@@ -69,6 +69,7 @@ f_v_raw / f_v
 - `model.py`：`T2CReIDModel` 的 Stage-1、Stage-2 和推理路径。
 - `losses.py`：监督式 SigLIP、全身份 anchor SigLIP、batch-hard triplet。
 - `training.py`：两阶段 loss 组合。
+- `configuration.py` / `configs/`：Hydra structured schema、默认 recipe 和 dataset config group。
 - `jobs/siglip2_reid.py`：数据、模型、冻结、优化器、precision、缓存和验证。
 - `precision.py`：precision 解析、autocast、GradScaler 和 optimizer step。
 - `datasets.py` / `transforms.py`：Python reference dataset、共享变换配置、Rust batch collator。
@@ -515,8 +516,9 @@ fingerprint 和全部 TFC 配置纳入 resume 兼容性校验。schema 2 Stage-2
     rerank 与稠密 reference 距离/指标误差不超过 `1e-6`。
 15. 原生 eval resize 的 shape/dtype/contiguous 契约一致，fixture 最大误差不超过一个
     8-bit 量化步长对应的归一化值；固定 seed 的 Rust 增强可重放。
-16. `uv run train --help` 只显示 SigLIP 2 与 Rust backend 公共参数，不显示旧
-    `--clip-*` 参数。
+16. train、feature evaluation 和 native benchmark 三个入口均由 Hydra typed config
+    管理；各自 `--help` / `--cfg job` 可输出组合配置，训练入口显示 dataset config
+    group，且不存在旧 `clip_*` 字段或 argparse 参数路径。
 
 ## 13. 明确不做
 

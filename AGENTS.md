@@ -18,6 +18,7 @@ Stack:
 - Python 3.14+; the current locked environment uses Python 3.14.6.
 - PyTorch 2.13 and torchvision 0.28, using the CUDA 13.2 wheel index.
 - Transformers 5.14.1.
+- Hydra 1.4 development line with OmegaConf 2.4 for Python 3.14 support.
 - Weights & Biases 0.28.1.
 - `uv` for dependency, environment, and command execution.
 - Rust 1.85+ with maturin 1.14, PyO3/rust-numpy 0.29, Rayon, and pure-Rust
@@ -77,6 +78,8 @@ T2C-ReID/
 |   |-- native.py              Mandatory native ABI/version check
 |   |-- evaluation.py          Chunked Rust mAP/CMC and sparse rerank dispatch
 |   |-- retrieval.py           Fused/image-only retrieval mode constants
+|   |-- configuration.py       Typed Hydra schemas and composition helpers
+|   |-- configs/               Training/evaluation/benchmark Hydra configs
 |   |-- loops.py               Generic epoch loop and checkpoint writing
 |   |-- wandb.py               Stage-aware W&B adapter
 |   |-- jobs/siglip2_reid.py   End-to-end training job assembly and runtime
@@ -129,7 +132,7 @@ image encoder LR `5e-6`. Override only the parameters needed for an experiment.
 `precision=auto` resolves to BF16 on capable CUDA devices, FP16 + GradScaler on
 other CUDA devices, and FP32 on CPU. Gradient accumulation does not enlarge the
 pairwise SigLIP or triplet-mining scope; both operate on each micro-batch, so
-`--batch-size` must be the full PK batch and accumulation stays at 1 unless
+`batch_size` must be the full PK batch and accumulation stays at 1 unless
 memory forces otherwise.
 
 Two defaults are calibration-sensitive and must be re-derived, not copied, if
@@ -142,15 +145,16 @@ the dataset or feature scale changes:
 - `triplet_margin`: batch-hard triplet runs on **unnormalized** `visual_raw`
   with a euclidean metric, so a `0.3` margin is meaningful only while
   `||visual_raw||` is small. Measure the fraction of anchors with a non-zero
-  hinge; if it is near zero the term is inert and `--triplet-metric cosine`
+  hinge; if it is near zero the term is inert and `triplet_metric=cosine`
   (well scaled for a `[0, 2]` distance) is the right correction.
 
 ### Feature Evaluation
 
 ```bash
-uv run python -m t2c_reid.cli.evaluate path/to/features.npz \
-  --output metrics.json \
-  --ranks 1 5 10
+uv run python -m t2c_reid.cli.evaluate \
+  features=path/to/features.npz \
+  output=metrics.json \
+  ranks=[1,5,10]
 ```
 
 The NPZ must contain `query_features`, `gallery_features`, `query_ids`,

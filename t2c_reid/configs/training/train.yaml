@@ -1,0 +1,81 @@
+defaults:
+  - train_schema
+  - dataset: msmt17
+  - _self_
+
+job_builder: t2c_reid.jobs.siglip2_reid:build_training_job
+epochs: 60
+validation_interval: 5
+resume: null
+seed: null
+enable_wandb: false
+wandb_project: T2C-ReID
+wandb_entity: null
+wandb_mode: online
+wandb_dir: null
+siglip2_model_name: google/siglip2-so400m-patch14-384
+siglip2_checkpoint: null
+batch_size: 64
+eval_batch_size: 128
+gradient_accumulation_steps: 1
+precision: auto
+image_height: 392
+image_width: 196
+num_instances: 4
+num_workers: 8
+data_backend: rust
+prefetch_factor: 2
+pin_memory: null
+persistent_workers: null
+rust_data_threads: 2
+evaluation_backend: rust
+evaluation_chunk_size: 256
+lr: 0.0001
+image_encoder_lr: 0.000005
+sie_coe: 0.0
+device: cuda
+beta: 0.1
+beta_warmup_epochs: 0
+stage1_lr_scheduler: cosine
+stage1_warmup_epochs: 5
+stage2_lr_scheduler: cosine
+stage2_warmup_epochs: 5
+grad_clip_norm: 5.0
+context_length: 4
+tfc_momentum: 0.5
+tfc_tail_momentum: 0.9
+tfc_class_balance_beta: 0.9999
+tfc_local_weight: 1.0
+tfc_global_weight: 1.0
+tfc_cross_modal_weight: 0.5
+tfc_cross_camera_weight: 0.1
+tfc_contrast_temperature: 0.07
+tfc_transfer_reg_weight: 0.01
+triplet_margin: 0.3
+triplet_metric: euclidean
+tfc_weight: 1.0
+alignment_weight: 0.1
+stage1_epochs: 60
+stage1_feature_cache: true
+id_logit_scale: 1.0
+label_smoothing: 0.1
+reid_head: bnneck
+retrieval_mode: fused
+report_rerank: false
+flip_tta: false
+gradient_checkpointing: true
+freeze_prompt_bank_stage2: false
+freeze_image_encoder_stage1: true
+freeze_image_encoder_stage2: false
+freeze_text_encoder: true
+sanity_gate_epochs: 0
+sanity_gate_factor: 1.5
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: runs/hydra/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: runs/hydra/multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}

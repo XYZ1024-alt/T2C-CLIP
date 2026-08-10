@@ -66,6 +66,7 @@ Core requirements are declared in `pyproject.toml`:
 - PyTorch 2.13+
 - torchvision 0.28+
 - Transformers 5.14.1+
+- Hydra 1.4 development line (required for Python 3.14)
 - Weights & Biases 0.28+
 
 The first real run downloads the selected Hugging Face checkpoint, which is
@@ -104,23 +105,38 @@ Only specify values that differ from the baseline recipe. For example:
 
 ```bash
 uv run train \
-  --data-root D:/datasets/MSMT17_V1 \
-  --tfc-weight 0.5 \
-  --alignment-weight 0.25 \
-  --run-name msmt17-tfc-weight-sweep
+  data_root=D:/datasets/MSMT17_V1 \
+  tfc_weight=0.5 \
+  alignment_weight=0.25 \
+  run_name=msmt17-tfc-weight-sweep
 ```
+
+Training parameters are composed by Hydra from
+`t2c_reid/configs/training/train.yaml`. Dataset-specific paths and run names live in
+the `dataset` config group:
+
+```bash
+uv run train dataset=market1501
+uv run train --cfg job
+uv run train --help
+```
+
+Hydra overrides use `snake_case=value`; the former argparse-style
+`--kebab-case value` options are not supported. Hydra keeps the process working
+directory unchanged and writes its resolved config and override provenance
+under the ignored `runs/hydra/` tree.
 
 The defaults select MSMT17 at `data/MSMT17_V1`, the fixed model, `392x196`
 input, Stage-1 `60`, Stage-2 `60`, batch `64` with `4` instances per identity,
 accumulation `1`, eval batch `128`, cosine learning rates with a `5`-epoch
 warmup in both stages, BNNeck, automatic precision, and gradient checkpointing.
-`--job-builder` remains available for test fixtures or external jobs but is not
+`job_builder` remains available for test fixtures or external jobs but is not
 required for normal T2C-ReID training.
 
 ### Why The Batch Is 64 And Accumulation Is 1
 
-`--batch-size` is the real triplet and SigLIP mining scope, and gradient
-accumulation does not widen it. At `--batch-size 8 --num-instances 2` the PK
+`batch_size` is the real triplet and SigLIP mining scope, and gradient
+accumulation does not widen it. At `batch_size=8 num_instances=2` the PK
 sampler yields `P=4` identities with `K=2` instances, so every batch-hard
 triplet anchor has exactly **one** positive and six negatives — the mining
 degenerates into "take the only positive". The default is now the standard ReID
@@ -138,10 +154,10 @@ Stage-1 trains identity-aware prompts with the supervised SigLIP objective.
 Every image/text pair sharing a person ID is positive; all other pairs in the
 PK micro-batch are negative. The image tower is frozen by default.
 
-`--stage1-feature-cache` is enabled by default. It extracts the frozen
+`stage1_feature_cache=true` is the default. It extracts the frozen
 train-split image features once through the eval transform and reuses them for
-all Stage-1 epochs. The flag is rejected if the Stage-1 image tower is
-trainable.
+all Stage-1 epochs. The configuration is rejected when
+`freeze_image_encoder_stage1=false`.
 
 ### Stage 2
 
@@ -185,9 +201,9 @@ available positive cameras. The text center teacher exactly encodes
 `global + camera + identity` under `no_grad`; identity prompts remain absent
 from query/gallery retrieval.
 
-Long-tail identities use higher EMA momentum between `--tfc-momentum` and
-`--tfc-tail-momentum`. Effective-number class weights are applied to every
-sample-level TFC component. Set `--tfc-weight 0` to skip the teacher text
+Long-tail identities use higher EMA momentum between `tfc_momentum` and
+`tfc_tail_momentum`. Effective-number class weights are applied to every
+sample-level TFC component. Set `tfc_weight=0` to skip the teacher text
 forward, all center updates, and all TFC losses.
 
 The pretrained `logit_scale` and `logit_bias` are frozen constants:
@@ -215,7 +231,7 @@ rejects every other model ID, including NaFlex variants.
 
 ### Memory Semantics
 
-`--batch-size` is the actual SigLIP pairwise and triplet-mining micro-batch.
+`batch_size` is the actual SigLIP pairwise and triplet-mining micro-batch.
 Gradient accumulation does not enlarge either mining scope, which is why the
 default recipe puts the whole batch in one micro-batch:
 
@@ -230,10 +246,10 @@ Approximate Stage-2 peak on the default recipe: about 13 GB static (all
 parameters in FP32, plus gradients and AdamW moments for the 428M-parameter
 vision tower, the autocast BF16 weight cache, and the TFC prototype buffers) and
 about 40 MB of activations per image with gradient checkpointing on — roughly
-16 GB at batch 64. Do not disable `--gradient-checkpointing`: without it the
+16 GB at batch 64. Do not set `gradient_checkpointing=false`: without it the
 per-image activation cost is over 400 MB.
 
-`--precision auto` resolves as follows:
+`precision=auto` resolves as follows:
 
 - CUDA with BF16 support: `bf16`
 - other CUDA: `fp16` with `torch.amp.GradScaler`
@@ -242,83 +258,83 @@ per-image activation cost is over 400 MB.
 Explicit unsupported low precision fails at startup instead of silently
 falling back. FP16 scaler state is saved and restored with the checkpoint.
 
-## Main CLI Options
+## Main Hydra Parameters
 
 Run and data defaults:
 
 - `uv run train`
-- `--dataset msmt17`
-- `--data-root data/MSMT17_V1`
-- `--stage1-epochs 60`
-- `--epochs 60` (Stage-2 epochs)
-- `--validation-interval 5`
-- `--checkpoint-dir checkpoints/msmt17-siglip2-tfc`
-- `--job-builder t2c_reid.jobs.siglip2_reid:build_training_job`
+- `dataset=msmt17` (config group: `msmt17|market1501`)
+- `data_root=data/MSMT17_V1`
+- `stage1_epochs=60`
+- `epochs=60` (Stage-2 epochs)
+- `validation_interval=5`
+- `checkpoint_dir=checkpoints/msmt17-siglip2-tfc`
+- `job_builder=t2c_reid.jobs.siglip2_reid:build_training_job`
 
 Backbone and input:
 
-- `--siglip2-model-name google/siglip2-so400m-patch14-384` (the only accepted value)
-- `--siglip2-checkpoint PATH` (optional strict additional state dict)
-- `--image-height 392`
-- `--image-width 196`
-- `--sie-coe 0.0`
-- `--context-length 4`
+- `siglip2_model_name=google/siglip2-so400m-patch14-384` (the only accepted value)
+- `siglip2_checkpoint=null` (optional strict additional state dict)
+- `image_height=392`
+- `image_width=196`
+- `sie_coe=0.0`
+- `context_length=4`
 
 Batching and memory:
 
-- `--batch-size 64`
-- `--eval-batch-size 128`
-- `--num-instances 4`
-- `--gradient-accumulation-steps 1`
-- `--num-workers 8`
-- `--data-backend rust|python` (default `rust`; Python is a reference backend)
-- `--prefetch-factor 2`
-- `--pin-memory / --no-pin-memory` (defaults on for CUDA)
-- `--persistent-workers / --no-persistent-workers` (defaults on with workers)
-- `--rust-data-threads 2`
-- `--evaluation-backend rust|python` (default `rust`)
-- `--evaluation-chunk-size 256`
-- `--precision auto|fp32|bf16|fp16`
-- `--gradient-checkpointing / --no-gradient-checkpointing`
+- `batch_size=64`
+- `eval_batch_size=128`
+- `num_instances=4`
+- `gradient_accumulation_steps=1`
+- `num_workers=8`
+- `data_backend=rust|python` (default `rust`; Python is a reference backend)
+- `prefetch_factor=2`
+- `pin_memory=null|true|false` (`null` enables it automatically on CUDA)
+- `persistent_workers=null|true|false` (`null` enables it when workers exist)
+- `rust_data_threads=2`
+- `evaluation_backend=rust|python` (default `rust`)
+- `evaluation_chunk_size=256`
+- `precision=auto|fp32|bf16|fp16`
+- `gradient_checkpointing=true|false`
 
 Optimization:
 
-- `--lr 1e-4`
-- `--image-encoder-lr 5e-6`
-- `--grad-clip-norm 5.0` (0 disables)
-- `--alignment-weight 0.1`
-- `--tfc-weight 1.0`
-- `--tfc-momentum 0.5` (highest-frequency identity)
-- `--tfc-tail-momentum 0.9` (lowest-frequency identity)
-- `--tfc-class-balance-beta 0.9999`
-- `--tfc-local-weight 1.0`
-- `--tfc-global-weight 1.0`
-- `--tfc-cross-modal-weight 0.5`
-- `--tfc-cross-camera-weight 0.1`
-- `--tfc-contrast-temperature 0.07`
-- `--tfc-transfer-reg-weight 0.01`
-- `--triplet-margin 0.3`
-- `--triplet-metric euclidean|cosine`
-- `--label-smoothing 0.1`
-- `--stage1-lr-scheduler none|cosine` (default `cosine`)
-- `--stage1-warmup-epochs 5`
-- `--stage2-lr-scheduler none|cosine` (default `cosine`)
-- `--stage2-warmup-epochs 5`
-- `--beta 0.1`
-- `--beta-warmup-epochs 0`
+- `lr=1e-4`
+- `image_encoder_lr=5e-6`
+- `grad_clip_norm=5.0` (0 disables)
+- `alignment_weight=0.1`
+- `tfc_weight=1.0`
+- `tfc_momentum=0.5` (highest-frequency identity)
+- `tfc_tail_momentum=0.9` (lowest-frequency identity)
+- `tfc_class_balance_beta=0.9999`
+- `tfc_local_weight=1.0`
+- `tfc_global_weight=1.0`
+- `tfc_cross_modal_weight=0.5`
+- `tfc_cross_camera_weight=0.1`
+- `tfc_contrast_temperature=0.07`
+- `tfc_transfer_reg_weight=0.01`
+- `triplet_margin=0.3`
+- `triplet_metric=euclidean|cosine`
+- `label_smoothing=0.1`
+- `stage1_lr_scheduler=none|cosine` (default `cosine`)
+- `stage1_warmup_epochs=5`
+- `stage2_lr_scheduler=none|cosine` (default `cosine`)
+- `stage2_warmup_epochs=5`
+- `beta=0.1`
+- `beta_warmup_epochs=0`
 
 Freezing and retrieval:
 
-- `--freeze-image-encoder-stage1 / --no-freeze-image-encoder-stage1`
-- `--freeze-image-encoder-stage2 / --no-freeze-image-encoder-stage2`
-- `--freeze-text-encoder / --no-freeze-text-encoder`
-- `--freeze-prompt-bank-stage2 / --no-freeze-prompt-bank-stage2`
-- `--reid-head linear|bnneck` (default `bnneck`)
-- `--retrieval-mode fused|image_only`
-- `--report-rerank`
-- `--flip-tta` (off by default; averaging the mirrored view deviates from the
-  protocol of the published baselines this project compares against, so it must
-  be an explicit and disclosed choice)
+- `freeze_image_encoder_stage1=true|false`
+- `freeze_image_encoder_stage2=true|false`
+- `freeze_text_encoder=true|false`
+- `freeze_prompt_bank_stage2=true|false`
+- `reid_head=linear|bnneck` (default `bnneck`)
+- `retrieval_mode=fused|image_only`
+- `report_rerank=true|false`
+- `flip_tta=true|false` (off by default; averaging the mirrored view deviates
+  from the protocol of the published baselines this project compares against,
+  so it must be an explicit and disclosed choice)
 
 ## Checkpoints And Resume
 
@@ -338,14 +354,14 @@ New checkpoints use schema version 3 and include:
 Resume a Stage-2 run with the same architecture and precision:
 
 ```bash
-uv run train \
-  --resume checkpoints/msmt17-siglip2-tfc/last.pth
+uv run train resume=checkpoints/msmt17-siglip2-tfc/last.pth
 ```
 
 This migration intentionally rejects schema 2 Stage-2 checkpoints, OpenAI CLIP
-weights, and old T2C-CLIP training checkpoints. The removed options
-`--clip-model-name`, `--clip-checkpoint`, and `--clip-weight` are argparse
-errors. Incompatible resume metadata fails before model weights are loaded.
+weights, and old T2C-CLIP training checkpoints. The removed config fields
+`clip_model_name`, `clip_checkpoint`, and `clip_weight` are rejected by Hydra's
+structured schema. Incompatible resume metadata fails before model weights are
+loaded.
 
 ## Weights & Biases
 
@@ -354,9 +370,9 @@ Enable online tracking:
 ```bash
 uv run wandb login
 uv run train \
-  --enable-wandb \
-  --wandb-project T2C-ReID \
-  --run-name msmt17-siglip2-camera-tfc
+  enable_wandb=true \
+  wandb_project=T2C-ReID \
+  run_name=msmt17-siglip2-camera-tfc
 ```
 
 Training metrics include:
@@ -377,11 +393,14 @@ micro-batches; epoch metrics average all micro-batches.
 Evaluate pre-extracted query/gallery features from `.npz`:
 
 ```bash
-uv run python -m t2c_reid.cli.evaluate path/to/features.npz \
-  --output metrics.json \
-  --ranks 1 5 10
+uv run python -m t2c_reid.cli.evaluate \
+  features=path/to/features.npz \
+  output=metrics.json \
+  ranks=[1,5,10]
 ```
 
+Evaluation parameters come from
+`t2c_reid/configs/evaluation/evaluate.yaml`.
 The evaluator applies the standard Image-to-Image ReID protocol and excludes
 same-identity, same-camera gallery samples. Rust evaluates exact cosine scores
 in query chunks and aggregates deterministic mAP/CMC without retaining the
@@ -390,11 +409,12 @@ complete `Q x G` score matrix. Primary metrics remain no-rerank.
 Add exact sparse k-reciprocal metrics without replacing the primary result:
 
 ```bash
-uv run python -m t2c_reid.cli.evaluate path/to/features.npz \
-  --report-rerank \
-  --rerank-k1 20 \
-  --rerank-k2 6 \
-  --rerank-lambda 0.3
+uv run python -m t2c_reid.cli.evaluate \
+  features=path/to/features.npz \
+  report_rerank=true \
+  rerank_k1=20 \
+  rerank_k2=6 \
+  rerank_lambda=0.3
 ```
 
 Sparse rerank keeps exact all-sample neighbor search and therefore still has
@@ -411,11 +431,11 @@ bilinear resize, padded crop, SigLIP normalization, and normalized-space random
 erasing, then transfers an owned contiguous `BCHW float32` allocation to NumPy
 and `torch.from_numpy` without copying the element buffer.
 
-A fixed `--seed` is repeatable within the same Rust pipeline version. The Rust
-augmentation parameters and operation order match the torchvision pipeline,
-but stochastic pixel values and random-number sequences are not bitwise
-compatible with the Python backend. Eval resize regression fixtures differ by
-at most one 8-bit quantization step after normalization.
+A fixed training `seed` is repeatable within the same Rust pipeline version.
+The Rust augmentation parameters and operation order match the torchvision
+pipeline, but stochastic pixel values and random-number sequences are not
+bitwise compatible with the Python backend. Eval resize regression fixtures
+differ by at most one 8-bit quantization step after normalization.
 
 ## Performance Benchmark
 
@@ -423,16 +443,18 @@ Run the self-contained synthetic benchmark:
 
 ```bash
 uv run python -m t2c_reid.cli.benchmark_native \
-  --mode all \
-  --runs 5 \
-  --warmup-runs 1 \
-  --output output/native-benchmark.json
+  mode=all \
+  runs=5 \
+  warmup_runs=1 \
+  output=output/native-benchmark.json
 ```
 
-Use real training images by adding `--dataset market1501|msmt17 --data-root
-PATH`. The benchmark defaults to two Rust threads per data worker because that
+Benchmark parameters come from
+`t2c_reid/configs/benchmark/benchmark.yaml`. Use real training images by adding
+`dataset=market1501|msmt17 data_root=PATH`. The benchmark defaults to two Rust
+threads per data worker because that
 was the first configuration to clear the synthetic throughput gate; production
-training retains the conservative `--rust-data-threads 1` default and should be
+training uses `rust_data_threads=2` by default and should be
 tuned against available CPU cores. The JSON reports median/p95 duration, throughput, sampled RSS, backend
 speedup, metric parity, and the acceptance gates: data `1.5x`, primary
 evaluation `3x`, rerank `2x`, and rerank RSS ratio `<=0.4`. Benchmark gates are

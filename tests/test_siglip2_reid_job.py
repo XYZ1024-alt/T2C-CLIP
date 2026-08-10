@@ -1,33 +1,36 @@
-from argparse import Namespace
-from pathlib import Path
 import random
-from types import SimpleNamespace
 import tempfile
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
-from PIL import Image
 import torch
+from PIL import Image
 from transformers import SiglipConfig, SiglipModel
 
+from t2c_reid.configuration import TrainingConfig, compose_training_config
 from t2c_reid.datasets import ReIDImageBatch
 from t2c_reid.jobs.siglip2_reid import (
+    BetaSchedule,
+    JobDataConfig,
     Siglip2LoadResult,
     Siglip2ReIDTrainingModel,
-    JobDataConfig,
+    StageLRScheduler,
     TransformBundle,
     _extract_features,
-    BetaSchedule,
-    StageLRScheduler,
+    _validate_loaded_siglip2,
     build_training_job,
     load_dataset_bundle,
     load_transformers_siglip2,
-    _validate_loaded_siglip2,
 )
 from t2c_reid.retrieval import IMAGE_ONLY_RETRIEVAL
-from t2c_reid.siglip2_backbone import SIGLIP2_MODEL_ID
 from t2c_reid.transforms import Siglip2ImageTransform
-from tests._siglip2_fakes import FakeSiglip2, FakeSiglip2Tokenizer, FakeSiglip2ImageProcessor
+from tests._siglip2_fakes import (
+    FakeSiglip2,
+    FakeSiglip2ImageProcessor,
+    FakeSiglip2Tokenizer,
+)
 
 
 class Siglip2ReIDJobTest(unittest.TestCase):
@@ -45,9 +48,7 @@ class Siglip2ReIDJobTest(unittest.TestCase):
 
     def test_public_loader_rejects_non_target_checkpoint(self):
         with self.assertRaisesRegex(ValueError, "only supports"):
-            load_transformers_siglip2(
-                "google/siglip2-so400m-patch16-naflex"
-            )
+            load_transformers_siglip2("google/siglip2-so400m-patch16-naflex")
 
     def test_load_dataset_bundle_rejects_missing_root(self):
         config = JobDataConfig("market1501", Path("missing"))
@@ -78,13 +79,17 @@ class Siglip2ReIDJobTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            data = load_dataset_bundle(JobDataConfig("msmt17", root), FakeSiglip2ImageProcessor())
+            data = load_dataset_bundle(
+                JobDataConfig("msmt17", root), FakeSiglip2ImageProcessor()
+            )
 
         self.assertEqual(len(data.train), 3)
         self.assertEqual(data.num_train_ids, 2)
         self.assertTrue(torch.equal(data.identity_counts, torch.tensor([2, 1])))
         self.assertEqual(tuple(data.identity_camera_counts.shape), (2, 3))
-        self.assertTrue(torch.equal(data.identity_camera_counts.sum(dim=1), data.identity_counts))
+        self.assertTrue(
+            torch.equal(data.identity_camera_counts.sum(dim=1), data.identity_counts)
+        )
 
     def test_load_dataset_bundle_uses_train_transform_only_for_train_split(self):
         class ConstantTransform:
@@ -103,7 +108,9 @@ class Siglip2ReIDJobTest(unittest.TestCase):
 
             data = load_dataset_bundle(JobDataConfig("market1501", root), transforms)
 
-            self.assertTrue(torch.equal(data.train[0].image, torch.full((3, 2, 2), 2.0)))
+            self.assertTrue(
+                torch.equal(data.train[0].image, torch.full((3, 2, 2), 2.0))
+            )
             self.assertTrue(torch.equal(data.query[0].image, torch.ones(3, 2, 2)))
             self.assertTrue(torch.equal(data.gallery[0].image, torch.ones(3, 2, 2)))
 
@@ -131,7 +138,9 @@ class Siglip2ReIDJobTest(unittest.TestCase):
     def test_build_training_job_returns_real_callbacks_with_fake_siglip2(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
-            job = build_training_job(_training_args(root), siglip2_loader=_load_fake_siglip2)
+            job = build_training_job(
+                _training_config(root), siglip2_loader=_load_fake_siglip2
+            )
             reporter = TrainBatchReporterRecorder()
 
             train_metrics = job.train_one_epoch(1, reporter)
@@ -236,7 +245,9 @@ class Siglip2ReIDJobTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
             with self.assertRaisesRegex(ValueError, "patch budget mismatch"):
-                build_training_job(_training_args(root), siglip2_loader=mismatched_loader)
+                build_training_job(
+                    _training_config(root), siglip2_loader=mismatched_loader
+                )
 
     def test_loaded_tokenizer_special_ids_must_match_model(self):
         class WrongTokenizer(FakeSiglip2Tokenizer):
@@ -252,12 +263,14 @@ class Siglip2ReIDJobTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
             with self.assertRaisesRegex(ValueError, "bos_token_id mismatch"):
-                build_training_job(_training_args(root), siglip2_loader=mismatched_loader)
+                build_training_job(
+                    _training_config(root), siglip2_loader=mismatched_loader
+                )
 
     def test_non_patch_aligned_image_size_fails_at_startup(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
-            args = _training_args(root)
+            args = _training_config(root)
             args.image_height = 391
             with self.assertRaisesRegex(ValueError, "divisible"):
                 build_training_job(args, siglip2_loader=_load_fake_siglip2)
@@ -266,9 +279,9 @@ class Siglip2ReIDJobTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
             enabled = build_training_job(
-                _training_args(root), siglip2_loader=_load_fake_siglip2
+                _training_config(root), siglip2_loader=_load_fake_siglip2
             )
-            args = _training_args(root)
+            args = _training_config(root)
             args.gradient_checkpointing = False
             disabled = build_training_job(args, siglip2_loader=_load_fake_siglip2)
 
@@ -282,11 +295,12 @@ class Siglip2ReIDJobTest(unittest.TestCase):
     def test_build_training_job_returns_two_stage_job_when_stage1_epochs_positive(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
-            args = _training_args(root)
+            args = _training_config(root)
             args.stage1_epochs = 1
             job = build_training_job(args, siglip2_loader=_load_fake_siglip2)
 
         from scripts.train import TwoStageTrainingJob
+
         self.assertIsInstance(job, TwoStageTrainingJob)
 
     def test_build_training_job_rejects_training_split_without_positive_pairs(self):
@@ -294,7 +308,9 @@ class Siglip2ReIDJobTest(unittest.TestCase):
             root = _build_market_fixture_without_positive_pairs(Path(tmp))
 
             with self.assertRaises(ValueError):
-                build_training_job(_training_args(root), siglip2_loader=_load_fake_siglip2)
+                build_training_job(
+                    _training_config(root), siglip2_loader=_load_fake_siglip2
+                )
 
     def test_extract_features_passes_configured_retrieval_mode(self):
         model = RetrievalModeRecorder()
@@ -354,14 +370,16 @@ class Siglip2ReIDJobTest(unittest.TestCase):
         self.assertFalse(torch.allclose(plain.features, averaged.features))
         self.assertTrue(
             torch.allclose(
-                averaged.features.norm(dim=1), torch.ones(averaged.features.shape[0]), atol=1e-6
+                averaged.features.norm(dim=1),
+                torch.ones(averaged.features.shape[0]),
+                atol=1e-6,
             )
         )
 
     def test_validation_reports_rerank_metrics_when_requested(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
-            args = _training_args(root)
+            args = _training_config(root)
             args.report_rerank = True
 
             job = build_training_job(args, siglip2_loader=_load_fake_siglip2)
@@ -380,21 +398,18 @@ class Siglip2ReIDJobTest(unittest.TestCase):
             key = "vision_model.embeddings.patch_embedding.weight"
             state[key] = torch.full_like(state[key], 0.25)
             torch.save(state, checkpoint)
-            args = _training_args(root)
+            args = _training_config(root)
             args.siglip2_checkpoint = checkpoint
 
             job = build_training_job(args, siglip2_loader=_load_fake_siglip2)
 
-        loaded = (
-            job.model.retrieval_model.image_encoder.siglip2_model
-            .vision_model.embeddings.patch_embedding.weight
-        )
+        loaded = job.model.retrieval_model.image_encoder.siglip2_model.vision_model.embeddings.patch_embedding.weight
         self.assertTrue(torch.allclose(loaded, torch.full_like(loaded, 0.25)))
 
     def test_missing_siglip2_checkpoint_fails_at_startup(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
-            args = _training_args(root)
+            args = _training_config(root)
             args.siglip2_checkpoint = Path(tmp) / "missing.pth"
 
             with self.assertRaises(FileNotFoundError):
@@ -405,16 +420,18 @@ class Siglip2ReIDJobTest(unittest.TestCase):
             root = _build_market_fixture(Path(tmp))
             checkpoint = Path(tmp) / "bad_siglip2_state.pth"
             torch.save({"not_a_alignment_weight": torch.ones(1)}, checkpoint)
-            args = _training_args(root)
+            args = _training_config(root)
             args.siglip2_checkpoint = checkpoint
 
-            with self.assertRaisesRegex(ValueError, "unexpected SigLIP 2 checkpoint keys"):
+            with self.assertRaisesRegex(
+                ValueError, "unexpected SigLIP 2 checkpoint keys"
+            ):
                 build_training_job(args, siglip2_loader=_load_fake_siglip2)
 
     def test_no_freeze_image_encoder_stage2_reenables_encoder_after_stage1_freeze(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
-            args = _training_args(root)
+            args = _training_config(root)
             args.stage1_epochs = 1
             args.freeze_image_encoder_stage1 = True
             args.freeze_image_encoder_stage2 = False
@@ -427,7 +444,7 @@ class Siglip2ReIDJobTest(unittest.TestCase):
     def test_stage1_training_reapplies_stage1_freezing_before_epoch(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
-            args = _training_args(root)
+            args = _training_config(root)
             args.stage1_epochs = 1
             args.freeze_image_encoder_stage1 = True
             args.freeze_image_encoder_stage2 = False
@@ -442,7 +459,7 @@ class Siglip2ReIDJobTest(unittest.TestCase):
     def test_stage1_learning_rate_follows_its_own_warmup_and_cosine(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
-            args = _training_args(root)
+            args = _training_config(root)
             args.stage1_epochs = 4
             args.stage1_lr_scheduler = "cosine"
             args.stage1_warmup_epochs = 2
@@ -465,7 +482,7 @@ class Siglip2ReIDJobTest(unittest.TestCase):
     def test_stage1_scheduler_is_absent_when_not_requested(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
-            args = _training_args(root)
+            args = _training_config(root)
             args.stage1_epochs = 2
             args.stage1_lr_scheduler = "none"
             job = build_training_job(args, siglip2_loader=_load_fake_siglip2)
@@ -482,7 +499,7 @@ class Siglip2ReIDJobTest(unittest.TestCase):
     def test_no_freeze_image_encoder_stage2_works_without_stage1_epochs(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
-            args = _training_args(root)
+            args = _training_config(root)
             args.stage1_epochs = 0
             args.freeze_image_encoder_stage1 = True
             args.freeze_image_encoder_stage2 = False
@@ -495,7 +512,7 @@ class Siglip2ReIDJobTest(unittest.TestCase):
     def test_stage2_can_freeze_prompt_bank_after_stage1(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
-            args = _training_args(root)
+            args = _training_config(root)
             args.stage1_epochs = 1
             args.freeze_prompt_bank_stage2 = True
 
@@ -513,13 +530,15 @@ class Siglip2ReIDJobTest(unittest.TestCase):
         # only the TFC teacher call.
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
-            args = _training_args(root)
+            args = _training_config(root)
             args.freeze_prompt_bank_stage2 = True
             args.freeze_text_encoder = True
             args.epochs = 2
 
             job = build_training_job(args, siglip2_loader=_load_fake_siglip2)
-            encoder = job.model.retrieval_model.image_encoder.siglip2_model.text_model.encoder
+            encoder = (
+                job.model.retrieval_model.image_encoder.siglip2_model.text_model.encoder
+            )
             encoder.call_count = 0
             job.train_one_epoch(1, TrainBatchReporterRecorder())
             first_epoch_calls = encoder.call_count
@@ -529,20 +548,24 @@ class Siglip2ReIDJobTest(unittest.TestCase):
         self.assertEqual(first_epoch_calls, 3)
         self.assertEqual(second_epoch_calls, 1)
 
-    def test_stage2_frozen_prompts_with_trainable_text_encoder_recompute_anchors_each_epoch(self):
+    def test_stage2_frozen_prompts_with_trainable_text_encoder_recompute_anchors_each_epoch(
+        self,
+    ):
         # The anchors pass through the text encoder too: with the prompt bank
         # frozen but the text tower still training, the anchor matrix must be
         # re-encoded at every Stage-2 epoch start (and no camera cache may
         # exist), exactly like the fully unfrozen case.
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
-            args = _training_args(root)
+            args = _training_config(root)
             args.freeze_prompt_bank_stage2 = True
             args.freeze_text_encoder = False
             args.epochs = 2
 
             job = build_training_job(args, siglip2_loader=_load_fake_siglip2)
-            encoder = job.model.retrieval_model.image_encoder.siglip2_model.text_model.encoder
+            encoder = (
+                job.model.retrieval_model.image_encoder.siglip2_model.text_model.encoder
+            )
             encoder.call_count = 0
             job.train_one_epoch(1, TrainBatchReporterRecorder())
             first_epoch_calls = encoder.call_count
@@ -559,11 +582,13 @@ class Siglip2ReIDJobTest(unittest.TestCase):
         # per-batch retrieval text (1 batch in this fixture); no camera cache.
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
-            args = _training_args(root)
+            args = _training_config(root)
             args.epochs = 2
 
             job = build_training_job(args, siglip2_loader=_load_fake_siglip2)
-            encoder = job.model.retrieval_model.image_encoder.siglip2_model.text_model.encoder
+            encoder = (
+                job.model.retrieval_model.image_encoder.siglip2_model.text_model.encoder
+            )
             encoder.call_count = 0
             job.train_one_epoch(1, TrainBatchReporterRecorder())
             first_epoch_calls = encoder.call_count
@@ -579,7 +604,9 @@ class Siglip2ReIDJobTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
-            job = build_training_job(_training_args(root), siglip2_loader=_load_fake_siglip2)
+            job = build_training_job(
+                _training_config(root), siglip2_loader=_load_fake_siglip2
+            )
             with mock.patch.object(PrecisionController, "step", return_value=False):
                 job.train_one_epoch(1, TrainBatchReporterRecorder())
 
@@ -591,14 +618,16 @@ class Siglip2ReIDJobTest(unittest.TestCase):
     def test_tfc_weight_zero_skips_training_prompt_teacher_and_center_updates(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
-            args = _training_args(root)
+            args = _training_config(root)
             args.freeze_prompt_bank_stage2 = True
             args.freeze_text_encoder = True
             args.tfc_weight = 0.0
             args.epochs = 2
 
             job = build_training_job(args, siglip2_loader=_load_fake_siglip2)
-            encoder = job.model.retrieval_model.image_encoder.siglip2_model.text_model.encoder
+            encoder = (
+                job.model.retrieval_model.image_encoder.siglip2_model.text_model.encoder
+            )
             encoder.call_count = 0
             job.train_one_epoch(1, TrainBatchReporterRecorder())
             first_epoch_calls = encoder.call_count
@@ -612,7 +641,7 @@ class Siglip2ReIDJobTest(unittest.TestCase):
     def test_stage2_camera_text_cache_matches_online_encoding(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
-            args = _training_args(root)
+            args = _training_config(root)
             args.freeze_prompt_bank_stage2 = True
             args.freeze_text_encoder = True
 
@@ -631,7 +660,7 @@ class Siglip2ReIDJobTest(unittest.TestCase):
     def test_stage2_prompt_bank_remains_trainable_by_default(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
-            args = _training_args(root)
+            args = _training_config(root)
 
             job = build_training_job(args, siglip2_loader=_load_fake_siglip2)
 
@@ -641,19 +670,21 @@ class Siglip2ReIDJobTest(unittest.TestCase):
     def test_bnneck_adds_trainable_batch_norm_head(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
-            args = _training_args(root)
+            args = _training_config(root)
             args.reid_head = "bnneck"
 
             job = build_training_job(args, siglip2_loader=_load_fake_siglip2)
 
         # The head lives inside the retrieval model so training and eval share one path.
         self.assertFalse(hasattr(job.model, "feature_head"))
-        self.assertGreater(_trainable_parameter_count(job.model.retrieval_model.feature_head), 0)
+        self.assertGreater(
+            _trainable_parameter_count(job.model.retrieval_model.feature_head), 0
+        )
 
     def test_bnneck_keeps_batch_norm_bias_frozen_in_stage2(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
-            args = _training_args(root)
+            args = _training_config(root)
             args.reid_head = "bnneck"
 
             job = build_training_job(args, siglip2_loader=_load_fake_siglip2)
@@ -664,20 +695,25 @@ class Siglip2ReIDJobTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
 
-            job = build_training_job(_training_args(root), siglip2_loader=_load_fake_siglip2)
+            job = build_training_job(
+                _training_config(root), siglip2_loader=_load_fake_siglip2
+            )
 
         self.assertIsNone(job.model.classifier.bias)
 
     def test_bnneck_head_params_land_in_new_optimizer_group(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
-            args = _training_args(root)
+            args = _training_config(root)
             args.reid_head = "bnneck"
 
             job = build_training_job(args, siglip2_loader=_load_fake_siglip2)
 
         _, new_group = _lookup_param_groups(job.optimizer)
-        new_names = [_element_name(model=job.model, parameter=parameter) for parameter in new_group["params"]]
+        new_names = [
+            _element_name(model=job.model, parameter=parameter)
+            for parameter in new_group["params"]
+        ]
         self.assertTrue(
             any("feature_head" in name for name in new_names),
             f"feature_head params missing from the 'new' group: {new_names}",
@@ -696,7 +732,9 @@ class Siglip2ReIDJobTest(unittest.TestCase):
             tfc_bank=torch.nn.Module(),
         )
 
-        output = model.encode_retrieval(torch.zeros(3, 3, 2, 2), torch.zeros(3, dtype=torch.long))
+        output = model.encode_retrieval(
+            torch.zeros(3, 3, 2, 2), torch.zeros(3, dtype=torch.long)
+        )
 
         self.assertTrue(torch.equal(output, torch.ones(3, 4)))
 
@@ -706,7 +744,7 @@ class Siglip2ReIDJobTest(unittest.TestCase):
         # applies a non-uniform per-dimension transform.
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
-            args = _training_args(root)
+            args = _training_config(root)
             args.reid_head = "bnneck"
 
             job = build_training_job(args, siglip2_loader=_load_fake_siglip2)
@@ -738,7 +776,9 @@ class Siglip2ReIDJobTest(unittest.TestCase):
         # running a second full no-grad forward per batch.
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
-            job = build_training_job(_training_args(root), siglip2_loader=_load_fake_siglip2)
+            job = build_training_job(
+                _training_config(root), siglip2_loader=_load_fake_siglip2
+            )
             siglip2 = job.model.retrieval_model.image_encoder.siglip2_model
             siglip2.image_feature_calls = 0
 
@@ -749,49 +789,24 @@ class Siglip2ReIDJobTest(unittest.TestCase):
     def test_persistent_workers_require_positive_worker_count(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
-            args = _training_args(root)
+            args = _training_config(root)
             args.persistent_workers = True
 
-            with self.assertRaisesRegex(ValueError, "persistent-workers"):
+            with self.assertRaisesRegex(ValueError, "persistent_workers"):
                 build_training_job(args, siglip2_loader=_load_fake_siglip2)
 
-    def test_default_args_freeze_image_encoder_stage2_is_false_when_attr_absent(self):
-        # The job config must default Stage-2 image encoder to UNFROZEN (matching
-        #  SigLIP 2-ReID's standard Stage-2 recipe) when the caller passes no explicit flag.
-        args = Namespace(
-            dataset="market1501",
-            data_root=Path("."),
-            siglip2_model_name=SIGLIP2_MODEL_ID,
-            batch_size=4,
-            num_workers=0,
-            lr=0.001,
-            device="cpu",
-            beta=0.1,
-            context_length=2,
-            tfc_momentum=0.5,
-            triplet_margin=0.3,
-            tfc_weight=1.0,
-            alignment_weight=0.1,
-            label_smoothing=0.0,
-            stage1_epochs=0,
-            epochs=1,
-            validation_interval=1,
-            freeze_image_encoder_stage1=True,
-            # freeze_image_encoder_stage2 deliberately absent
-            freeze_text_encoder=True,
-            freeze_prompt_bank_stage2=False,
-            reid_head="linear",
-            retrieval_mode="fused",
-        )
-        from t2c_reid.jobs.siglip2_reid import _job_config_from_args
+    def test_hydra_default_keeps_stage2_image_encoder_unfrozen(self):
+        from t2c_reid.jobs.siglip2_reid import _job_config_from_training_config
 
-        config = _job_config_from_args(args)
-        self.assertFalse(config.freeze_image_encoder_stage2)
+        training_config = compose_training_config()
+        job_config = _job_config_from_training_config(training_config)
+
+        self.assertFalse(job_config.freeze_image_encoder_stage2)
 
     def test_image_encoder_lr_creates_separate_param_group_for_unfrozen_stage2(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
-            args = _training_args(root)
+            args = _training_config(root)
             args.stage1_epochs = 0
             args.freeze_image_encoder_stage1 = True
             args.freeze_image_encoder_stage2 = False  # default unfrozen
@@ -805,9 +820,15 @@ class Siglip2ReIDJobTest(unittest.TestCase):
         self.assertAlmostEqual(backbone_group["lr"], 5e-5)
         self.assertAlmostEqual(new_group["lr"], 0.001)
         # Filtered by name: backbone group should hold only visual_projection params.
-        backbone_names = [_element_name(model=job.model, parameter=parameter) for parameter in backbone_group["params"]]
+        backbone_names = [
+            _element_name(model=job.model, parameter=parameter)
+            for parameter in backbone_group["params"]
+        ]
         self.assertTrue(
-            all("visual_projection" in name or "vision_model" in name for name in backbone_names),
+            all(
+                "visual_projection" in name or "vision_model" in name
+                for name in backbone_names
+            ),
             f"backbone group contains non-backbone params: {backbone_names}",
         )
 
@@ -876,8 +897,12 @@ class Siglip2ReIDJobTest(unittest.TestCase):
 
     def test_stage_lr_scheduler_apply_scales_groups_by_stage_epoch(self):
         parameter = torch.nn.Parameter(torch.zeros(1))
-        optimizer = torch.optim.AdamW([{"params": [parameter], "lr": 1e-4, "name": "new"}])
-        scheduler = StageLRScheduler(base_lrs=(1e-4,), total_epochs=10, warmup_epochs=2, first_epoch=11)
+        optimizer = torch.optim.AdamW(
+            [{"params": [parameter], "lr": 1e-4, "name": "new"}]
+        )
+        scheduler = StageLRScheduler(
+            base_lrs=(1e-4,), total_epochs=10, warmup_epochs=2, first_epoch=11
+        )
 
         scheduler.apply(optimizer, epoch=11)  # stage epoch 1 -> 0.5x warmup
 
@@ -886,7 +911,7 @@ class Siglip2ReIDJobTest(unittest.TestCase):
     def test_stage2_cosine_scheduler_changes_lr_across_epochs(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
-            args = _training_args(root)
+            args = _training_config(root)
             args.stage2_lr_scheduler = "cosine"
             args.stage2_warmup_epochs = 2
             args.epochs = 10
@@ -900,7 +925,7 @@ class Siglip2ReIDJobTest(unittest.TestCase):
     def test_stage2_scheduler_none_keeps_lr_constant(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
-            args = _training_args(root)
+            args = _training_config(root)
             args.stage2_lr_scheduler = "none"
             args.epochs = 10
 
@@ -911,66 +936,67 @@ class Siglip2ReIDJobTest(unittest.TestCase):
         self.assertEqual(first, second)
 
     def test_job_config_reads_num_instances(self):
-        from t2c_reid.jobs.siglip2_reid import _job_config_from_args
+        from t2c_reid.jobs.siglip2_reid import _job_config_from_training_config
 
-        args = _training_args(Path("."))
+        args = _training_config(Path("."))
         args.num_instances = 4
 
-        config = _job_config_from_args(args)
+        config = _job_config_from_training_config(args)
 
         self.assertEqual(config.num_instances, 4)
 
     def test_job_config_reads_id_logit_scale(self):
-        from t2c_reid.jobs.siglip2_reid import _job_config_from_args
+        from t2c_reid.jobs.siglip2_reid import _job_config_from_training_config
 
-        args = _training_args(Path("."))
+        args = _training_config(Path("."))
         args.id_logit_scale = 10.0
 
-        config = _job_config_from_args(args)
+        config = _job_config_from_training_config(args)
 
         self.assertEqual(config.id_logit_scale, 10.0)
 
     def test_job_config_reads_triplet_metric(self):
-        from t2c_reid.jobs.siglip2_reid import _job_config_from_args
+        from t2c_reid.jobs.siglip2_reid import _job_config_from_training_config
 
-        args = _training_args(Path("."))
+        args = _training_config(Path("."))
         args.triplet_metric = "cosine"
 
-        config = _job_config_from_args(args)
+        config = _job_config_from_training_config(args)
 
         self.assertEqual(config.triplet_metric, "cosine")
 
-    def test_job_config_triplet_metric_defaults_to_euclidean_when_absent(self):
-        from t2c_reid.jobs.siglip2_reid import _job_config_from_args
+    def test_job_config_uses_hydra_default_triplet_metric(self):
+        from t2c_reid.jobs.siglip2_reid import _job_config_from_training_config
 
-        args = _training_args(Path("."))
-        del args.triplet_metric
+        training_config = compose_training_config()
 
-        config = _job_config_from_args(args)
+        config = _job_config_from_training_config(training_config)
 
         self.assertEqual(config.triplet_metric, "euclidean")
 
     def test_stage_metadata_includes_triplet_metric(self):
-        from t2c_reid.jobs.siglip2_reid import _job_config_from_args, _stage_metadata
 
-        args = _training_args(Path("."))
+        args = _training_config(Path("."))
         args.triplet_metric = "cosine"
 
         metadata = _stage_metadata_for(args)
 
         self.assertEqual(metadata.get("triplet_metric"), "cosine")
 
-    def test_job_config_num_instances_defaults_to_two_when_absent(self):
-        from t2c_reid.jobs.siglip2_reid import _job_config_from_args
+    def test_job_config_reads_fixture_num_instances(self):
+        from t2c_reid.jobs.siglip2_reid import _job_config_from_training_config
 
-        args = _training_args(Path("."))
+        args = _training_config(Path("."))
 
-        config = _job_config_from_args(args)
+        config = _job_config_from_training_config(args)
 
         self.assertEqual(config.num_instances, 2)
 
     def test_train_loader_uses_configured_num_instances(self):
-        from t2c_reid.jobs.siglip2_reid import _job_config_from_args, _train_loader
+        from t2c_reid.jobs.siglip2_reid import (
+            _job_config_from_training_config,
+            _train_loader,
+        )
 
         class _StubDataset(torch.utils.data.Dataset):
             def __init__(self, person_ids):
@@ -986,10 +1012,10 @@ class Siglip2ReIDJobTest(unittest.TestCase):
             def __getitem__(self, index):
                 return index
 
-        args = _training_args(Path("."))
+        args = _training_config(Path("."))
         args.num_instances = 4
         args.batch_size = 8
-        config = _job_config_from_args(args)
+        config = _job_config_from_training_config(args)
         dataset = _StubDataset([0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3])
 
         loader = _train_loader(dataset, config)
@@ -1001,18 +1027,20 @@ class Siglip2ReIDJobTest(unittest.TestCase):
         import math
 
         from t2c_reid.jobs.siglip2_reid import (
-            _job_config_from_args,
+            _job_config_from_training_config,
             _stage1_loss_config,
             _stage2_loss_config,
         )
 
-        siglip2 = FakeSiglip2(hidden_size=8, feature_dim=4)  # logit_scale parameter = 1.0
+        siglip2 = FakeSiglip2(
+            hidden_size=8, feature_dim=4
+        )  # logit_scale parameter = 1.0
 
         stage1 = _stage1_loss_config(siglip2)
         self.assertAlmostEqual(stage1.logit_scale, math.e, places=5)
         self.assertEqual(stage1.logit_bias, -1.0)
 
-        config = _job_config_from_args(_training_args(Path(".")))
+        config = _job_config_from_training_config(_training_config(Path(".")))
         stage2 = _stage2_loss_config(config, siglip2)
         self.assertAlmostEqual(stage2.logit_scale, math.e, places=5)
         self.assertEqual(stage2.logit_bias, -1.0)
@@ -1025,7 +1053,9 @@ class Siglip2ReIDJobTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
 
-            job = build_training_job(_training_args(root), siglip2_loader=_load_fake_siglip2)
+            job = build_training_job(
+                _training_config(root), siglip2_loader=_load_fake_siglip2
+            )
 
         siglip2 = job.model.retrieval_model.image_encoder.siglip2_model
         self.assertFalse(siglip2.logit_scale.requires_grad)
@@ -1045,7 +1075,9 @@ class Siglip2ReIDJobTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
 
-            job = build_training_job(_training_args(root), siglip2_loader=_load_fake_siglip2)
+            job = build_training_job(
+                _training_config(root), siglip2_loader=_load_fake_siglip2
+            )
 
         text_encoder = job.model.retrieval_model.text_encoder
         self.assertEqual(text_encoder.prefix_token_ids, (5, 6, 7, 5))
@@ -1063,29 +1095,30 @@ class Siglip2ReIDJobTest(unittest.TestCase):
             root = _build_market_fixture(Path(tmp))
 
             with self.assertRaisesRegex(ValueError, "tokenizer"):
-                build_training_job(_training_args(root), siglip2_loader=load_without_tokenizer)
+                build_training_job(
+                    _training_config(root), siglip2_loader=load_without_tokenizer
+                )
 
     def test_job_config_reads_sie_coe(self):
-        from t2c_reid.jobs.siglip2_reid import _job_config_from_args
+        from t2c_reid.jobs.siglip2_reid import _job_config_from_training_config
 
-        args = _training_args(Path("."))
+        args = _training_config(Path("."))
         args.sie_coe = 1.5
 
-        config = _job_config_from_args(args)
+        config = _job_config_from_training_config(args)
 
         self.assertEqual(config.sie_coe, 1.5)
 
     def test_job_config_sie_coe_defaults_to_zero_when_absent(self):
-        from t2c_reid.jobs.siglip2_reid import _job_config_from_args
+        from t2c_reid.jobs.siglip2_reid import _job_config_from_training_config
 
-        config = _job_config_from_args(_training_args(Path(".")))
+        config = _job_config_from_training_config(_training_config(Path(".")))
 
         self.assertEqual(config.sie_coe, 0.0)
 
     def test_stage_metadata_includes_sie_coe(self):
-        from t2c_reid.jobs.siglip2_reid import _job_config_from_args, _stage_metadata
 
-        args = _training_args(Path("."))
+        args = _training_config(Path("."))
         args.sie_coe = 1.5
 
         metadata = _stage_metadata_for(args)
@@ -1096,14 +1129,16 @@ class Siglip2ReIDJobTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
 
-            job = build_training_job(_training_args(root), siglip2_loader=_load_fake_siglip2)
+            job = build_training_job(
+                _training_config(root), siglip2_loader=_load_fake_siglip2
+            )
 
         self.assertIsNone(job.model.retrieval_model.image_encoder.sie_embedding)
 
     def test_sie_embedding_sized_by_dataset_cameras_when_enabled(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))  # two cameras: c1, c2
-            args = _training_args(root)
+            args = _training_config(root)
             args.sie_coe = 1.0
 
             job = build_training_job(args, siglip2_loader=_load_fake_siglip2)
@@ -1115,14 +1150,19 @@ class Siglip2ReIDJobTest(unittest.TestCase):
     def test_sie_params_land_in_new_optimizer_group(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
-            args = _training_args(root)
+            args = _training_config(root)
             args.sie_coe = 1.0
 
             job = build_training_job(args, siglip2_loader=_load_fake_siglip2)
 
         backbone_group, new_group = _lookup_param_groups(job.optimizer)
-        backbone_names = [_element_name(model=job.model, parameter=p) for p in backbone_group["params"]]
-        new_names = [_element_name(model=job.model, parameter=p) for p in new_group["params"]]
+        backbone_names = [
+            _element_name(model=job.model, parameter=p)
+            for p in backbone_group["params"]
+        ]
+        new_names = [
+            _element_name(model=job.model, parameter=p) for p in new_group["params"]
+        ]
         self.assertTrue(
             any("sie_embedding" in name for name in new_names),
             f"sie_embedding params missing from the 'new' group: {new_names}",
@@ -1130,18 +1170,21 @@ class Siglip2ReIDJobTest(unittest.TestCase):
         self.assertFalse(any("sie_embedding" in name for name in backbone_names))
 
     def test_sie_embedding_follows_image_encoder_freeze_per_stage(self):
-        from t2c_reid.jobs.siglip2_reid import _apply_freezing, _job_config_from_args
+        from t2c_reid.jobs.siglip2_reid import (
+            _apply_freezing,
+            _job_config_from_training_config,
+        )
 
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
-            args = _training_args(root)
+            args = _training_config(root)
             args.sie_coe = 1.0
             args.stage1_epochs = 1
             args.freeze_image_encoder_stage1 = True
             args.freeze_image_encoder_stage2 = False
 
             job = build_training_job(args, siglip2_loader=_load_fake_siglip2)
-            config = _job_config_from_args(args)
+            config = _job_config_from_training_config(args)
             model = job.stage2.model
             sie = model.retrieval_model.image_encoder.sie_embedding
 
@@ -1152,23 +1195,21 @@ class Siglip2ReIDJobTest(unittest.TestCase):
             self.assertTrue(sie.weight.requires_grad)
 
     def test_job_config_stage1_feature_cache_defaults_true(self):
-        from t2c_reid.jobs.siglip2_reid import _job_config_from_args
+        from t2c_reid.jobs.siglip2_reid import _job_config_from_training_config
 
-        config = _job_config_from_args(_training_args(Path(".")))
+        config = _job_config_from_training_config(_training_config(Path(".")))
 
         self.assertTrue(config.stage1_feature_cache)
 
     def test_stage_metadata_includes_stage1_feature_cache(self):
-        from t2c_reid.jobs.siglip2_reid import _job_config_from_args, _stage_metadata
 
-        metadata = _stage_metadata_for(_training_args(Path(".")))
+        metadata = _stage_metadata_for(_training_config(Path(".")))
 
         self.assertIs(metadata.get("stage1_feature_cache"), True)
 
     def test_stage_metadata_includes_image_size_and_prompt_template(self):
-        from t2c_reid.jobs.siglip2_reid import _job_config_from_args, _stage_metadata
 
-        metadata = _stage_metadata_for(_training_args(Path(".")))
+        metadata = _stage_metadata_for(_training_config(Path(".")))
 
         self.assertEqual(metadata.get("image_size"), "392x196")
         self.assertEqual(metadata.get("checkpoint_schema_version"), 3)
@@ -1181,7 +1222,7 @@ class Siglip2ReIDJobTest(unittest.TestCase):
     def test_stage1_optimizer_excludes_camera_transfer_logits(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
-            args = _training_args(root)
+            args = _training_config(root)
             args.stage1_epochs = 1
             job = build_training_job(args, siglip2_loader=_load_fake_siglip2)
 
@@ -1200,20 +1241,20 @@ class Siglip2ReIDJobTest(unittest.TestCase):
         self.assertIn(id(transfer), stage2_parameters)
 
     def test_tfc_config_rejects_invalid_momentum_and_empty_main_loss(self):
-        from t2c_reid.jobs.siglip2_reid import _job_config_from_args
+        from t2c_reid.jobs.siglip2_reid import _job_config_from_training_config
 
-        args = _training_args(Path("."))
+        args = _training_config(Path("."))
         args.tfc_tail_momentum = 0.4
         with self.assertRaisesRegex(ValueError, "head <= tail"):
-            _job_config_from_args(args)
+            _job_config_from_training_config(args)
 
-        args = _training_args(Path("."))
+        args = _training_config(Path("."))
         args.tfc_local_weight = 0.0
         args.tfc_global_weight = 0.0
         args.tfc_cross_modal_weight = 0.0
         args.tfc_cross_camera_weight = 0.0
         with self.assertRaisesRegex(ValueError, "at least one positive"):
-            _job_config_from_args(args)
+            _job_config_from_training_config(args)
 
     def test_optimizer_uses_no_decay_groups_for_norms_bias_prompts_and_sie(self):
         #  SigLIP 2-ReID-style AdamW grouping: 1-D parameters (norm weights/biases),
@@ -1221,7 +1262,7 @@ class Siglip2ReIDJobTest(unittest.TestCase):
         # every other weight uses 1e-4.
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
-            args = _training_args(root)
+            args = _training_config(root)
             args.reid_head = "bnneck"
             args.sie_coe = 3.0
 
@@ -1235,8 +1276,12 @@ class Siglip2ReIDJobTest(unittest.TestCase):
                 name = _element_name(model=job.model, parameter=parameter)
                 expects_no_decay = (
                     parameters_by_name[name].ndim <= 1
-                    or name.startswith("retrieval_model.prompt_bank.")
-                    or name.startswith("retrieval_model.image_encoder.sie_embedding.")
+                    or name.startswith(
+                        (
+                            "retrieval_model.prompt_bank.",
+                            "retrieval_model.image_encoder.sie_embedding.",
+                        )
+                    )
                     or name == "tfc_bank.camera_transfer_logits"
                 )
                 if expects_no_decay:
@@ -1251,23 +1296,23 @@ class Siglip2ReIDJobTest(unittest.TestCase):
     def test_stage1_feature_cache_rejects_trainable_stage1_image_encoder(self):
         # Cached image features are only valid while the Stage-1 image tower
         # is frozen; the conflicting flag combination must fail at build time.
-        args = _training_args(Path("."))
+        args = _training_config(Path("."))
         args.freeze_image_encoder_stage1 = False
         args.stage1_feature_cache = True
 
         with self.assertRaisesRegex(
-            ValueError, r"stage1-feature-cache.*freeze-image-encoder-stage1"
+            ValueError, r"stage1_feature_cache.*freeze_image_encoder_stage1"
         ):
             build_training_job(args, siglip2_loader=_load_fake_siglip2)
 
     def test_stage1_feature_cache_can_be_disabled_with_trainable_image_encoder(self):
-        from t2c_reid.jobs.siglip2_reid import _job_config_from_args
+        from t2c_reid.jobs.siglip2_reid import _job_config_from_training_config
 
-        args = _training_args(Path("."))
+        args = _training_config(Path("."))
         args.freeze_image_encoder_stage1 = False
         args.stage1_feature_cache = False
 
-        config = _job_config_from_args(args)
+        config = _job_config_from_training_config(args)
 
         self.assertFalse(config.stage1_feature_cache)
 
@@ -1295,7 +1340,7 @@ class Siglip2ReIDJobTest(unittest.TestCase):
     def test_stage1_cache_runs_image_tower_only_in_first_epoch(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
-            args = _training_args(root)
+            args = _training_config(root)
             args.stage1_epochs = 2
 
             job = build_training_job(args, siglip2_loader=_load_fake_siglip2)
@@ -1321,7 +1366,7 @@ class Siglip2ReIDJobTest(unittest.TestCase):
     def test_stage1_cache_disabled_runs_image_tower_every_epoch(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
-            args = _training_args(root)
+            args = _training_config(root)
             args.stage1_epochs = 2
             args.stage1_feature_cache = False
 
@@ -1352,11 +1397,12 @@ class Siglip2ReIDJobTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             root = _build_market_fixture(Path(tmp))
-            args = _training_args(root)
+            args = _training_config(root)
             args.stage1_epochs = 1
             args.data_backend = "python"
             with mock.patch(
-                "t2c_reid.jobs.siglip2_reid.Siglip2TrainImageTransform", PoisonTrainTransform
+                "t2c_reid.jobs.siglip2_reid.Siglip2TrainImageTransform",
+                PoisonTrainTransform,
             ):
                 job = build_training_job(args, siglip2_loader=_load_fake_siglip2)
                 metrics = job.stage1.train_one_epoch(1, TrainBatchReporterRecorder())
@@ -1369,17 +1415,20 @@ class Siglip2ReIDJobTest(unittest.TestCase):
         def run_stage1(root: Path, feature_cache: bool) -> list[float]:
             random.seed(7)
             torch.manual_seed(7)
-            args = _training_args(root)
+            args = _training_config(root)
             args.stage1_epochs = 2
             args.stage1_feature_cache = feature_cache
             with mock.patch(
-                "t2c_reid.jobs.siglip2_reid.Siglip2TrainImageTransform", Siglip2ImageTransform
+                "t2c_reid.jobs.siglip2_reid.Siglip2TrainImageTransform",
+                Siglip2ImageTransform,
             ):
                 job = build_training_job(args, siglip2_loader=_load_fake_siglip2)
             losses = []
             for epoch in (1, 2):
                 random.seed(100 + epoch)
-                metrics = job.stage1.train_one_epoch(epoch, TrainBatchReporterRecorder())
+                metrics = job.stage1.train_one_epoch(
+                    epoch, TrainBatchReporterRecorder()
+                )
                 losses.append(metrics["loss"])
             return losses
 
@@ -1461,14 +1510,14 @@ def _load_fake_siglip2(model_name: str) -> Siglip2LoadResult:
     )
 
 
-def _stage_metadata_for(args: Namespace):
+def _stage_metadata_for(training_config: TrainingConfig):
     from t2c_reid.jobs.siglip2_reid import (
-        _job_config_from_args,
+        _job_config_from_training_config,
         _stage_metadata,
         _validate_loaded_siglip2,
     )
 
-    config = _job_config_from_args(args)
+    config = _job_config_from_training_config(training_config)
     loaded = _load_fake_siglip2(config.siglip2_model_name)
     spec = _validate_loaded_siglip2(loaded, config.image_size)
     data = SimpleNamespace(
@@ -1480,7 +1529,11 @@ def _stage_metadata_for(args: Namespace):
 
 
 def _trainable_parameter_count(module: torch.nn.Module) -> int:
-    return sum(parameter.numel() for parameter in module.parameters() if parameter.requires_grad)
+    return sum(
+        parameter.numel()
+        for parameter in module.parameters()
+        if parameter.requires_grad
+    )
 
 
 def _lookup_param_groups(optimizer: torch.optim.Optimizer) -> tuple[dict, dict]:
@@ -1492,7 +1545,13 @@ def _lookup_param_groups(optimizer: torch.optim.Optimizer) -> tuple[dict, dict]:
     merged: dict[str, dict] = {}
     for group in optimizer.param_groups:
         name = str(group.get("name", ""))
-        family = "backbone" if name.startswith("backbone") else "new" if name.startswith("new") else name
+        family = (
+            "backbone"
+            if name.startswith("backbone")
+            else "new"
+            if name.startswith("new")
+            else name
+        )
         if family not in merged:
             merged[family] = {"params": [], "lr": group["lr"], "name": family}
         merged[family]["params"].extend(group["params"])
@@ -1577,36 +1636,32 @@ def _asymmetric_batch() -> ReIDImageBatch:
     )
 
 
-def _training_args(root: Path) -> Namespace:
-    return Namespace(
-        dataset="market1501",
-        data_root=root,
-        siglip2_model_name=SIGLIP2_MODEL_ID,
-        batch_size=4,
-        num_workers=0,
-        lr=0.001,
-        image_encoder_lr=5e-5,
-        device="cpu",
-        beta=0.1,
-        context_length=2,
-        tfc_momentum=0.5,
-        triplet_margin=0.3,
-        triplet_metric="euclidean",
-        tfc_weight=1.0,
-        alignment_weight=0.1,
-        label_smoothing=0.0,
-        stage1_epochs=0,
-        epochs=1,
-        validation_interval=1,
-        freeze_image_encoder_stage1=True,
-        freeze_image_encoder_stage2=False,
-        freeze_text_encoder=True,
-        freeze_prompt_bank_stage2=False,
-        reid_head="linear",
-        siglip2_checkpoint=None,
-        retrieval_mode="fused",
-        beta_warmup_epochs=0,
-        report_rerank=False,
+def _training_config(root: Path) -> TrainingConfig:
+    return compose_training_config(
+        [
+            "dataset=market1501",
+            f"data_root={root.as_posix()}",
+            "batch_size=4",
+            "eval_batch_size=16",
+            "gradient_accumulation_steps=4",
+            "num_instances=2",
+            "num_workers=0",
+            "rust_data_threads=1",
+            "lr=0.001",
+            "image_encoder_lr=0.00005",
+            "device=cpu",
+            "context_length=2",
+            "label_smoothing=0.0",
+            "stage1_epochs=0",
+            "epochs=1",
+            "validation_interval=1",
+            "stage1_lr_scheduler=none",
+            "stage1_warmup_epochs=0",
+            "stage2_lr_scheduler=none",
+            "stage2_warmup_epochs=0",
+            "reid_head=linear",
+            "grad_clip_norm=0.0",
+        ]
     )
 
 

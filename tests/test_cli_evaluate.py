@@ -1,14 +1,19 @@
 import json
-from pathlib import Path
 import tempfile
 import unittest
+from pathlib import Path
 
 import numpy as np
+from hydra.errors import HydraException
 
 from t2c_reid.cli.evaluate import main
 
 
 class EvaluateCliTest(unittest.TestCase):
+    def test_unknown_hydra_override_is_rejected(self):
+        with self.assertRaises(HydraException):
+            main(["legacy_flag=true"])
+
     def test_main_writes_no_rerank_metrics_json(self):
         with tempfile.TemporaryDirectory() as tmp:
             input_path = Path(tmp) / "features.npz"
@@ -23,7 +28,13 @@ class EvaluateCliTest(unittest.TestCase):
                 gallery_cams=np.array([2, 2], dtype=np.int64),
             )
 
-            exit_code = main([str(input_path), "--output", str(output_path), "--ranks", "1"])
+            exit_code = main(
+                [
+                    f"features={input_path.as_posix()}",
+                    f"output={output_path.as_posix()}",
+                    "ranks=[1]",
+                ]
+            )
             payload = json.loads(output_path.read_text(encoding="utf-8"))
 
         self.assertEqual(exit_code, 0)
@@ -45,16 +56,12 @@ class EvaluateCliTest(unittest.TestCase):
 
             exit_code = main(
                 [
-                    str(input_path),
-                    "--output",
-                    str(output_path),
-                    "--ranks",
-                    "1",
-                    "--report-rerank",
-                    "--rerank-k1",
-                    "1",
-                    "--rerank-k2",
-                    "1",
+                    f"features={input_path.as_posix()}",
+                    f"output={output_path.as_posix()}",
+                    "ranks=[1]",
+                    "report_rerank=true",
+                    "rerank_k1=1",
+                    "rerank_k2=1",
                 ]
             )
             payload = json.loads(output_path.read_text(encoding="utf-8"))

@@ -1,49 +1,40 @@
 import json
-from pathlib import Path
 import tempfile
 import time
 import unittest
+from pathlib import Path
 from unittest import mock
+
+from hydra.errors import HydraException
 
 from t2c_reid.cli.benchmark_native import _RssSampler, main
 
 
 class NativeBenchmarkCliTest(unittest.TestCase):
+    def test_unknown_hydra_override_is_rejected(self):
+        with self.assertRaises(HydraException):
+            main(["legacy_flag=true"])
+
     def test_tiny_benchmark_writes_structured_results(self):
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "benchmark.json"
             exit_code = main(
                 [
-                    "--mode",
-                    "all",
-                    "--data-samples",
-                    "4",
-                    "--batch-size",
-                    "2",
-                    "--num-workers",
-                    "0",
-                    "--image-height",
-                    "16",
-                    "--image-width",
-                    "8",
-                    "--query-count",
-                    "4",
-                    "--gallery-count",
-                    "8",
-                    "--feature-dim",
-                    "8",
-                    "--rerank-query-count",
-                    "3",
-                    "--rerank-gallery-count",
-                    "6",
-                    "--chunk-size",
-                    "2",
-                    "--runs",
-                    "1",
-                    "--warmup-runs",
-                    "0",
-                    "--output",
-                    str(output),
+                    "mode=all",
+                    "data_samples=4",
+                    "batch_size=2",
+                    "num_workers=0",
+                    "image_height=16",
+                    "image_width=8",
+                    "query_count=4",
+                    "gallery_count=8",
+                    "feature_dim=8",
+                    "rerank_query_count=3",
+                    "rerank_gallery_count=6",
+                    "chunk_size=2",
+                    "runs=1",
+                    "warmup_runs=0",
+                    f"output={output.as_posix()}",
                 ]
             )
             payload = json.loads(output.read_text(encoding="utf-8"))
@@ -63,13 +54,15 @@ class NativeBenchmarkCliTest(unittest.TestCase):
             self.assertEqual(len(payload["settings"]["git_diff_sha256"]), 64)
 
     def test_rss_sampler_propagates_background_probe_failure(self):
-        with mock.patch(
-            "t2c_reid.cli.benchmark_native._current_rss_bytes",
-            side_effect=[100, RuntimeError("probe failed")],
+        with (
+            mock.patch(
+                "t2c_reid.cli.benchmark_native._current_rss_bytes",
+                side_effect=[100, RuntimeError("probe failed")],
+            ),
+            self.assertRaisesRegex(RuntimeError, "RSS sampling failed"),
+            _RssSampler(),
         ):
-            with self.assertRaisesRegex(RuntimeError, "RSS sampling failed"):
-                with _RssSampler():
-                    time.sleep(0.02)
+            time.sleep(0.02)
 
 
 if __name__ == "__main__":

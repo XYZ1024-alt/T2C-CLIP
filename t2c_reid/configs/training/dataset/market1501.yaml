@@ -1,0 +1,5 @@
+# @package _global_
+dataset: market1501
+data_root: data/Market-1501-v15.09.15
+checkpoint_dir: checkpoints/market1501-siglip2-tfc
+run_name: market1501-siglip2-camera-tfc

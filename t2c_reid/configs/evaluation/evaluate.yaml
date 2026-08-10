@@ -1,0 +1,19 @@
+defaults:
+  - evaluate_schema
+  - _self_
+
+features: ???
+output: null
+ranks: [1, 5, 10]
+evaluation_backend: rust
+evaluation_chunk_size: 256
+report_rerank: false
+rerank_k1: 20
+rerank_k2: 6
+rerank_lambda: 0.3
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: runs/hydra/evaluate/${now:%Y-%m-%d}/${now:%H-%M-%S}

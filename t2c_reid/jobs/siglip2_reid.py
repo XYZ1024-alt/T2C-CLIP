@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import hashlib
 import math
-
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from itertools import batched
@@ -25,22 +24,11 @@ from torch.utils.data import DataLoader
 
 from scripts.train import StageMetadata, TrainingJob, TwoStageTrainingJob
 from t2c_reid.anchors import IdentityAnchorProvider
-from t2c_reid.siglip2_backbone import (
-    TransformersSiglip2ImageEncoder,
-    TransformersSiglip2TextEncoder,
-    SIGLIP2_MODEL_ID,
-    siglip2_feature_dim,
-    siglip2_max_num_patches,
-    siglip2_patch_size,
-    siglip2_text_hidden_dim,
-    siglip2_uses_patchified_inputs,
-    validate_siglip2_image_size,
-)
+from t2c_reid.configuration import TrainingConfig
 from t2c_reid.data import ReIDSample, load_market_split, load_msmt17_manifest
 from t2c_reid.datasets import (
     DEFAULT_INSTANCES_PER_IDENTITY,
     PYTHON_DATA_BACKEND,
-    RUST_DATA_BACKEND,
     IdentityBalancedBatchSampler,
     ReIDImageBatch,
     ReIDImageDataset,
@@ -54,8 +42,6 @@ from t2c_reid.datasets import (
     require_data_backend,
 )
 from t2c_reid.evaluation import (
-    DEFAULT_QUERY_CHUNK_SIZE,
-    RUST_EVALUATION_BACKEND,
     ReIDMetrics,
     evaluate_reid,
     evaluate_reid_with_rerank,
@@ -66,6 +52,17 @@ from t2c_reid.model import T2CReIDModel
 from t2c_reid.precision import PrecisionController, PrecisionPolicy, resolve_precision
 from t2c_reid.prompts import PromptBank, PromptConfig
 from t2c_reid.retrieval import FUSED_RETRIEVAL, require_retrieval_mode
+from t2c_reid.siglip2_backbone import (
+    SIGLIP2_MODEL_ID,
+    TransformersSiglip2ImageEncoder,
+    TransformersSiglip2TextEncoder,
+    siglip2_feature_dim,
+    siglip2_max_num_patches,
+    siglip2_patch_size,
+    siglip2_text_hidden_dim,
+    siglip2_uses_patchified_inputs,
+    validate_siglip2_image_size,
+)
 from t2c_reid.tfc import CameraAwareTFCBank
 from t2c_reid.training import (
     Stage1LossBreakdown,
@@ -79,7 +76,6 @@ from t2c_reid.training import (
     stage2_loss_breakdown,
 )
 from t2c_reid.transforms import (
-    DEFAULT_IMAGE_SIZE,
     ImageTransformConfig,
     Siglip2ImageTransform,
     Siglip2TrainImageTransform,
@@ -136,10 +132,6 @@ class Siglip2ModelSpec:
 class JobDataConfig:
     dataset: str
     root: Path
-
-
-# Conservative full-backbone learning rate for the 400M-parameter foundation model.
-DEFAULT_IMAGE_ENCODER_LR = 5e-6
 
 
 @dataclass(frozen=True)
@@ -271,7 +263,7 @@ class Stage1FeatureCache:
 
     def ensure_extracted(
         self,
-        model: "Siglip2ReIDTrainingModel",
+        model: Siglip2ReIDTrainingModel,
         precision: PrecisionController,
     ) -> None:
         if self._visual_raw is not None:
@@ -286,8 +278,12 @@ class Stage1FeatureCache:
             for batch in loader:
                 images = batch.images.to(self._config.device, non_blocking=True)
                 cameras = batch.camera_ids.to(self._config.device, non_blocking=True)
-                visual_parts.append(model.retrieval_model.encode_visual_raw(images, cameras))
-                person_parts.append(batch.person_ids.to(self._config.device, non_blocking=True))
+                visual_parts.append(
+                    model.retrieval_model.encode_visual_raw(images, cameras)
+                )
+                person_parts.append(
+                    batch.person_ids.to(self._config.device, non_blocking=True)
+                )
                 camera_parts.append(cameras)
         if was_training:
             model.train()
@@ -299,7 +295,11 @@ class Stage1FeatureCache:
 
     def batches(self) -> Iterator[Stage1CachedBatch]:
         """Identity-balanced batches over the cached tensors (same PK sampling as the train loader)."""
-        if self._visual_raw is None or self._person_ids is None or self._camera_ids is None:
+        if (
+            self._visual_raw is None
+            or self._person_ids is None
+            or self._camera_ids is None
+        ):
             raise ValueError("stage1 feature cache must be extracted before batching")
         sampler = IdentityBalancedBatchSampler(
             self._person_ids.tolist(),
@@ -307,7 +307,9 @@ class Stage1FeatureCache:
             instances_per_identity=self._config.num_instances,
         )
         for batch_indices in sampler:
-            indices = torch.tensor(batch_indices, dtype=torch.long, device=self._visual_raw.device)
+            indices = torch.tensor(
+                batch_indices, dtype=torch.long, device=self._visual_raw.device
+            )
             yield Stage1CachedBatch(
                 visual_raw=self._visual_raw[indices],
                 person_ids=self._person_ids[indices],
@@ -317,15 +319,15 @@ class Stage1FeatureCache:
 
 @dataclass(frozen=True)
 class StageTrainingRuntime:
-    model: "Siglip2ReIDTrainingModel"
+    model: Siglip2ReIDTrainingModel
     loaders: LoaderBundle
     optimizer: torch.optim.Optimizer
     stage: str
     loss_config: Any
     device: torch.device
-    beta_schedule: "BetaSchedule | None" = None
-    freeze_config: "Siglip2ReIDJobConfig | None" = None
-    lr_scheduler: "StageLRScheduler | None" = None
+    beta_schedule: BetaSchedule | None = None
+    freeze_config: Siglip2ReIDJobConfig | None = None
+    lr_scheduler: StageLRScheduler | None = None
     anchor_provider: IdentityAnchorProvider | None = None
     feature_cache: Stage1FeatureCache | None = None
     precision: PrecisionController | None = None
@@ -335,12 +337,12 @@ class StageTrainingRuntime:
 
 @dataclass(frozen=True)
 class ValidationRuntime:
-    model: "Siglip2ReIDTrainingModel"
+    model: Siglip2ReIDTrainingModel
     loaders: LoaderBundle
     device: torch.device
     retrieval_mode: str
-    model_config: "Siglip2ReIDJobConfig"
-    beta_schedule: "BetaSchedule | None" = None
+    model_config: Siglip2ReIDJobConfig
+    beta_schedule: BetaSchedule | None = None
     report_rerank: bool = False
     precision: PrecisionController | None = None
 
@@ -371,7 +373,7 @@ class BetaSchedule:
             return 0.0
         return self.beta * min(1.0, (stage_epoch - 1) / self.warmup_epochs)
 
-    def apply(self, model: "Siglip2ReIDTrainingModel", epoch: int) -> None:
+    def apply(self, model: Siglip2ReIDTrainingModel, epoch: int) -> None:
         stage_epoch = epoch - self.first_epoch + 1
         model.retrieval_model.beta = self.effective_beta(stage_epoch)
 
@@ -452,10 +454,12 @@ class BNNeck(torch.nn.Module):
 
 
 def build_training_job(
-    args: Any,
-    siglip2_loader: Siglip2Loader = lambda model_name: load_transformers_siglip2(model_name),
+    training_config: TrainingConfig,
+    siglip2_loader: Siglip2Loader = lambda model_name: load_transformers_siglip2(
+        model_name
+    ),
 ) -> TwoStageTrainingJob | TrainingJob:
-    config = _job_config_from_args(args)
+    config = _job_config_from_training_config(training_config)
     loaded_siglip2 = siglip2_loader(config.siglip2_model_name)
     _load_siglip2_checkpoint_if_requested(
         loaded_siglip2.model, config.siglip2_checkpoint, config.device
@@ -547,8 +551,7 @@ def build_training_job(
 def load_transformers_siglip2(model_name: str) -> Siglip2LoadResult:
     if model_name != SIGLIP2_MODEL_ID:
         raise ValueError(
-            f"this training job only supports {SIGLIP2_MODEL_ID!r}, got "
-            f"{model_name!r}"
+            f"this training job only supports {SIGLIP2_MODEL_ID!r}, got {model_name!r}"
         )
     try:
         from transformers import AutoModel, AutoProcessor, AutoTokenizer
@@ -589,9 +592,7 @@ def _validate_loaded_siglip2(
 
     uses_patchified_inputs = siglip2_uses_patchified_inputs(model)
     if uses_patchified_inputs:
-        processor_patch_size = _processor_integer(
-            loaded.image_processor, "patch_size"
-        )
+        processor_patch_size = _processor_integer(loaded.image_processor, "patch_size")
         processor_max_patches = _processor_integer(
             loaded.image_processor, "max_num_patches"
         )
@@ -619,19 +620,27 @@ def _validate_loaded_siglip2(
     embedding_patch_size = getattr(embeddings, "patch_size", None)
     embedding_num_patches = getattr(embeddings, "num_patches", None)
     position_embedding = getattr(embeddings, "position_embedding", None)
-    position_count = getattr(getattr(position_embedding, "weight", None), "shape", (None,))[0]
+    position_count = getattr(
+        getattr(position_embedding, "weight", None), "shape", (None,)
+    )[0]
     if embedding_patch_size != patch_size:
-        raise ValueError("SigLIP 2 vision embeddings patch size disagrees with model config")
+        raise ValueError(
+            "SigLIP 2 vision embeddings patch size disagrees with model config"
+        )
     if embedding_num_patches != max_num_patches or position_count != max_num_patches:
-        raise ValueError("SigLIP 2 vision positional embedding budget disagrees with model config")
+        raise ValueError(
+            "SigLIP 2 vision positional embedding budget disagrees with model config"
+        )
 
     bos, eos, pad = _resolve_siglip2_token_ids(
         model,
         loaded.tokenizer,
         strict_config_match=uses_patchified_inputs,
     )
-    text_padding_side = "left" if uses_patchified_inputs else str(
-        getattr(loaded.tokenizer, "padding_side", "right")
+    text_padding_side = (
+        "left"
+        if uses_patchified_inputs
+        else str(getattr(loaded.tokenizer, "padding_side", "right"))
     )
     if text_padding_side not in {"left", "right"}:
         raise ValueError(
@@ -644,8 +653,7 @@ def _validate_loaded_siglip2(
         )
     include_bos_token = uses_patchified_inputs
     mask_text_padding = uses_patchified_inputs or (
-        "attention_mask"
-        in tuple(getattr(loaded.tokenizer, "model_input_names", ()))
+        "attention_mask" in tuple(getattr(loaded.tokenizer, "model_input_names", ()))
     )
     if not uses_patchified_inputs and mask_text_padding:
         raise ValueError(
@@ -658,9 +666,7 @@ def _validate_loaded_siglip2(
         patch_size=patch_size,
         max_num_patches=max_num_patches,
         patch_count=patch_count,
-        vision_input_format=(
-            "patchified" if uses_patchified_inputs else "fixed_bchw"
-        ),
+        vision_input_format=("patchified" if uses_patchified_inputs else "fixed_bchw"),
         text_padding_side=text_padding_side,
         include_bos_token=include_bos_token,
         mask_text_padding=mask_text_padding,
@@ -716,7 +722,9 @@ def _processor_integer(image_processor: Any, name: str) -> int:
             raise ValueError(f"SigLIP 2 image processor {name} must be square")
         value = int(value[0])
     if not isinstance(value, int) or value < 1:
-        raise ValueError(f"SigLIP 2 image processor must expose positive integer {name}")
+        raise ValueError(
+            f"SigLIP 2 image processor must expose positive integer {name}"
+        )
     return value
 
 
@@ -726,7 +734,9 @@ def _configure_gradient_checkpointing(model: torch.nn.Module, enabled: bool) -> 
     )
     method = getattr(model, method_name, None)
     if not callable(method):
-        raise ValueError(f"SigLIP 2 model does not support {method_name}")
+        raise ValueError(  # noqa: TRY004 - incompatible model contract
+            f"SigLIP 2 model does not support {method_name}"
+        )
     method()
 
 
@@ -796,7 +806,9 @@ def _build_image_dataset(
         )
     native_config = getattr(transform, "native_config", None)
     if not isinstance(native_config, ImageTransformConfig):
-        raise TypeError("Rust data backend requires a transform with ImageTransformConfig")
+        raise TypeError(
+            "Rust data backend requires a transform with ImageTransformConfig"
+        )
     return ReIDMetadataDataset(
         ReIDMetadataDatasetConfig(samples, person_id_map, camera_id_map, native_config)
     )
@@ -808,158 +820,132 @@ def _transform_bundle(transforms) -> TransformBundle:
     return TransformBundle(train=transforms, eval=transforms)
 
 
-def _job_config_from_args(args: Any) -> Siglip2ReIDJobConfig:
-    if args.dataset is None:
-        raise ValueError("--dataset is required for t2c_reid.jobs.siglip2_reid")
-    if args.data_root is None:
-        raise ValueError("--data-root is required for t2c_reid.jobs.siglip2_reid")
-    freeze_image_encoder_stage1 = bool(getattr(args, "freeze_image_encoder_stage1", True))
-    stage1_feature_cache = bool(getattr(args, "stage1_feature_cache", True))
-    if stage1_feature_cache and not freeze_image_encoder_stage1:
+def _job_config_from_training_config(config: TrainingConfig) -> Siglip2ReIDJobConfig:
+    if config.dataset is None:
+        raise ValueError("dataset is required for t2c_reid.jobs.siglip2_reid")
+    if config.data_root is None:
+        raise ValueError("data_root is required for t2c_reid.jobs.siglip2_reid")
+    if config.stage1_feature_cache and not config.freeze_image_encoder_stage1:
         raise ValueError(
-            "--stage1-feature-cache requires --freeze-image-encoder-stage1: a trainable "
-            "Stage-1 image encoder makes the cached image features stale; pass "
-            "--no-stage1-feature-cache or keep the Stage-1 image encoder frozen"
+            "stage1_feature_cache requires freeze_image_encoder_stage1=true: a "
+            "trainable Stage-1 image encoder makes cached image features stale"
         )
-    device = torch.device(args.device)
-    batch_size = int(getattr(args, "batch_size", 8))
-    eval_batch_size = int(getattr(args, "eval_batch_size", 16))
-    gradient_accumulation_steps = int(
-        getattr(args, "gradient_accumulation_steps", 4)
+    device = torch.device(config.device)
+    image_size = (config.image_height, config.image_width)
+    data_backend = require_data_backend(config.data_backend)
+    evaluation_backend = require_evaluation_backend(config.evaluation_backend)
+    pin_memory_arg = config.pin_memory
+    pin_memory = (
+        device.type == "cuda" if pin_memory_arg is None else bool(pin_memory_arg)
     )
-    image_size = (
-        int(getattr(args, "image_height", DEFAULT_IMAGE_SIZE[0])),
-        int(getattr(args, "image_width", DEFAULT_IMAGE_SIZE[1])),
-    )
-    num_workers = int(getattr(args, "num_workers", 4))
-    data_backend = require_data_backend(str(getattr(args, "data_backend", RUST_DATA_BACKEND)))
-    prefetch_factor = int(getattr(args, "prefetch_factor", 2))
-    rust_data_threads = int(getattr(args, "rust_data_threads", 1))
-    evaluation_backend = require_evaluation_backend(
-        str(getattr(args, "evaluation_backend", RUST_EVALUATION_BACKEND))
-    )
-    evaluation_chunk_size = int(
-        getattr(args, "evaluation_chunk_size", DEFAULT_QUERY_CHUNK_SIZE)
-    )
-    pin_memory_arg = getattr(args, "pin_memory", None)
-    pin_memory = device.type == "cuda" if pin_memory_arg is None else bool(pin_memory_arg)
-    persistent_workers_arg = getattr(args, "persistent_workers", None)
+    persistent_workers_arg = config.persistent_workers
     persistent_workers = (
-        num_workers > 0
+        config.num_workers > 0
         if persistent_workers_arg is None
         else bool(persistent_workers_arg)
     )
     for value, name in (
-        (batch_size, "--batch-size"),
-        (eval_batch_size, "--eval-batch-size"),
-        (gradient_accumulation_steps, "--gradient-accumulation-steps"),
-        (prefetch_factor, "--prefetch-factor"),
-        (rust_data_threads, "--rust-data-threads"),
-        (evaluation_chunk_size, "--evaluation-chunk-size"),
-        (image_size[0], "--image-height"),
-        (image_size[1], "--image-width"),
+        (config.batch_size, "batch_size"),
+        (config.eval_batch_size, "eval_batch_size"),
+        (config.gradient_accumulation_steps, "gradient_accumulation_steps"),
+        (config.prefetch_factor, "prefetch_factor"),
+        (config.rust_data_threads, "rust_data_threads"),
+        (config.evaluation_chunk_size, "evaluation_chunk_size"),
+        (config.image_height, "image_height"),
+        (config.image_width, "image_width"),
     ):
         if value < 1:
             raise ValueError(f"{name} must be positive")
-    if num_workers < 0:
-        raise ValueError("--num-workers must be non-negative")
-    if num_workers == 0 and persistent_workers_arg is True:
-        raise ValueError("--persistent-workers requires --num-workers to be positive")
-    precision = resolve_precision(str(getattr(args, "precision", "auto")), device)
-    model_name = str(getattr(args, "siglip2_model_name", SIGLIP2_MODEL_ID))
-    if model_name != SIGLIP2_MODEL_ID:
+    if config.num_workers < 0:
+        raise ValueError("num_workers must be non-negative")
+    if config.num_workers == 0 and persistent_workers_arg is True:
+        raise ValueError("persistent_workers=true requires num_workers to be positive")
+    precision = resolve_precision(config.precision, device)
+    if config.siglip2_model_name != SIGLIP2_MODEL_ID:
         raise ValueError(
             f"this training job only supports {SIGLIP2_MODEL_ID!r}, got "
-            f"{model_name!r}"
+            f"{config.siglip2_model_name!r}"
         )
-    tfc_momentum = float(getattr(args, "tfc_momentum", 0.5))
-    tfc_tail_momentum = float(getattr(args, "tfc_tail_momentum", 0.9))
-    tfc_class_balance_beta = float(getattr(args, "tfc_class_balance_beta", 0.9999))
-    tfc_local_weight = float(getattr(args, "tfc_local_weight", 1.0))
-    tfc_global_weight = float(getattr(args, "tfc_global_weight", 1.0))
-    tfc_cross_modal_weight = float(getattr(args, "tfc_cross_modal_weight", 0.5))
-    tfc_cross_camera_weight = float(getattr(args, "tfc_cross_camera_weight", 0.1))
-    tfc_contrast_temperature = float(getattr(args, "tfc_contrast_temperature", 0.07))
-    tfc_transfer_reg_weight = float(getattr(args, "tfc_transfer_reg_weight", 0.01))
-    tfc_weight = float(args.tfc_weight)
     _validate_tfc_config(
-        tfc_weight=tfc_weight,
-        head_momentum=tfc_momentum,
-        tail_momentum=tfc_tail_momentum,
-        class_balance_beta=tfc_class_balance_beta,
-        local_weight=tfc_local_weight,
-        global_weight=tfc_global_weight,
-        cross_modal_weight=tfc_cross_modal_weight,
-        cross_camera_weight=tfc_cross_camera_weight,
-        contrast_temperature=tfc_contrast_temperature,
-        transfer_reg_weight=tfc_transfer_reg_weight,
+        tfc_weight=config.tfc_weight,
+        head_momentum=config.tfc_momentum,
+        tail_momentum=config.tfc_tail_momentum,
+        class_balance_beta=config.tfc_class_balance_beta,
+        local_weight=config.tfc_local_weight,
+        global_weight=config.tfc_global_weight,
+        cross_modal_weight=config.tfc_cross_modal_weight,
+        cross_camera_weight=config.tfc_cross_camera_weight,
+        contrast_temperature=config.tfc_contrast_temperature,
+        transfer_reg_weight=config.tfc_transfer_reg_weight,
     )
     return Siglip2ReIDJobConfig(
-        dataset=args.dataset,
-        data_root=args.data_root,
-        siglip2_model_name=model_name,
-        siglip2_checkpoint=getattr(args, "siglip2_checkpoint", None),
-        batch_size=batch_size,
-        eval_batch_size=eval_batch_size,
-        gradient_accumulation_steps=gradient_accumulation_steps,
-        num_workers=num_workers,
+        dataset=config.dataset,
+        data_root=config.data_root,
+        siglip2_model_name=config.siglip2_model_name,
+        siglip2_checkpoint=config.siglip2_checkpoint,
+        batch_size=config.batch_size,
+        eval_batch_size=config.eval_batch_size,
+        gradient_accumulation_steps=config.gradient_accumulation_steps,
+        num_workers=config.num_workers,
         data_backend=data_backend,
-        prefetch_factor=prefetch_factor,
+        prefetch_factor=config.prefetch_factor,
         pin_memory=pin_memory,
         persistent_workers=persistent_workers,
-        rust_data_threads=rust_data_threads,
+        rust_data_threads=config.rust_data_threads,
         evaluation_backend=evaluation_backend,
-        evaluation_chunk_size=evaluation_chunk_size,
-        lr=float(getattr(args, "lr", 1e-4)),
-        image_encoder_lr=float(getattr(args, "image_encoder_lr", DEFAULT_IMAGE_ENCODER_LR)),
+        evaluation_chunk_size=config.evaluation_chunk_size,
+        lr=config.lr,
+        image_encoder_lr=config.image_encoder_lr,
         device=device,
         precision=precision,
-        gradient_checkpointing=bool(getattr(args, "gradient_checkpointing", True)),
+        gradient_checkpointing=config.gradient_checkpointing,
         image_size=image_size,
-        beta=float(args.beta),
-        context_length=int(args.context_length),
-        tfc_momentum=tfc_momentum,
-        tfc_tail_momentum=tfc_tail_momentum,
-        tfc_class_balance_beta=tfc_class_balance_beta,
-        tfc_local_weight=tfc_local_weight,
-        tfc_global_weight=tfc_global_weight,
-        tfc_cross_modal_weight=tfc_cross_modal_weight,
-        tfc_cross_camera_weight=tfc_cross_camera_weight,
-        tfc_contrast_temperature=tfc_contrast_temperature,
-        tfc_transfer_reg_weight=tfc_transfer_reg_weight,
-        triplet_margin=float(args.triplet_margin),
-        triplet_metric=str(getattr(args, "triplet_metric", "euclidean")),
-        tfc_weight=tfc_weight,
-        alignment_weight=float(getattr(args, "alignment_weight", 1.0)),
-        id_logit_scale=float(getattr(args, "id_logit_scale", 1.0)),
-        label_smoothing=float(getattr(args, "label_smoothing", 0.0)),
-        stage1_epochs=int(getattr(args, "stage1_epochs", 0)),
-        stage2_epochs=int(getattr(args, "epochs", 120)),
-        validation_interval=int(getattr(args, "validation_interval", 5)),
-        freeze_image_encoder_stage1=freeze_image_encoder_stage1,
-        freeze_image_encoder_stage2=bool(getattr(args, "freeze_image_encoder_stage2", False)),
-        freeze_text_encoder=bool(getattr(args, "freeze_text_encoder", True)),
-        stage2_first_epoch=int(getattr(args, "stage2_first_epoch", int(getattr(args, "stage1_epochs", 0)) + 1)),
-        freeze_prompt_bank_stage2=bool(getattr(args, "freeze_prompt_bank_stage2", False)),
-        reid_head=str(getattr(args, "reid_head", "linear")),
-        retrieval_mode=require_retrieval_mode(str(getattr(args, "retrieval_mode", "fused"))),
-        beta_warmup_epochs=int(getattr(args, "beta_warmup_epochs", 0)),
-        report_rerank=bool(getattr(args, "report_rerank", False)),
-        stage1_lr_scheduler=str(getattr(args, "stage1_lr_scheduler", "none")),
-        stage1_warmup_epochs=int(getattr(args, "stage1_warmup_epochs", 0)),
-        stage2_lr_scheduler=str(getattr(args, "stage2_lr_scheduler", "none")),
-        stage2_warmup_epochs=int(getattr(args, "stage2_warmup_epochs", 0)),
-        num_instances=int(getattr(args, "num_instances", DEFAULT_INSTANCES_PER_IDENTITY)),
-        sie_coe=float(getattr(args, "sie_coe", 0.0)),
-        stage1_feature_cache=stage1_feature_cache,
-        grad_clip_norm=_validated_grad_clip_norm(float(getattr(args, "grad_clip_norm", 0.0))),
-        flip_tta=bool(getattr(args, "flip_tta", False)),
+        beta=config.beta,
+        context_length=config.context_length,
+        tfc_momentum=config.tfc_momentum,
+        tfc_tail_momentum=config.tfc_tail_momentum,
+        tfc_class_balance_beta=config.tfc_class_balance_beta,
+        tfc_local_weight=config.tfc_local_weight,
+        tfc_global_weight=config.tfc_global_weight,
+        tfc_cross_modal_weight=config.tfc_cross_modal_weight,
+        tfc_cross_camera_weight=config.tfc_cross_camera_weight,
+        tfc_contrast_temperature=config.tfc_contrast_temperature,
+        tfc_transfer_reg_weight=config.tfc_transfer_reg_weight,
+        triplet_margin=config.triplet_margin,
+        triplet_metric=config.triplet_metric,
+        tfc_weight=config.tfc_weight,
+        alignment_weight=config.alignment_weight,
+        id_logit_scale=config.id_logit_scale,
+        label_smoothing=config.label_smoothing,
+        stage1_epochs=config.stage1_epochs,
+        stage2_epochs=config.epochs,
+        validation_interval=config.validation_interval,
+        freeze_image_encoder_stage1=config.freeze_image_encoder_stage1,
+        freeze_image_encoder_stage2=config.freeze_image_encoder_stage2,
+        freeze_text_encoder=config.freeze_text_encoder,
+        stage2_first_epoch=config.stage1_epochs + 1,
+        freeze_prompt_bank_stage2=config.freeze_prompt_bank_stage2,
+        reid_head=config.reid_head,
+        retrieval_mode=require_retrieval_mode(config.retrieval_mode),
+        beta_warmup_epochs=config.beta_warmup_epochs,
+        report_rerank=config.report_rerank,
+        stage1_lr_scheduler=config.stage1_lr_scheduler,
+        stage1_warmup_epochs=config.stage1_warmup_epochs,
+        stage2_lr_scheduler=config.stage2_lr_scheduler,
+        stage2_warmup_epochs=config.stage2_warmup_epochs,
+        num_instances=config.num_instances,
+        sie_coe=config.sie_coe,
+        stage1_feature_cache=config.stage1_feature_cache,
+        grad_clip_norm=_validated_grad_clip_norm(config.grad_clip_norm),
+        flip_tta=config.flip_tta,
     )
 
 
 def _validated_grad_clip_norm(value: float) -> float:
     if not math.isfinite(value) or value < 0.0:
-        raise ValueError("--grad-clip-norm must be finite and non-negative (0 disables clipping)")
+        raise ValueError(
+            "grad_clip_norm must be finite and non-negative (0 disables clipping)"
+        )
     return value
 
 
@@ -977,7 +963,7 @@ def _validate_tfc_config(
     transfer_reg_weight: float,
 ) -> None:
     if not math.isfinite(tfc_weight) or tfc_weight < 0.0:
-        raise ValueError("--tfc-weight must be finite and non-negative")
+        raise ValueError("tfc_weight must be finite and non-negative")
     if not (
         math.isfinite(head_momentum)
         and math.isfinite(tail_momentum)
@@ -985,14 +971,19 @@ def _validate_tfc_config(
     ):
         raise ValueError("TFC momentum must satisfy 0 <= head <= tail < 1")
     if not math.isfinite(class_balance_beta) or not 0.0 <= class_balance_beta < 1.0:
-        raise ValueError("--tfc-class-balance-beta must satisfy 0 <= beta < 1")
+        raise ValueError("tfc_class_balance_beta must satisfy 0 <= beta < 1")
     weights = (local_weight, global_weight, cross_modal_weight, cross_camera_weight)
-    if any(not math.isfinite(weight) or weight < 0.0 for weight in (*weights, transfer_reg_weight)):
+    if any(
+        not math.isfinite(weight) or weight < 0.0
+        for weight in (*weights, transfer_reg_weight)
+    ):
         raise ValueError("TFC loss weights must be finite and non-negative")
     if tfc_weight > 0.0 and sum(weights) == 0.0:
-        raise ValueError("positive --tfc-weight requires at least one positive TFC main loss weight")
+        raise ValueError(
+            "positive tfc_weight requires at least one positive TFC main loss weight"
+        )
     if not math.isfinite(contrast_temperature) or contrast_temperature <= 0.0:
-        raise ValueError("--tfc-contrast-temperature must be finite and positive")
+        raise ValueError("tfc_contrast_temperature must be finite and positive")
 
 
 def _build_runtimes(
@@ -1013,8 +1004,12 @@ def _build_runtimes(
     optimizer_stage1 = _build_optimizer(model, config)
     siglip2_model = _siglip2_model_for(model.retrieval_model)
     stage1_runtime = StageTrainingRuntime(
-        model=model, loaders=loaders, optimizer=optimizer_stage1, stage=STAGE1,
-        loss_config=_stage1_loss_config(siglip2_model), device=config.device,
+        model=model,
+        loaders=loaders,
+        optimizer=optimizer_stage1,
+        stage=STAGE1,
+        loss_config=_stage1_loss_config(siglip2_model),
+        device=config.device,
         freeze_config=config,
         lr_scheduler=_build_stage1_lr_scheduler(optimizer_stage1, config),
         feature_cache=stage1_feature_cache,
@@ -1038,8 +1033,12 @@ def _build_runtimes(
         frozen=config.freeze_prompt_bank_stage2 and config.freeze_text_encoder,
     )
     stage2_runtime = StageTrainingRuntime(
-        model=model, loaders=loaders, optimizer=optimizer_stage2, stage=STAGE2,
-        loss_config=stage2_loss_config, device=config.device,
+        model=model,
+        loaders=loaders,
+        optimizer=optimizer_stage2,
+        stage=STAGE2,
+        loss_config=stage2_loss_config,
+        device=config.device,
         beta_schedule=stage2_beta_schedule,
         freeze_config=config,
         lr_scheduler=stage2_lr_scheduler,
@@ -1048,7 +1047,13 @@ def _build_runtimes(
         gradient_accumulation_steps=config.gradient_accumulation_steps,
         grad_clip_norm=config.grad_clip_norm,
     )
-    return stage1_runtime, stage2_runtime, optimizer_stage1, optimizer_stage2, stage2_beta_schedule
+    return (
+        stage1_runtime,
+        stage2_runtime,
+        optimizer_stage1,
+        optimizer_stage2,
+        stage2_beta_schedule,
+    )
 
 
 def _build_stage1_feature_cache(
@@ -1060,7 +1065,9 @@ def _build_stage1_feature_cache(
     return Stage1FeatureCache(data.train_eval, config)
 
 
-def _apply_freezing(model: Siglip2ReIDTrainingModel, config: Siglip2ReIDJobConfig, stage: str) -> None:
+def _apply_freezing(
+    model: Siglip2ReIDTrainingModel, config: Siglip2ReIDJobConfig, stage: str
+) -> None:
     retrieval = model.retrieval_model
     siglip2_model = _siglip2_model_for(retrieval)
     image_trainable = _image_encoder_trainable(config, stage)
@@ -1069,7 +1076,9 @@ def _apply_freezing(model: Siglip2ReIDTrainingModel, config: Siglip2ReIDJobConfi
     # The SIE camera embedding feeds the vision tower, so it follows the
     # image-encoder freeze state of the current stage.
     if retrieval.image_encoder.sie_embedding is not None:
-        _set_module_requires_grad(retrieval.image_encoder.sie_embedding, image_trainable)
+        _set_module_requires_grad(
+            retrieval.image_encoder.sie_embedding, image_trainable
+        )
     _set_module_requires_grad(siglip2_model.text_model, text_trainable)
     # SigLIP's calibrated temperature and bias remain fixed for both stages.
     siglip2_model.logit_scale.requires_grad_(False)
@@ -1123,7 +1132,9 @@ NO_DECAY_PARAMETER_PREFIXES = (
 )
 
 
-def _build_optimizer(model: torch.nn.Module, config: Siglip2ReIDJobConfig) -> torch.optim.Optimizer:
+def _build_optimizer(
+    model: torch.nn.Module, config: Siglip2ReIDJobConfig
+) -> torch.optim.Optimizer:
     grouped: dict[tuple[str, bool], list[torch.nn.Parameter]] = {}
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
@@ -1143,12 +1154,14 @@ def _build_optimizer(model: torch.nn.Module, config: Siglip2ReIDJobConfig) -> to
             params = grouped.get((family, no_decay))
             if not params:
                 continue
-            param_groups.append({
-                "params": params,
-                "lr": family_lrs[family],
-                "weight_decay": 0.0 if no_decay else WEIGHT_DECAY,
-                "name": f"{family}_no_decay" if no_decay else family,
-            })
+            param_groups.append(
+                {
+                    "params": params,
+                    "lr": family_lrs[family],
+                    "weight_decay": 0.0 if no_decay else WEIGHT_DECAY,
+                    "name": f"{family}_no_decay" if no_decay else family,
+                }
+            )
     return torch.optim.AdamW(param_groups)
 
 
@@ -1158,9 +1171,13 @@ def _pretrained_siglip_calibration(
     logit_scale = getattr(siglip2_model, "logit_scale", None)
     logit_bias = getattr(siglip2_model, "logit_bias", None)
     if not isinstance(logit_scale, torch.Tensor):
-        raise ValueError("SigLIP 2 model must expose a logit_scale tensor")
+        raise ValueError(  # noqa: TRY004 - incompatible model contract
+            "SigLIP 2 model must expose a logit_scale tensor"
+        )
     if not isinstance(logit_bias, torch.Tensor):
-        raise ValueError("SigLIP 2 model must expose a logit_bias tensor")
+        raise ValueError(  # noqa: TRY004 - incompatible model contract
+            "SigLIP 2 model must expose a logit_bias tensor"
+        )
     return float(logit_scale.detach().exp()), float(logit_bias.detach())
 
 
@@ -1197,7 +1214,7 @@ def _stage2_loss_config(
 def _build_stage1_lr_scheduler(
     optimizer: torch.optim.Optimizer,
     config: Siglip2ReIDJobConfig,
-) -> "StageLRScheduler | None":
+) -> StageLRScheduler | None:
     """Stage-1 shares :class:`StageLRScheduler`; Stage-1 epochs are already 1-based."""
 
     return _build_stage_lr_scheduler(
@@ -1213,7 +1230,7 @@ def _build_stage1_lr_scheduler(
 def _build_stage2_lr_scheduler(
     optimizer: torch.optim.Optimizer,
     config: Siglip2ReIDJobConfig,
-) -> "StageLRScheduler | None":
+) -> StageLRScheduler | None:
     return _build_stage_lr_scheduler(
         optimizer,
         name=config.stage2_lr_scheduler,
@@ -1232,7 +1249,7 @@ def _build_stage_lr_scheduler(
     total_epochs: int,
     warmup_epochs: int,
     first_epoch: int,
-) -> "StageLRScheduler | None":
+) -> StageLRScheduler | None:
     if name == "none":
         return None
     if name != "cosine":
@@ -1263,7 +1280,9 @@ def _stage_metadata(
             "backbone_family": "siglip2",
             "dataset": config.dataset,
             "siglip2_model_name": config.siglip2_model_name,
-            "siglip2_checkpoint": str(config.siglip2_checkpoint) if config.siglip2_checkpoint is not None else None,
+            "siglip2_checkpoint": str(config.siglip2_checkpoint)
+            if config.siglip2_checkpoint is not None
+            else None,
             "stage1_epochs": config.stage1_epochs,
             "stage2_epochs": config.stage2_epochs,
             "stage2_first_epoch": config.stage2_first_epoch,
@@ -1483,9 +1502,13 @@ def _load_siglip2_checkpoint_if_requested(
     if not checkpoint.exists():
         raise FileNotFoundError(f"SigLIP 2 checkpoint does not exist: {checkpoint}")
     payload = torch.load(checkpoint, map_location=device, weights_only=True)
-    state_dict = payload.get("state_dict", payload) if isinstance(payload, dict) else payload
+    state_dict = (
+        payload.get("state_dict", payload) if isinstance(payload, dict) else payload
+    )
     if not isinstance(state_dict, dict):
-        raise TypeError("SigLIP 2 checkpoint must be a state_dict or contain a state_dict key")
+        raise TypeError(
+            "SigLIP 2 checkpoint must be a state_dict or contain a state_dict key"
+        )
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     if unexpected:
         raise ValueError(f"unexpected SigLIP 2 checkpoint keys: {unexpected}")
@@ -1518,7 +1541,9 @@ def _resolve_siglip2_token_ids(
         tokenizer_id = getattr(tokenizer, name, None)
         config_id = getattr(text_config, name, None)
         if not isinstance(tokenizer_id, int):
-            raise ValueError(f"SigLIP 2 tokenizer must expose integer {name}")
+            raise ValueError(  # noqa: TRY004 - incompatible tokenizer contract
+                f"SigLIP 2 tokenizer must expose integer {name}"
+            )
         if tokenizer_id < 0 or tokenizer_id >= vocab_size:
             raise ValueError(
                 f"SigLIP 2 tokenizer {name}={tokenizer_id} is outside the model "
@@ -1539,7 +1564,9 @@ def _resolve_siglip2_token_ids(
 def _encode_template_token_ids(tokenizer: Any, text: str) -> tuple[int, ...]:
     """Encode a constant template fragment without adding special tokens."""
     if tokenizer is None:
-        raise ValueError("a SigLIP 2 tokenizer is required to encode the prompt template")
+        raise ValueError(
+            "a SigLIP 2 tokenizer is required to encode the prompt template"
+        )
     encoded = tokenizer(text, add_special_tokens=False)
     input_ids = encoded["input_ids"]
     token_ids = tuple(int(token_id) for token_id in input_ids)
@@ -1701,7 +1728,9 @@ def _train_batches(runtime: StageTrainingRuntime):
 def _noop_validate():
     def validate(epoch: int) -> ReIDMetrics:
         # Stage-1 has no ReID classifier trained yet; reporting random mAP would be misleading.
-        return ReIDMetrics(map=float("nan"), cmc={rank: float("nan") for rank in DEFAULT_RANKS})
+        return ReIDMetrics(
+            map=float("nan"), cmc={rank: float("nan") for rank in DEFAULT_RANKS}
+        )
 
     return validate
 
@@ -1785,9 +1814,7 @@ def _extract_features(
     flip_tta: bool = False,
 ) -> FeatureSet:
     if precision is None:
-        precision = PrecisionController(
-            PrecisionPolicy("fp32", "fp32", device.type)
-        )
+        precision = PrecisionController(PrecisionPolicy("fp32", "fp32", device.type))
     feature_parts: list[torch.Tensor] = []
     person_ids: list[int] = []
     camera_ids: list[int] = []
@@ -1795,20 +1822,26 @@ def _extract_features(
         for batch in loader:
             images = batch.images.to(device, non_blocking=True)
             cameras = batch.camera_ids.to(device, non_blocking=True)
-            features = model.encode_retrieval(images, cameras, retrieval_mode=retrieval_mode)
+            features = model.encode_retrieval(
+                images, cameras, retrieval_mode=retrieval_mode
+            )
             if flip_tta:
                 # Both views already come back L2-normalized, so summing them
                 # and renormalizing averages the two directions. Doubles eval
                 # cost; training is untouched.
                 flipped = model.encode_retrieval(
-                    torch.flip(images, dims=(3,)), cameras, retrieval_mode=retrieval_mode
+                    torch.flip(images, dims=(3,)),
+                    cameras,
+                    retrieval_mode=retrieval_mode,
                 )
-                features = l2_normalize((features.float() + flipped.float()))
+                features = l2_normalize(features.float() + flipped.float())
             feature_parts.append(features.float().cpu())
             person_ids.extend(batch.original_person_ids)
             camera_ids.extend(batch.original_camera_ids)
     if not feature_parts:
-        raise ValueError("eval loader produced no samples; cannot extract query/gallery features")
+        raise ValueError(
+            "eval loader produced no samples; cannot extract query/gallery features"
+        )
     return FeatureSet(torch.cat(feature_parts), tuple(person_ids), tuple(camera_ids))
 
 
@@ -1856,10 +1889,14 @@ def _stage1_step(
             person_ids=batch.person_ids,
             config=runtime.loss_config,
         )
-    return stage1_alignment_loss(model, _training_batch(batch, runtime.device), runtime.loss_config)
+    return stage1_alignment_loss(
+        model, _training_batch(batch, runtime.device), runtime.loss_config
+    )
 
 
-def _stage2_step(runtime: StageTrainingRuntime, batch: TrainingBatch) -> Stage2LossBreakdown:
+def _stage2_step(
+    runtime: StageTrainingRuntime, batch: TrainingBatch
+) -> Stage2LossBreakdown:
     if runtime.anchor_provider is None:
         raise ValueError("stage2 training requires an identity anchor provider")
     inputs = Stage2LossInputs(

@@ -2,22 +2,23 @@
 
 from __future__ import annotations
 
-import argparse
 import json
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Sequence
 
+import hydra
 import numpy as np
 import torch
+from omegaconf import DictConfig
 
+from t2c_reid.configuration import (
+    EvaluationConfig,
+    compose_evaluation_config,
+    evaluation_config_from_dict_config,
+)
 from t2c_reid.evaluation import (
     DEFAULT_QUERY_CHUNK_SIZE,
-    DEFAULT_RANKS,
-    DEFAULT_RERANK_K1,
-    DEFAULT_RERANK_K2,
-    DEFAULT_RERANK_LAMBDA,
     RUST_EVALUATION_BACKEND,
-    SUPPORTED_EVALUATION_BACKENDS,
     ReIDMetrics,
     RerankConfig,
     evaluate_reid,
@@ -34,16 +35,26 @@ REQUIRED_KEYS = (
 )
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    args = _build_parser().parse_args(argv)
+def main(overrides: Sequence[str] | None = None) -> int | None:
+    if overrides is None:
+        return _hydra_main()
+    return _run_evaluation(compose_evaluation_config(overrides))
+
+
+@hydra.main(config_path="../configs/evaluation", config_name="evaluate")
+def _hydra_main(config: DictConfig) -> int:
+    return _run_evaluation(evaluation_config_from_dict_config(config))
+
+
+def _run_evaluation(config: EvaluationConfig) -> int:
     primary, rerank = _evaluate_npz(
-        args.features,
-        tuple(args.ranks),
-        backend=args.evaluation_backend,
-        query_chunk_size=args.evaluation_chunk_size,
+        config.features,
+        tuple(config.ranks),
+        backend=config.evaluation_backend,
+        query_chunk_size=config.evaluation_chunk_size,
         rerank_config=(
-            RerankConfig(args.rerank_k1, args.rerank_k2, args.rerank_lambda)
-            if args.report_rerank
+            RerankConfig(config.rerank_k1, config.rerank_k2, config.rerank_lambda)
+            if config.report_rerank
             else None
         ),
     )
@@ -51,35 +62,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if rerank is not None:
         payload["rerank"] = _metrics_payload(rerank)
     text = json.dumps(payload, indent=2, sort_keys=True)
-    if args.output is None:
+    if config.output is None:
         print(text)
         return 0
-    args.output.write_text(text + "\n", encoding="utf-8")
+    config.output.write_text(text + "\n", encoding="utf-8")
     return 0
-
-
-def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Evaluate primary and optional reranked ReID metrics from .npz features."
-    )
-    parser.add_argument("features", type=Path)
-    parser.add_argument("--output", type=Path)
-    parser.add_argument("--ranks", nargs="+", type=int, default=list(DEFAULT_RANKS))
-    parser.add_argument(
-        "--evaluation-backend",
-        choices=SUPPORTED_EVALUATION_BACKENDS,
-        default=RUST_EVALUATION_BACKEND,
-    )
-    parser.add_argument(
-        "--evaluation-chunk-size",
-        type=int,
-        default=DEFAULT_QUERY_CHUNK_SIZE,
-    )
-    parser.add_argument("--report-rerank", action="store_true")
-    parser.add_argument("--rerank-k1", type=int, default=DEFAULT_RERANK_K1)
-    parser.add_argument("--rerank-k2", type=int, default=DEFAULT_RERANK_K2)
-    parser.add_argument("--rerank-lambda", type=float, default=DEFAULT_RERANK_LAMBDA)
-    return parser
 
 
 def _evaluate_npz(
@@ -93,7 +80,9 @@ def _evaluate_npz(
     with np.load(path) as data:
         _validate_keys(data.files, path)
         query_features = torch.as_tensor(data["query_features"], dtype=torch.float32)
-        gallery_features = torch.as_tensor(data["gallery_features"], dtype=torch.float32)
+        gallery_features = torch.as_tensor(
+            data["gallery_features"], dtype=torch.float32
+        )
         metadata = {
             "query_ids": data["query_ids"].astype(int).tolist(),
             "gallery_ids": data["gallery_ids"].astype(int).tolist(),

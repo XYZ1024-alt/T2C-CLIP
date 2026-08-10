@@ -5,6 +5,7 @@ description = "Train2Central ReID research codebase for Image-to-Image person re
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
+    "hydra-core>=1.4.0.dev3,<1.5",
     "numpy>=2.4.0",
     "torch>=2.13.0",
     "torchvision>=0.28.0",

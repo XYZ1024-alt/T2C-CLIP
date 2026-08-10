@@ -1,0 +1,30 @@
+defaults:
+  - benchmark_schema
+  - _self_
+
+mode: all
+dataset: market1501
+data_root: null
+data_samples: 256
+batch_size: 16
+num_workers: 4
+rust_data_threads: 2
+image_height: 392
+image_width: 196
+query_count: 256
+gallery_count: 2048
+feature_dim: 256
+rerank_query_count: 256
+rerank_gallery_count: 2048
+chunk_size: 128
+runs: 5
+warmup_runs: 1
+seed: 7
+output: null
+rss_worker_backend: null
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: runs/hydra/benchmark/${now:%Y-%m-%d}/${now:%H-%M-%S}

@@ -1,8 +1,7 @@
-from pathlib import Path
 import contextlib
-import io
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import torch
@@ -29,24 +28,16 @@ class TwoStageTrainingScriptTest(unittest.TestCase):
             checkpoint_dir = Path(tmp) / "checkpoints"
             with mock.patch("scripts.train.start_wandb_run", new=fake_start_wandb_run):
                 exit_code = main(
-                    [
-                        "--job-builder",
-                        f"{__name__}:build_two_stage_training_job",
-                        "--stage1-epochs",
-                        "2",
-                        "--epochs",
-                        "1",
-                        "--validation-interval",
-                        "1",
-                        "--checkpoint-dir",
-                        str(checkpoint_dir),
-                        "--enable-wandb",
-                        "--wandb-project",
-                        "T2C-ReID-TwoStage-Script-Test",
-                        "--wandb-mode",
-                        "offline",
-                        "--run-name",
-                        "two-stage-test",
+                    _two_stage_overrides(
+                        checkpoint_dir,
+                        stage1_epochs=2,
+                        epochs=1,
+                    )
+                    + [
+                        "enable_wandb=true",
+                        "wandb_project=T2C-ReID-TwoStage-Script-Test",
+                        "wandb_mode=offline",
+                        "run_name=two-stage-test",
                     ],
                     progress_factory=lambda iterable, **kwargs: iterable,
                 )
@@ -55,8 +46,12 @@ class TwoStageTrainingScriptTest(unittest.TestCase):
             best_path = checkpoint_dir / "best.pth"
             last_path = checkpoint_dir / "last.pth"
             self.assertTrue(stage1_last_path.exists(), "stage1 checkpoint file missing")
-            self.assertTrue(best_path.exists(), "best.pth should exist (single Stage-2 epoch)")
-            self.assertTrue(last_path.exists(), "last.pth should exist (Stage-2 checkpoint)")
+            self.assertTrue(
+                best_path.exists(), "best.pth should exist (single Stage-2 epoch)"
+            )
+            self.assertTrue(
+                last_path.exists(), "last.pth should exist (Stage-2 checkpoint)"
+            )
             best_payload = _load_checkpoint(best_path)
             self.assertEqual(best_payload["stage"], "stage2")
             last_payload = _load_checkpoint(last_path)
@@ -68,9 +63,15 @@ class TwoStageTrainingScriptTest(unittest.TestCase):
         self.assertEqual(run.config["dataset"], "fixture")
         stage1_epochs = [payload for payload in run.logged if "stage1_epoch" in payload]
         stage2_epochs = [payload for payload in run.logged if "stage2_epoch" in payload]
-        validation = [payload for payload in run.logged if "validation_epoch" in payload]
-        self.assertEqual([payload["stage1_train_loss"] for payload in stage1_epochs], [1.0, 2.0])
-        self.assertEqual([payload["stage2_train_loss"] for payload in stage2_epochs], [3.0])
+        validation = [
+            payload for payload in run.logged if "validation_epoch" in payload
+        ]
+        self.assertEqual(
+            [payload["stage1_train_loss"] for payload in stage1_epochs], [1.0, 2.0]
+        )
+        self.assertEqual(
+            [payload["stage2_train_loss"] for payload in stage2_epochs], [3.0]
+        )
         self.assertEqual(validation[0]["mAP"], 0.5)
 
     def test_resume_skips_stage1_and_completed_stage2_epochs(self):
@@ -80,25 +81,22 @@ class TwoStageTrainingScriptTest(unittest.TestCase):
             checkpoint_dir = Path(tmp) / "checkpoints"
             # Global epochs: stage1 = [1], stage2 = [2, 3]; last.pth records epoch 3.
             main(
-                [
-                    "--job-builder", f"{__name__}:build_two_stage_training_job",
-                    "--stage1-epochs", "1",
-                    "--epochs", "2",
-                    "--validation-interval", "1",
-                    "--checkpoint-dir", str(checkpoint_dir),
-                ],
+                _two_stage_overrides(
+                    checkpoint_dir,
+                    stage1_epochs=1,
+                    epochs=2,
+                ),
                 progress_factory=lambda iterable, **kwargs: iterable,
             )
 
             exit_code = main(
-                [
-                    "--job-builder", f"{__name__}:recording_two_stage_builder",
-                    "--stage1-epochs", "1",
-                    "--epochs", "4",
-                    "--validation-interval", "1",
-                    "--checkpoint-dir", str(checkpoint_dir),
-                    "--resume", str(checkpoint_dir / "last.pth"),
-                ],
+                _two_stage_overrides(
+                    checkpoint_dir,
+                    builder=f"{__name__}:recording_two_stage_builder",
+                    stage1_epochs=1,
+                    epochs=4,
+                    resume=checkpoint_dir / "last.pth",
+                ),
                 progress_factory=lambda iterable, **kwargs: iterable,
             )
 
@@ -107,7 +105,7 @@ class TwoStageTrainingScriptTest(unittest.TestCase):
         self.assertEqual(RECORDED_STAGE_EPOCHS["stage2"], [4, 5])
 
 
-def build_two_stage_training_job(args) -> TwoStageTrainingJob:
+def build_two_stage_training_job(config) -> TwoStageTrainingJob:
     model = torch.nn.Linear(2, 2)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
 
@@ -125,7 +123,9 @@ def build_two_stage_training_job(args) -> TwoStageTrainingJob:
 
     def stage1_validate(epoch: int) -> ReIDMetrics:
         # Stage-1 has no ReID classifier, so we return NaN metrics on purpose.
-        return ReIDMetrics(map=float("nan"), cmc={rank: float("nan") for rank in (1, 5, 10)})
+        return ReIDMetrics(
+            map=float("nan"), cmc={rank: float("nan") for rank in (1, 5, 10)}
+        )
 
     def stage2_validate(epoch: int) -> ReIDMetrics:
         return ReIDMetrics(map=0.5, cmc={1: 0.5})
@@ -147,8 +147,8 @@ def build_two_stage_training_job(args) -> TwoStageTrainingJob:
     )
 
 
-def recording_two_stage_builder(args) -> TwoStageTrainingJob:
-    job = build_two_stage_training_job(args)
+def recording_two_stage_builder(config) -> TwoStageTrainingJob:
+    job = build_two_stage_training_job(config)
 
     def wrap(stage: str, inner):
         def train_one_epoch(epoch: int, reporter):
@@ -172,6 +172,26 @@ def recording_two_stage_builder(args) -> TwoStageTrainingJob:
         ),
         stage_metadata=None,
     )
+
+
+def _two_stage_overrides(
+    checkpoint_dir: Path,
+    *,
+    builder: str | None = None,
+    stage1_epochs: int,
+    epochs: int,
+    resume: Path | None = None,
+) -> list[str]:
+    overrides = [
+        f"job_builder={builder or f'{__name__}:build_two_stage_training_job'}",
+        f"stage1_epochs={stage1_epochs}",
+        f"epochs={epochs}",
+        "validation_interval=1",
+        f"checkpoint_dir={checkpoint_dir.as_posix()}",
+    ]
+    if resume is not None:
+        overrides.append(f"resume={resume.as_posix()}")
+    return overrides
 
 
 class FakeWandbConfig(dict):
